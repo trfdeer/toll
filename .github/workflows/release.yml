@@ -1,0 +1,51 @@
+name: release
+
+# Builds the Nix-produced OCI image and publishes it to GHCR:
+#   ghcr.io/trfdeer/toll:<tag> and :latest   (linux/amd64 only)
+#
+# On a tag push (v*) the tag name is used verbatim and :latest is moved.
+# Every other run (a push to main, manual runs) publishes the commit hash as
+# a snapshot tag only; :latest is never touched.
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/trfdeer/toll
+  TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('snapshot-{0}', github.sha) }}
+
+jobs:
+  image:
+    name: image (amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Build the docker archive via Nix
+        run: nix build .#image
+      - name: Load, tag, and push
+        run: |
+          set -euo pipefail
+          echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+          loaded=$(docker load < result | sed -n 's/^Loaded image: //p')
+          test -n "${loaded}" || { echo "unexpected docker load output"; exit 1; }
+          echo "loaded ${loaded}"
+          docker tag "${loaded}" "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:${TAG}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            docker tag "${loaded}" "${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}

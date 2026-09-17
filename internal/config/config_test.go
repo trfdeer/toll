@@ -1,0 +1,193 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestEnvOnlyUpstream(t *testing.T) {
+	t.Setenv("TOLL_UPSTREAM_URL", "https://api.example.com/v1")
+	t.Setenv("TOLL_UPSTREAM_API_KEY", "sk-test")
+
+	cfg, err := Load(t.Context(), Flags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Upstreams) != 1 {
+		t.Fatalf("upstreams = %d, want 1", len(cfg.Upstreams))
+	}
+	u := cfg.Upstreams[0]
+	if u.URL.String() != "https://api.example.com/v1" || u.APIKey != "sk-test" || u.Name != "default" {
+		t.Errorf("unexpected upstream: %+v", u)
+	}
+	if u.Refresh != 5*time.Minute {
+		t.Errorf("refresh = %v, want 5m", u.Refresh)
+	}
+}
+
+// TestNoUpstreamStartsClean verifies an empty configuration is valid: the
+// gateway must start without any provider (they can be added later via the
+// admin UI).
+func TestNoUpstreamStartsClean(t *testing.T) {
+	cfg, err := Load(t.Context(), Flags{})
+	if err != nil {
+		t.Fatalf("Load with no upstreams: %v", err)
+	}
+	if len(cfg.Upstreams) != 0 {
+		t.Fatalf("upstreams = %d, want 0", len(cfg.Upstreams))
+	}
+}
+
+const fullYAML = `
+listen: ":9090"
+log_level: debug
+data_dir: /tmp/toll-test-data
+upstreams:
+  - name: hyper
+    url: https://hyper.charm.land/v1
+    api_key_env: HYPER_API_KEY
+    refresh_interval: 1m
+    alias_rules:
+      - match: "^(.+)$"
+        as: "hyper/$1"
+        name: "Hyper $1"
+    models:
+      - id: some-upstream-model
+        alias: custom/alias
+        name: Custom Name
+        disabled: true
+        metadata:
+          pricing:
+            input: 0.5
+    overlays:
+      - match: "^custom/"
+        metadata:
+          capabilities:
+            vision: true
+`
+
+func TestFileConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "toll.yaml")
+	if err := os.WriteFile(path, []byte(fullYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TOLL_CONFIG", path)
+	t.Setenv("HYPER_API_KEY", "sk-hyper")
+	t.Setenv("TOLL_LISTEN", ":7070") // env must beat the file's :9090
+
+	cfg, err := Load(t.Context(), Flags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Listen != ":7070" {
+		t.Errorf("listen = %q, want :7070 (env wins over file)", cfg.Listen)
+	}
+	if cfg.DataDir != "/tmp/toll-test-data" {
+		t.Errorf("data_dir = %q", cfg.DataDir)
+	}
+
+	if len(cfg.Upstreams) != 1 {
+		t.Fatalf("upstreams = %d, want 1", len(cfg.Upstreams))
+	}
+	u := cfg.Upstreams[0]
+	if u.Name != "hyper" || u.APIKey != "sk-hyper" || u.Refresh != time.Minute {
+		t.Errorf("unexpected upstream: name=%q key=%q refresh=%v", u.Name, u.APIKey, u.Refresh)
+	}
+	if len(u.AliasRules) != 1 || u.AliasRules[0].Regexp() == nil {
+		t.Errorf("alias rules not compiled")
+	} else if got := u.AliasRules[0].Regexp().ReplaceAllString("glm-5.3-flash", u.AliasRules[0].As); got != "hyper/glm-5.3-flash" {
+		t.Errorf("alias rule produced %q", got)
+	}
+	if len(u.Overlays) != 1 || u.Overlays[0].Regexp() == nil {
+		t.Errorf("overlays not compiled")
+	}
+	if len(u.Models) != 1 || u.Models[0].Alias != "custom/alias" {
+		t.Errorf("explicit model entry not parsed: %+v", u.Models)
+	}
+	if u.Models[0].Disabled == nil || !*u.Models[0].Disabled {
+		t.Errorf("model entry disabled not parsed: %+v", u.Models[0])
+	}
+}
+
+func TestMissingSecretEnvFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "toll.yaml")
+	if err := os.WriteFile(path, []byte(fullYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TOLL_CONFIG", path)
+	os.Unsetenv("HYPER_API_KEY")
+
+	_, err := Load(t.Context(), Flags{})
+	if err == nil {
+		t.Fatal("expected error for missing HYPER_API_KEY")
+	}
+}
+
+func TestBadRegexFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "toll.yaml")
+	bad := `
+upstreams:
+  - name: x
+    url: https://x.example/v1
+    api_key_env: X_KEY
+    alias_rules:
+      - match: "([unclosed"
+        as: "y/$1"
+`
+	if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TOLL_CONFIG", path)
+	t.Setenv("X_KEY", "k")
+
+	if _, err := Load(t.Context(), Flags{}); err == nil {
+		t.Fatal("expected error for invalid alias regex")
+	}
+}
+
+func TestStorePromptsFromFileAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "toll.yaml")
+	if err := os.WriteFile(path, []byte("store_prompts: false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TOLL_CONFIG", path)
+	os.Unsetenv("TOLL_STORE_PROMPTS")
+
+	cfg, err := Load(t.Context(), Flags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StorePrompts == nil || *cfg.StorePrompts {
+		t.Fatalf("file store_prompts = %v, want false", cfg.StorePrompts)
+	}
+
+	// The env var wins over the file.
+	t.Setenv("TOLL_STORE_PROMPTS", "true")
+	cfg, err = Load(t.Context(), Flags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StorePrompts == nil || !*cfg.StorePrompts {
+		t.Errorf("env store_prompts = %v, want true", cfg.StorePrompts)
+	}
+}
+
+func TestFlagsBeatEverything(t *testing.T) {
+	t.Setenv("TOLL_UPSTREAM_URL", "https://api.example.com/v1")
+	t.Setenv("TOLL_UPSTREAM_API_KEY", "sk-test")
+
+	cfg, err := Load(t.Context(), Flags{Listen: ":1234"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != ":1234" {
+		t.Errorf("listen = %q, want :1234", cfg.Listen)
+	}
+}

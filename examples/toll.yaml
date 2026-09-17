@@ -1,0 +1,80 @@
+# toll configuration — full example.
+#
+# Secrets NEVER live here: upstream entries reference environment variables
+# by name (api_key_env). Precedence for scalar settings: flags > env (TOLL_*)
+# > this file > defaults.
+#
+# Start with: TOLL_CONFIG=./toll.yaml toll
+# (or just `toll` — ./toll.yaml is picked up automatically)
+
+listen: ":8080"          # TOLL_LISTEN overrides
+log_level: info          # TOLL_LOG_LEVEL overrides (debug shows cost divergence)
+data_dir: ./data         # SQLite lives here (TOLL_DATA_DIR overrides)
+# Prompt/response bodies are stored separately ($data_dir/content.db). Set
+# this to false to keep only transcript metadata (tokens, cost, timing).
+# TOLL_STORE_PROMPTS overrides; the admin UI Settings toggle overrides both
+# at runtime. Omit to leave the runtime/DB value in charge.
+# store_prompts: true
+
+upstreams:
+  # --- An OpenAI-compatible provider (https://openrouter.ai) ---
+  - name: openrouter
+    url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    refresh_interval: 5m        # how often to re-pull /v1/models (default 5m)
+    # disable_refresh: true     # sync once at startup instead
+
+    # Regex rules rewrite upstream model IDs into gateway-facing IDs
+    # ($1… refer to capture groups). Unmatched models default to
+    # "<upstream name>/<upstream model id>".
+    alias_rules:
+      - match: "^(.+)$"
+        as: "openrouter/$1"
+        name: "OpenRouter $1"   # optional display-name template
+
+    # Metadata overlays deep-merge into upstream model metadata.
+    # They match the GATEWAY id, and never delete upstream fields —
+    # only inject or override.
+    overlays:
+      # Make sure every model carries a fallback tier tag.
+      - match: "^openrouter/.*"
+        metadata:
+          tier: standard
+
+      # Cost tracking reads a "pricing" object of per-Mtok USD rates with
+      # keys input, output, cache_create, cache_hit (input and output are
+      # required; a model without them reports an unknown cost, never a
+      # guess). Add rates the provider does not publish itself.
+      # - match: "^openrouter/meta-llama/.*"
+      #   metadata:
+      #     pricing:
+      #       input: 0.20
+      #       output: 0.60
+
+  # --- A second provider, with explicit model entries ---
+  - name: openai
+    url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    refresh_interval: 1h
+    alias_rules:
+      - match: "^(.+)$"
+        as: "openai/$1"
+
+    # Explicit model entries pin alias/name/metadata above rules and
+    # overlays (keys here always win). An `alias` seeds the model's custom
+    # gateway ID in the database at startup; afterwards the admin UI's alias
+    # edit is authoritative (export the config to keep UI edits across
+    # restarts). `disabled` is three-state: omit it to leave the registry's
+    # (UI) toggle alone; set it to pin the state across discovery refreshes.
+    # A disabled model is hidden from /v1/models and unroutable, but stays
+    # in the registry and the config export.
+    models:
+      - id: gpt-5.2
+        alias: openai/flagship
+        name: "OpenAI Flagship"
+        metadata:
+          context_window: 400000
+          capabilities:
+            vision: true
+      # - id: gpt-4.1
+      #   disabled: true
