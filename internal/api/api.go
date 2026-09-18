@@ -52,11 +52,18 @@ func unauthorized(w http.ResponseWriter) {
 // request context (they are intentionally separate types; this is the one
 // bridge point).
 func toKeysKey(vk *store.VirtualKey) *keys.VirtualKey {
+	rules := make([]keys.Rule, 0, len(vk.Rules))
+	for _, r := range vk.Rules {
+		rules = append(rules, keys.Rule{
+			ProviderFilter: toKeysFilter(r.ProviderFilter),
+			ModelFilter:    toKeysFilter(r.ModelFilter),
+		})
+	}
 	return &keys.VirtualKey{
-		ID:             vk.ID,
-		Name:           vk.Name,
-		ProviderFilter: toKeysFilter(vk.ProviderFilter),
-		ModelFilter:    toKeysFilter(vk.ModelFilter),
+		ID:       vk.ID,
+		Name:     vk.Name,
+		AllowAll: vk.AllowAll,
+		Rules:    rules,
 	}
 }
 
@@ -99,7 +106,7 @@ func NewModelsHandler(st *store.Store, logger *log.Logger) http.Handler {
 			}
 			// Provider is the upstream the model was discovered from, not a
 			// prefix of its ID.
-			if !keys.Allows(row.UpstreamName, vk.ProviderFilter, vk.ModelFilter, row.GatewayID) {
+			if !keys.Allows(row.UpstreamName, row.GatewayID, vk.AllowAll, vk.Rules) {
 				continue
 			}
 			var meta map[string]any

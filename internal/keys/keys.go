@@ -33,12 +33,20 @@ type Filter struct {
 	Values []string   `json:"values"`
 }
 
-// VirtualKey is a resolved virtual key from the store.
+// Rule is one clause of a resolved profile: a model passes it when its
+// provider passes ProviderFilter and its gateway ID passes ModelFilter.
+type Rule struct {
+	ProviderFilter Filter `json:"providerFilter"`
+	ModelFilter    Filter `json:"modelFilter"`
+}
+
+// VirtualKey is a resolved virtual key from the store. A key permits a model
+// when AllowAll is set or any of Rules permits it.
 type VirtualKey struct {
-	ID             int64
-	Name           string
-	ProviderFilter Filter
-	ModelFilter    Filter
+	ID       int64
+	Name     string
+	AllowAll bool
+	Rules    []Rule
 }
 
 // Generate returns a new plaintext key. It is shown once at creation; only
@@ -67,16 +75,25 @@ func ParseBearer(header string) (string, bool) {
 	return strings.TrimSpace(token), true
 }
 
-// Allows reports whether a model passes a key's provider and model filters.
+// Allows reports whether a model passes a key's resolved rules.
 //
 // provider is where the model was discovered from — the name of the upstream
 // that serves it, never parsed out of the model ID. Gating on the discovery
 // source keeps the filter correct even when an alias rule rewrites a gateway
 // ID so it no longer carries a provider prefix. modelID is the gateway-facing
-// ID, matched against the model filter. A filter in mode none imposes no
-// constraint.
-func Allows(provider string, providerFilter, modelFilter Filter, modelID string) bool {
-	return providerFilter.allows(provider) && modelFilter.allows(modelID)
+// ID, matched against each rule's model filter. allowAll (an All profile in
+// the ancestry) permits everything; otherwise a model is allowed when any rule
+// allows it (its provider filter and model filter both pass).
+func Allows(provider, modelID string, allowAll bool, rules []Rule) bool {
+	if allowAll {
+		return true
+	}
+	for _, r := range rules {
+		if r.ProviderFilter.allows(provider) && r.ModelFilter.allows(modelID) {
+			return true
+		}
+	}
+	return false
 }
 
 // allows reports whether v passes the filter.

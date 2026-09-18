@@ -143,6 +143,11 @@ func TestProfileValidation(t *testing.T) {
 		{"duplicate", "profiles:\n  - name: a\n  - name: a\n"},
 		{"bad mode", "profiles:\n  - name: a\n    provider_filter: {mode: sometimes, values: [x]}\n"},
 		{"empty include", "profiles:\n  - name: a\n    model_filter: {mode: include, values: []}\n"},
+		{"derived with filters", "profiles:\n  - name: child\n    provider_filter: {mode: include, values: [a]}\n    parents: [base]\n  - name: base\n"},
+		{"unknown parent", "profiles:\n  - name: child\n    parents: [missing]\n"},
+		{"self parent", "profiles:\n  - name: a\n    parents: [a]\n"},
+		{"duplicate parent", "profiles:\n  - name: child\n    parents: [base, base]\n  - name: base\n"},
+		{"cycle", "profiles:\n  - name: a\n    parents: [b]\n  - name: b\n    parents: [a]\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -155,6 +160,31 @@ func TestProfileValidation(t *testing.T) {
 				t.Fatalf("expected error for %s", tc.name)
 			}
 		})
+	}
+}
+
+func TestProfileParentsParse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "toll.yaml")
+	yaml := "profiles:\n" +
+		"  - name: child\n" +
+		"    parents: [base, All]\n" +
+		"  - name: base\n" +
+		"    provider_filter: {mode: include, values: [a]}\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TOLL_CONFIG", path)
+	cfg, err := Load(t.Context(), Flags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Profiles) != 2 {
+		t.Fatalf("profiles = %+v", cfg.Profiles)
+	}
+	child := cfg.Profiles[0]
+	if child.Name != "child" || len(child.Parents) != 2 ||
+		child.Parents[0] != "base" || child.Parents[1] != DefaultProfileName {
+		t.Errorf("child = %+v", child)
 	}
 }
 

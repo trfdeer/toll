@@ -27,11 +27,13 @@ type configExport struct {
 }
 
 // exportProfile mirrors config.Profile so the emitted YAML seeds profiles on
-// import. The seeded "All" default is never exported.
+// import. The seeded "All" default is never exported. Parents lists the
+// profiles a derived profile unions; leaf profiles omit it.
 type exportProfile struct {
 	Name           string       `yaml:"name"`
 	ProviderFilter exportFilter `yaml:"provider_filter"`
 	ModelFilter    exportFilter `yaml:"model_filter"`
+	Parents        []string     `yaml:"parents,omitempty"`
 }
 
 // exportFilter mirrors config.ProfileFilter. Empty values are omitted; the
@@ -130,6 +132,7 @@ func exportProfiles(rows []store.Profile) []exportProfile {
 			Name:           p.Name,
 			ProviderFilter: exportFilter{Mode: p.ProviderFilter.Mode, Values: p.ProviderFilter.Values},
 			ModelFilter:    exportFilter{Mode: p.ModelFilter.Mode, Values: p.ModelFilter.Values},
+			Parents:        p.Parents,
 		})
 	}
 	if len(out) == 0 {

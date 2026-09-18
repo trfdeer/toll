@@ -37,17 +37,23 @@ export interface UpdateKeyRequest {
 
 // ---- profiles ----
 
-// Profile is a named, reusable provider/model filter shared by virtual keys.
-// Its set of allowed models resolves live against the registry, so models
-// discovered later are picked up automatically.
+// Profile is a named, reusable model-access rule shared by virtual keys. It
+// is either a leaf (its own provider/model filters, no parents) or derived
+// (the union of its parents' sets, no filters of its own). Its set of allowed
+// models resolves live against the registry, so models discovered later are
+// picked up automatically.
 export interface Profile {
   name: string;
   providerFilter: KeyFilter;
   modelFilter: KeyFilter;
+  /** Names of the profiles a derived profile unions; empty for a leaf. */
+  parents: string[];
   /** The seeded "All" profile is read-only. */
   isDefault: boolean;
   /** Number of virtual keys referencing this profile. */
   keyCount: number;
+  /** Number of profiles that inherit from this one. */
+  childCount: number;
 }
 
 export interface ProfilesResponse {
@@ -58,6 +64,7 @@ export interface ProfileRequest {
   name: string;
   providerFilter: KeyFilter;
   modelFilter: KeyFilter;
+  parents: string[];
 }
 
 // ---- providers ----

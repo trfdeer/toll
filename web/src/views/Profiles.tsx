@@ -6,6 +6,9 @@ import {
   IconButton,
   InlineNotification,
   Modal,
+  MultiSelect,
+  RadioButton,
+  RadioButtonGroup,
   Stack,
   TextInput,
 } from "@carbon/react";
@@ -24,10 +27,16 @@ import {
 import { errorMessage } from "../lib/errors";
 import {
   allowedModels,
+  descendantsOf,
   EMPTY_FILTER,
+  profileAllowedModels,
   summarizeFilter,
 } from "../lib/filters";
 import type { KeyFilter, Model, Profile } from "../lib/types";
+
+// ProfileKind distinguishes a leaf (own filters) from a derived profile
+// (union of parents). The two are mutually exclusive, matching the server.
+type ProfileKind = "leaf" | "derived";
 
 // filtersValid rejects an include/exclude filter with no values, matching the
 // server-side validation.
@@ -44,8 +53,10 @@ export default function Profiles() {
   // editing is the profile being edited, or null when creating one.
   const [editing, setEditing] = useState<Profile | null>(null);
   const [name, setName] = useState("");
+  const [kind, setKind] = useState<ProfileKind>("leaf");
   const [provider, setProvider] = useState<KeyFilter>(EMPTY_FILTER);
   const [model, setModel] = useState<KeyFilter>(EMPTY_FILTER);
+  const [parents, setParents] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   // previewing is the profile whose allowed-model list is shown, or null.
   const [previewing, setPreviewing] = useState<Profile | null>(null);
@@ -67,8 +78,10 @@ export default function Profiles() {
 
   const resetForm = () => {
     setName("");
+    setKind("leaf");
     setProvider(EMPTY_FILTER);
     setModel(EMPTY_FILTER);
+    setParents([]);
   };
 
   const openCreate = () => {
@@ -81,8 +94,10 @@ export default function Profiles() {
   const openEdit = (p: Profile) => {
     setEditing(p);
     setName(p.name);
+    setKind(p.parents.length > 0 ? "derived" : "leaf");
     setProvider(p.providerFilter);
     setModel(p.modelFilter);
+    setParents(p.parents);
     setFormError(null);
     setOpen(true);
   };
@@ -94,16 +109,24 @@ export default function Profiles() {
     resetForm();
   };
 
+  // requestBody builds the profile payload. A derived profile carries neutral
+  // filters (its own are undefined by construction).
+  const requestBody = () => {
+    const derived = kind === "derived";
+    return {
+      name: name.trim(),
+      providerFilter: derived ? EMPTY_FILTER : provider,
+      modelFilter: derived ? EMPTY_FILTER : model,
+      parents: derived ? parents : [],
+    };
+  };
+
   const submit = async () => {
     if (!editing) return;
     setBusy(true);
     setFormError(null);
     try {
-      await updateProfile(editing.name, {
-        name: name.trim(),
-        providerFilter: provider,
-        modelFilter: model,
-      });
+      await updateProfile(editing.name, requestBody());
       reload();
       setOpen(false);
       setEditing(null);
@@ -119,11 +142,7 @@ export default function Profiles() {
     setBusy(true);
     setFormError(null);
     try {
-      await createProfile({
-        name: name.trim(),
-        providerFilter: provider,
-        modelFilter: model,
-      });
+      await createProfile(requestBody());
       reload();
       setOpen(false);
       resetForm();
@@ -152,6 +171,8 @@ export default function Profiles() {
   if (error && profiles === null) return <PageState error={error} />;
   if (!profiles) return <PageState />;
 
+  const byName = new Map(profiles.map((p) => [p.name, p]));
+
   // Providers are the discovery sources, matching how the server gates keys.
   const providers = Array.from(
     new Set(models.map((m) => m.upstream).filter(Boolean)),
@@ -163,12 +184,25 @@ export default function Profiles() {
   // (EMPTY_FILTER for the model dimension makes allowedModels provider-only.)
   const pickerModels = allowedModels(models, provider, EMPTY_FILTER);
 
+  // Parent candidates exclude the profile being edited and its descendants, so
+  // the picker cannot build a cycle.
+  const excluded = editing
+    ? new Set([editing.name, ...descendantsOf(editing.name, profiles)])
+    : new Set<string>();
+  const parentCandidates = profiles
+    .map((p) => p.name)
+    .filter((n) => !excluded.has(n));
+
   // previewModels is the resolved allowed set for the profile being previewed.
   const previewModels = previewing
-    ? previewing.isDefault
-      ? models
-      : allowedModels(models, previewing.providerFilter, previewing.modelFilter)
+    ? profileAllowedModels(previewing, byName, models)
     : [];
+
+  const formValid =
+    name.trim() !== "" &&
+    (kind === "derived"
+      ? parents.length > 0
+      : filtersValid(provider) && filtersValid(model));
 
   return (
     <Grid>
@@ -189,6 +223,7 @@ export default function Profiles() {
               "Name",
               "Providers",
               "Models",
+              "Based on",
               "Allowed models",
               "Keys",
               "",
@@ -202,17 +237,13 @@ export default function Profiles() {
             }
             empty="No profiles yet."
             rows={profiles.map((p) => {
-              const allowed = p.isDefault
-                ? models.length
-                : allowedModels(
-                    models,
-                    p.providerFilter,
-                    p.modelFilter,
-                  ).length;
+              const derived = p.parents.length > 0;
+              const allowed = profileAllowedModels(p, byName, models).length;
               return [
                 p.isDefault ? `${p.name} (default)` : p.name,
-                summarizeFilter(p.providerFilter, "provider", "providers"),
-                summarizeFilter(p.modelFilter, "model", "models"),
+                derived ? "—" : summarizeFilter(p.providerFilter, "provider", "providers"),
+                derived ? "—" : summarizeFilter(p.modelFilter, "model", "models"),
+                derived ? p.parents.join(", ") : "—",
                 allowed,
                 p.keyCount,
                 <>
@@ -239,9 +270,13 @@ export default function Profiles() {
                     label={
                       p.keyCount > 0
                         ? `Cannot delete ${p.name}: in use by ${p.keyCount} key(s)`
-                        : `Delete ${p.name}`
+                        : p.childCount > 0
+                          ? `Cannot delete ${p.name}: inherited by ${p.childCount} profile(s)`
+                          : `Delete ${p.name}`
                     }
-                    disabled={p.isDefault || p.keyCount > 0}
+                    disabled={
+                      p.isDefault || p.keyCount > 0 || p.childCount > 0
+                    }
                     onClick={() => setDeleting(p)}
                   >
                     <TrashCan />
@@ -263,12 +298,7 @@ export default function Profiles() {
         modalHeading={editing ? "Edit profile" : "New profile"}
         primaryButtonText={editing ? "Save" : "Create"}
         secondaryButtonText="Cancel"
-        primaryButtonDisabled={
-          busy ||
-          !name.trim() ||
-          !filtersValid(provider) ||
-          !filtersValid(model)
-        }
+        primaryButtonDisabled={busy || !formValid}
         onRequestSubmit={editing ? submit : create}
         onRequestClose={closeModal}
         onSecondarySubmit={closeModal}
@@ -282,25 +312,59 @@ export default function Profiles() {
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
-          <KeyFilters
-            id="profile-provider"
-            title="Provider filter"
-            mode={provider.mode}
-            values={provider.values}
-            items={providers}
-            onMode={(mode) => setProvider({ mode, values: [] })}
-            onValues={(values) => setProvider((p) => ({ ...p, values }))}
-          />
-          <KeyFilters
-            id="profile-model"
-            title="Model filter"
-            mode={model.mode}
-            values={model.values}
-            items={modelIds}
-            onPickValues={() => setPickingModels(true)}
-            onMode={(mode) => setModel({ mode, values: [] })}
-            onValues={(values) => setModel((m) => ({ ...m, values }))}
-          />
+          <RadioButtonGroup
+            legendText="Type"
+            name="profile-kind"
+            valueSelected={kind}
+            onChange={(value) => setKind(value as ProfileKind)}
+          >
+            <RadioButton
+              id="profile-kind-leaf"
+              labelText="Own provider/model filter"
+              value="leaf"
+            />
+            <RadioButton
+              id="profile-kind-derived"
+              labelText="Union of other profiles"
+              value="derived"
+            />
+          </RadioButtonGroup>
+          {kind === "leaf" ? (
+            <>
+              <KeyFilters
+                id="profile-provider"
+                title="Provider filter"
+                mode={provider.mode}
+                values={provider.values}
+                items={providers}
+                onMode={(mode) => setProvider({ mode, values: [] })}
+                onValues={(values) => setProvider((p) => ({ ...p, values }))}
+              />
+              <KeyFilters
+                id="profile-model"
+                title="Model filter"
+                mode={model.mode}
+                values={model.values}
+                items={modelIds}
+                onPickValues={() => setPickingModels(true)}
+                onMode={(mode) => setModel({ mode, values: [] })}
+                onValues={(values) => setModel((m) => ({ ...m, values }))}
+              />
+            </>
+          ) : (
+            <MultiSelect
+              id="profile-parents"
+              size="sm"
+              titleText="Parent profiles"
+              label="Select profiles…"
+              items={parentCandidates}
+              selectedItems={parents}
+              itemToString={(item: string) => item}
+              onChange={({ selectedItems }) =>
+                setParents(selectedItems as string[])
+              }
+            />
+          )}
           {formError && (
             <InlineNotification
               kind="error"
@@ -328,7 +392,8 @@ export default function Profiles() {
         >
           <p>
             Delete profile <strong>{deleting.name}</strong>? This cannot be
-            undone. No keys reference this profile.
+            undone. No keys reference this profile and no profile inherits from
+            it.
           </p>
         </Modal>
       )}

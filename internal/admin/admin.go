@@ -534,8 +534,10 @@ type profileView struct {
 	Name           string          `json:"name"`
 	ProviderFilter store.KeyFilter `json:"providerFilter"`
 	ModelFilter    store.KeyFilter `json:"modelFilter"`
+	Parents        []string        `json:"parents"`
 	IsDefault      bool            `json:"isDefault"`
 	KeyCount       int             `json:"keyCount"`
+	ChildCount     int             `json:"childCount"`
 }
 
 func (h *handlers) profilesList(w http.ResponseWriter, r *http.Request) {
@@ -546,9 +548,14 @@ func (h *handlers) profilesList(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]profileView, 0, len(ps))
 	for _, p := range ps {
+		parents := p.Parents
+		if parents == nil {
+			parents = []string{}
+		}
 		out = append(out, profileView{
 			Name: p.Name, ProviderFilter: p.ProviderFilter, ModelFilter: p.ModelFilter,
-			IsDefault: p.IsDefault, KeyCount: p.KeyCount,
+			Parents: parents, IsDefault: p.IsDefault,
+			KeyCount: p.KeyCount, ChildCount: p.ChildCount,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"profiles": out})
@@ -558,10 +565,14 @@ type profileRequest struct {
 	Name           string          `json:"name"`
 	ProviderFilter store.KeyFilter `json:"providerFilter"`
 	ModelFilter    store.KeyFilter `json:"modelFilter"`
+	Parents        []string        `json:"parents"`
 }
 
-// validateProfileRequest checks the name and both filters before a write.
-func validateProfileRequest(req profileRequest) error {
+// validateProfileRequest checks the name, both filters and the leaf/derived
+// XOR: a profile either carries filters or references parents, never both. It
+// trims parent names in place so the store sees the same values that were
+// validated.
+func validateProfileRequest(req *profileRequest) error {
 	if strings.TrimSpace(req.Name) == "" {
 		return errors.New("name is required")
 	}
@@ -573,6 +584,27 @@ func validateProfileRequest(req profileRequest) error {
 			return errors.New(f.label + " filter: " + err.Error())
 		}
 	}
+	seen := make(map[string]bool, len(req.Parents))
+	cleaned := make([]string, 0, len(req.Parents))
+	for _, parent := range req.Parents {
+		parent = strings.TrimSpace(parent)
+		switch {
+		case parent == "":
+			return errors.New("parent name is required")
+		case parent == strings.TrimSpace(req.Name):
+			return errors.New("a profile cannot be its own parent")
+		case seen[parent]:
+			return errors.New("duplicate parent " + parent)
+		}
+		seen[parent] = true
+		cleaned = append(cleaned, parent)
+	}
+	req.Parents = cleaned
+	if len(req.Parents) > 0 &&
+		(req.ProviderFilter.Mode == "include" || req.ProviderFilter.Mode == "exclude" ||
+			req.ModelFilter.Mode == "include" || req.ModelFilter.Mode == "exclude") {
+		return errors.New("a derived profile has no filters of its own")
+	}
 	return nil
 }
 
@@ -582,11 +614,11 @@ func (h *handlers) profilesCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
-	if err := validateProfileRequest(req); err != nil {
+	if err := validateProfileRequest(&req); err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
 		return
 	}
-	if _, err := h.store.CreateProfile(r.Context(), req.Name, req.ProviderFilter, req.ModelFilter); err != nil {
+	if _, err := h.store.CreateProfile(r.Context(), req.Name, req.ProviderFilter, req.ModelFilter, req.Parents); err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "could not create profile: " + err.Error()})
 		return
 	}
@@ -600,11 +632,11 @@ func (h *handlers) profilesUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
-	if err := validateProfileRequest(req); err != nil {
+	if err := validateProfileRequest(&req); err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := h.store.UpdateProfile(r.Context(), current, req.Name, req.ProviderFilter, req.ModelFilter); err != nil {
+	if err := h.store.UpdateProfile(r.Context(), current, req.Name, req.ProviderFilter, req.ModelFilter, req.Parents); err != nil {
 		h.writeProfileError(w, err, "could not update profile")
 		return
 	}
@@ -628,6 +660,8 @@ func (h *handlers) writeProfileError(w http.ResponseWriter, err error, fallback 
 	case errors.Is(err, store.ErrProfileImmutable):
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "the All profile is read-only"})
 	case errors.Is(err, store.ErrProfileInUse):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+	case errors.Is(err, store.ErrProfileInvalid):
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
 	default:
 		h.fail(w, err, fallback)

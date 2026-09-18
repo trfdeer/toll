@@ -94,6 +94,9 @@ type Profile struct {
 	Name           string        `yaml:"name"`
 	ProviderFilter ProfileFilter `yaml:"provider_filter"`
 	ModelFilter    ProfileFilter `yaml:"model_filter"`
+	// Parents names profiles this one unions. A derived profile (parents set)
+	// must keep both filters neutral; a leaf omits parents.
+	Parents []string `yaml:"parents,omitempty"`
 }
 
 // Upstream describes one OpenAI-compatible API backend.
@@ -350,9 +353,85 @@ func buildProfiles(in []Profile) ([]Profile, error) {
 		}
 		p.ProviderFilter = normalizeProfileFilter(p.ProviderFilter)
 		p.ModelFilter = normalizeProfileFilter(p.ModelFilter)
+
+		// Parents: trim, reject empties/duplicates/self-references, and enforce
+		// the leaf/derived XOR (a derived profile has no filters of its own).
+		parents := make([]string, 0, len(p.Parents))
+		parentSeen := make(map[string]bool, len(p.Parents))
+		for _, parent := range p.Parents {
+			parent = strings.TrimSpace(parent)
+			switch {
+			case parent == "":
+				errs = append(errs, fmt.Errorf("%s: parent name is required", label))
+				continue
+			case parent == p.Name:
+				errs = append(errs, fmt.Errorf("%s: a profile cannot be its own parent", label))
+				continue
+			case parentSeen[parent]:
+				errs = append(errs, fmt.Errorf("%s: duplicate parent %q", label, parent))
+				continue
+			}
+			parentSeen[parent] = true
+			parents = append(parents, parent)
+		}
+		if len(parents) > 0 &&
+			(p.ProviderFilter.Mode != "none" || p.ModelFilter.Mode != "none") {
+			errs = append(errs, fmt.Errorf("%s: a derived profile has no filters of its own", label))
+		}
+		p.Parents = parents
 		out = append(out, p)
 	}
-	return out, errors.Join(errs...)
+
+	if len(errs) > 0 {
+		return out, errors.Join(errs...)
+	}
+	if err := validateProfileGraph(out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// validateProfileGraph checks that every parent exists (in the config or as
+// the seeded All profile) and that the parent graph has no cycles.
+func validateProfileGraph(profiles []Profile) error {
+	known := map[string][]string{DefaultProfileName: nil}
+	for _, p := range profiles {
+		known[p.Name] = p.Parents
+	}
+	var errs []error
+	for _, p := range profiles {
+		for _, parent := range p.Parents {
+			if _, ok := known[parent]; !ok {
+				errs = append(errs, fmt.Errorf("profile %q: parent %q not found", p.Name, parent))
+			}
+		}
+	}
+	const (
+		visiting = 1
+		done     = 2
+	)
+	state := make(map[string]int, len(known))
+	var visit func(string)
+	visit = func(name string) {
+		switch state[name] {
+		case visiting:
+			errs = append(errs, fmt.Errorf("profile %q: parent cycle", name))
+			return
+		case done:
+			return
+		}
+		state[name] = visiting
+		for _, parent := range known[name] {
+			if _, ok := known[parent]; ok {
+				visit(parent)
+			}
+		}
+		state[name] = done
+	}
+	for _, p := range profiles {
+		visit(p.Name)
+	}
+	return errors.Join(errs...)
 }
 
 // validateProfileFilter mirrors the admin API's filter validation.

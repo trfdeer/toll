@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -106,7 +107,7 @@ func TestUpdateVirtualKey(t *testing.T) {
 
 	provider := KeyFilter{Mode: "include", Values: []string{"zeph"}}
 	model := KeyFilter{Mode: "exclude", Values: []string{"zeph/secret"}}
-	profileID, err := s.CreateProfile(t.Context(), "restricted", provider, model)
+	profileID, err := s.CreateProfile(t.Context(), "restricted", provider, model, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,15 +116,16 @@ func TestUpdateVirtualKey(t *testing.T) {
 	}
 
 	// The key material is unchanged: the same hash still resolves, and the
-	// filters come from the profile it now points at.
+	// rules come from the profile it now points at.
 	vk, err := s.KeyByHash(t.Context(), hash)
 	if err != nil {
 		t.Fatalf("key hash changed by update: %v", err)
 	}
-	if vk.Name != "after" || vk.ProfileName != "restricted" ||
-		vk.ProviderFilter.Mode != "include" ||
-		len(vk.ProviderFilter.Values) != 1 || vk.ProviderFilter.Values[0] != "zeph" ||
-		vk.ModelFilter.Mode != "exclude" {
+	if vk.Name != "after" || vk.ProfileName != "restricted" || vk.AllowAll ||
+		len(vk.Rules) != 1 ||
+		vk.Rules[0].ProviderFilter.Mode != "include" ||
+		len(vk.Rules[0].ProviderFilter.Values) != 1 || vk.Rules[0].ProviderFilter.Values[0] != "zeph" ||
+		vk.Rules[0].ModelFilter.Mode != "exclude" {
 		t.Errorf("updated key = %+v", vk)
 	}
 
@@ -263,7 +265,7 @@ func TestSeedProfiles(t *testing.T) {
 	ctx := t.Context()
 
 	// An existing profile to be updated by the seed.
-	if _, err := s.CreateProfile(ctx, "keep", KeyFilter{}, KeyFilter{}); err != nil {
+	if _, err := s.CreateProfile(ctx, "keep", KeyFilter{}, KeyFilter{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -302,5 +304,181 @@ func TestSeedProfiles(t *testing.T) {
 	}
 	if _, err := s.ProfileByName(ctx, "keep"); err != nil {
 		t.Errorf("unmentioned profile should survive: %v", err)
+	}
+}
+
+func TestDerivedProfileResolution(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := t.Context()
+
+	// Two leaf profiles.
+	if _, err := s.CreateProfile(ctx, "a-only",
+		KeyFilter{Mode: "include", Values: []string{"a"}}, KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateProfile(ctx, "b-only",
+		KeyFilter{Mode: "include", Values: []string{"b"}}, KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// A derived profile unions them and carries no filters of its own.
+	cID, err := s.CreateProfile(ctx, "a-plus-b", KeyFilter{}, KeyFilter{}, []string{"a-only", "b-only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.ProfileByName(ctx, "a-plus-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Parents) != 2 || c.Parents[0] != "a-only" || c.Parents[1] != "b-only" {
+		t.Errorf("derived parents = %v", c.Parents)
+	}
+
+	// A key on the derived profile resolves to both leaf rules.
+	if _, err := s.CreateVirtualKey(ctx, "app", "hash", cID); err != nil {
+		t.Fatal(err)
+	}
+	vk, err := s.KeyByHash(ctx, "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vk.AllowAll || len(vk.Rules) != 2 {
+		t.Fatalf("derived key resolution = allowAll=%v rules=%+v", vk.AllowAll, vk.Rules)
+	}
+	if vk.Rules[0].ProviderFilter.Values[0] != "a" || vk.Rules[1].ProviderFilter.Values[0] != "b" {
+		t.Errorf("resolved rules = %+v", vk.Rules)
+	}
+
+	// A derived profile may also nest.
+	dID, err := s.CreateProfile(ctx, "nested", KeyFilter{}, KeyFilter{}, []string{"a-plus-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVirtualKey(ctx, "nested-key", "hash-2", dID); err != nil {
+		t.Fatal(err)
+	}
+	nvk, err := s.KeyByHash(ctx, "hash-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nvk.AllowAll || len(nvk.Rules) != 2 {
+		t.Fatalf("nested resolution = allowAll=%v rules=%+v", nvk.AllowAll, nvk.Rules)
+	}
+
+	// An All ancestor short-circuits to allowAll.
+	_, err = s.ProfileByName(ctx, DefaultProfileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eID, err := s.CreateProfile(ctx, "everything", KeyFilter{}, KeyFilter{}, []string{DefaultProfileName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVirtualKey(ctx, "all-key", "hash-3", eID); err != nil {
+		t.Fatal(err)
+	}
+	avk, err := s.KeyByHash(ctx, "hash-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !avk.AllowAll {
+		t.Errorf("All ancestor should set allowAll: %+v", avk)
+	}
+}
+
+func TestDerivedProfileGuards(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := t.Context()
+
+	if _, err := s.CreateProfile(ctx, "a",
+		KeyFilter{Mode: "include", Values: []string{"a"}}, KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateProfile(ctx, "b",
+		KeyFilter{Mode: "include", Values: []string{"b"}}, KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mixed filters and parents is rejected.
+	if _, err := s.CreateProfile(ctx, "bad", KeyFilter{Mode: "include", Values: []string{"x"}}, KeyFilter{}, []string{"a"}); !errors.Is(err, ErrProfileInvalid) {
+		t.Errorf("mixed profile = %v, want ErrProfileInvalid", err)
+	}
+	// Unknown parent.
+	if _, err := s.CreateProfile(ctx, "bad", KeyFilter{}, KeyFilter{}, []string{"nope"}); !errors.Is(err, ErrProfileInvalid) {
+		t.Errorf("unknown parent = %v, want ErrProfileInvalid", err)
+	}
+	// Self-parent on update.
+	if err := s.UpdateProfile(ctx, "a", "a", KeyFilter{Mode: "include", Values: []string{"a"}}, KeyFilter{}, []string{"a"}); !errors.Is(err, ErrProfileInvalid) {
+		t.Errorf("self parent = %v, want ErrProfileInvalid", err)
+	}
+	// Cycle: a -> b then b -> a is refused.
+	if err := s.UpdateProfile(ctx, "a", "a", KeyFilter{}, KeyFilter{}, []string{"b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateProfile(ctx, "b", "b", KeyFilter{}, KeyFilter{}, []string{"a"}); !errors.Is(err, ErrProfileInvalid) {
+		t.Errorf("cycle = %v, want ErrProfileInvalid", err)
+	}
+	// b is now a parent of a; deleting it is refused.
+	if err := s.DeleteProfile(ctx, "b"); !errors.Is(err, ErrProfileInUse) {
+		t.Errorf("delete parent = %v, want ErrProfileInUse", err)
+	}
+	// Clear the edge and it deletes.
+	if err := s.UpdateProfile(ctx, "a", "a", KeyFilter{}, KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteProfile(ctx, "b"); err != nil {
+		t.Errorf("delete after clearing parent = %v", err)
+	}
+}
+
+func TestProfileRename(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := t.Context()
+
+	base, err := s.CreateProfile(ctx, "base",
+		KeyFilter{Mode: "include", Values: []string{"a"}}, KeyFilter{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateProfile(ctx, "child", KeyFilter{}, KeyFilter{}, []string{"base"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Renaming a parent keeps the edge (keyed by id) and the child sees the
+	// new name.
+	if err := s.UpdateProfile(ctx, "base", "base2",
+		KeyFilter{Mode: "include", Values: []string{"a"}}, KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	child, err := s.ProfileByName(ctx, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(child.Parents) != 1 || child.Parents[0] != "base2" {
+		t.Errorf("child parents after rename = %v", child.Parents)
+	}
+	if resolved, err := s.ProfileByName(ctx, "base2"); err != nil || resolved.ID != base {
+		t.Errorf("renamed parent = %+v err=%v", resolved, err)
+	}
+
+	// Renaming onto an existing name is a client error, not a raw UNIQUE.
+	if err := s.UpdateProfile(ctx, "child", "base2", KeyFilter{}, KeyFilter{}, nil); !errors.Is(err, ErrProfileInvalid) {
+		t.Errorf("rename collision = %v, want ErrProfileInvalid", err)
+	}
+	// The reserved default name is likewise refused.
+	if err := s.UpdateProfile(ctx, "child", DefaultProfileName, KeyFilter{}, KeyFilter{}, nil); !errors.Is(err, ErrProfileInvalid) {
+		t.Errorf("rename onto All = %v, want ErrProfileInvalid", err)
 	}
 }

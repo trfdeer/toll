@@ -29,6 +29,7 @@ interface ProfileBody {
   name?: string;
   providerFilter?: KeyFilter;
   modelFilter?: KeyFilter;
+  parents?: string[];
 }
 
 // In-memory mock of the toll admin API so the UI can be developed without a
@@ -37,13 +38,24 @@ interface ProfileBody {
 function mockApi(): Plugin {
   const none: KeyFilter = { mode: 'none', values: [] };
   const profiles: Profile[] = [
-    { name: 'All', providerFilter: none, modelFilter: none, isDefault: true, keyCount: 0 },
+    { name: 'All', providerFilter: none, modelFilter: none, parents: [], isDefault: true, keyCount: 0, childCount: 0 },
     {
       name: 'hyper-chat',
       providerFilter: { mode: 'include', values: ['hyper'] },
       modelFilter: { mode: 'exclude', values: ['hyper/deepseek-v3'] },
+      parents: [],
       isDefault: false,
       keyCount: 0,
+      childCount: 1,
+    },
+    {
+      name: 'hyper-strict',
+      providerFilter: none,
+      modelFilter: none,
+      parents: ['hyper-chat'],
+      isDefault: false,
+      keyCount: 0,
+      childCount: 0,
     },
   ];
   const keys: VirtualKey[] = [
@@ -257,7 +269,9 @@ function mockApi(): Plugin {
           return json(res, 200, {
             profiles: profiles.map((p) => ({
               ...p,
+              // Live counts: key references plus inheritance children.
               keyCount: keys.filter((k) => k.profile === p.name).length,
+              childCount: profiles.filter((x) => x.parents.includes(p.name)).length,
             })),
           });
         }
@@ -267,12 +281,15 @@ function mockApi(): Plugin {
           if (profiles.some((p) => p.name === body.name)) {
             return json(res, 422, { error: 'profile already exists' });
           }
+          const parents = body.parents ?? [];
           profiles.push({
             name: body.name,
             providerFilter: body.providerFilter ?? none,
             modelFilter: body.modelFilter ?? none,
+            parents,
             isDefault: false,
             keyCount: 0,
+            childCount: 0,
           });
           return json(res, 204, null);
         }
@@ -290,9 +307,13 @@ function mockApi(): Plugin {
           p.name = body.name;
           if (body.providerFilter) p.providerFilter = body.providerFilter;
           if (body.modelFilter) p.modelFilter = body.modelFilter;
-          // Keys reference profiles by name, so keep them pointing at the
-          // renamed profile.
+          p.parents = body.parents ?? [];
+          // Keys and derived profiles reference profiles by name, so keep them
+          // pointing at the renamed profile.
           for (const k of keys) if (k.profile === oldName) k.profile = p.name;
+          for (const x of profiles) {
+            x.parents = x.parents.map((parent) => (parent === oldName ? p.name : parent));
+          }
           return json(res, 204, null);
         }
         if (method === 'DELETE' && seg[0] === 'profiles' && seg[1]) {
@@ -305,6 +326,10 @@ function mockApi(): Plugin {
           const inUse = keys.filter((k) => k.profile === name).length;
           if (inUse > 0) {
             return json(res, 422, { error: `profile is in use by ${inUse} virtual key(s)` });
+          }
+          const children = profiles.filter((x) => x.parents.includes(name)).length;
+          if (children > 0) {
+            return json(res, 422, { error: `profile is in use as a parent by ${children} profile(s)` });
           }
           profiles.splice(i, 1);
           return json(res, 204, null);

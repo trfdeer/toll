@@ -107,7 +107,7 @@ func (c *Capture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// discovered from (never a prefix of its ID). A disallowed model is
 	// indistinguishable from an unknown one (no existence leak).
 	if vk := api.VirtualKeyFrom(r.Context()); vk != nil &&
-		!keys.Allows(route.UpstreamName, vk.ProviderFilter, vk.ModelFilter, model) {
+		!keys.Allows(route.UpstreamName, model, vk.AllowAll, vk.Rules) {
 		c.reject(w, reqID, http.StatusNotFound,
 			fmt.Sprintf("model %q is not available on this gateway", model))
 		return

@@ -1,4 +1,4 @@
-import type { KeyFilter, Model } from "./types";
+import type { KeyFilter, Model, Profile } from "./types";
 
 // The neutral filter: no constraint on the dimension.
 export const EMPTY_FILTER: KeyFilter = { mode: "none", values: [] };
@@ -47,4 +47,53 @@ export function allowedModels(
   model: KeyFilter,
 ): Model[] {
   return models.filter((m) => allowsModel(m, provider, model));
+}
+
+// profileAllowedModels resolves a profile's allowed set the way the gateway
+// does: the All default permits everything; a leaf applies its own filters; a
+// derived profile unions its parents. seen guards against parent cycles.
+export function profileAllowedModels(
+  profile: Profile,
+  byName: Map<string, Profile>,
+  models: Model[],
+  seen: Set<string> = new Set(),
+): Model[] {
+  if (profile.isDefault) return models;
+  if (seen.has(profile.name)) return [];
+  seen.add(profile.name);
+  if (profile.parents.length > 0) {
+    const out = new Map<number, Model>();
+    for (const parent of profile.parents) {
+      const p = byName.get(parent);
+      if (!p) continue;
+      for (const m of profileAllowedModels(p, byName, models, seen)) {
+        out.set(m.id, m);
+      }
+    }
+    return [...out.values()];
+  }
+  return allowedModels(models, profile.providerFilter, profile.modelFilter);
+}
+
+// descendantsOf returns every profile that transitively inherits from root,
+// so the parent picker can hide choices that would create a cycle.
+export function descendantsOf(root: string, profiles: Profile[]): Set<string> {
+  const children = new Map<string, string[]>();
+  for (const p of profiles) {
+    for (const parent of p.parents) {
+      children.set(parent, [...(children.get(parent) ?? []), p.name]);
+    }
+  }
+  const out = new Set<string>();
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    for (const child of children.get(current) ?? []) {
+      if (!out.has(child)) {
+        out.add(child);
+        stack.push(child);
+      }
+    }
+  }
+  return out;
 }

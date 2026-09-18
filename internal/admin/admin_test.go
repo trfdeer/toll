@@ -224,7 +224,7 @@ func TestKeysCreateListRevoke(t *testing.T) {
 
 	if _, err := st.CreateProfile(t.Context(), "restricted",
 		store.KeyFilter{Mode: "include", Values: []string{"hyper"}},
-		store.KeyFilter{Mode: "exclude", Values: []string{"hyper/glm"}}); err != nil {
+		store.KeyFilter{Mode: "exclude", Values: []string{"hyper/glm"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -309,7 +309,7 @@ func TestKeysUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.CreateProfile(t.Context(), "zeph-only",
-		store.KeyFilter{Mode: "include", Values: []string{"zeph"}}, store.KeyFilter{}); err != nil {
+		store.KeyFilter{Mode: "include", Values: []string{"zeph"}}, store.KeyFilter{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -463,6 +463,106 @@ func TestProfilesCRUD(t *testing.T) {
 	}
 }
 
+func TestProfilesDerived(t *testing.T) {
+	st, h := setup(t)
+
+	if _, err := st.CreateProfile(t.Context(), "base",
+		store.KeyFilter{Mode: "include", Values: []string{"hyper"}},
+		store.KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	do := func(method, path, body string) int {
+		t.Helper()
+		var req *http.Request
+		if body == "" {
+			req = httptest.NewRequest(method, path, nil)
+		} else {
+			req = httptest.NewRequest(method, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// A derived profile names its parents and carries no filters.
+	if code := do("POST", "/api/profiles", `{"name":"child","parents":["base"]}`); code != http.StatusNoContent {
+		t.Fatalf("create derived status = %d, want 204", code)
+	}
+
+	listProfiles := func() map[string]profileView {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/profiles", nil))
+		var listed struct {
+			Profiles []profileView `json:"profiles"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+			t.Fatal(err)
+		}
+		byName := map[string]profileView{}
+		for _, p := range listed.Profiles {
+			byName[p.Name] = p
+		}
+		return byName
+	}
+
+	byName := listProfiles()
+	if got := byName["child"]; len(got.Parents) != 1 || got.Parents[0] != "base" {
+		t.Errorf("derived profile = %+v", got)
+	}
+	if got := byName["base"]; got.ChildCount != 1 {
+		t.Errorf("base childCount = %d, want 1", got.ChildCount)
+	}
+
+	// Parent names are trimmed before the store resolves them.
+	if code := do("POST", "/api/profiles", `{"name":"padded","parents":[" base "]}`); code != http.StatusNoContent {
+		t.Fatalf("padded parent status = %d, want 204", code)
+	}
+	if got := listProfiles()["padded"]; len(got.Parents) != 1 || got.Parents[0] != "base" {
+		t.Errorf("padded parents = %v, want [base]", got.Parents)
+	}
+
+	// Renaming onto an existing name is a rejection, not a store 500.
+	if code := do("POST", "/api/profiles",
+		`{"name":"other","providerFilter":{"mode":"include","values":["z"]}}`); code != http.StatusNoContent {
+		t.Fatalf("create other status = %d, want 204", code)
+	}
+	if code := do("PUT", "/api/profiles/child", `{"name":"other","parents":["base"]}`); code != http.StatusUnprocessableEntity {
+		t.Errorf("rename collision status = %d, want 422", code)
+	}
+
+	// Filters mixed with parents, unknown parents and self-parenting are 422.
+	if code := do("POST", "/api/profiles",
+		`{"name":"mix","providerFilter":{"mode":"include","values":["x"]},"parents":["base"]}`); code != http.StatusUnprocessableEntity {
+		t.Errorf("mixed status = %d, want 422", code)
+	}
+	if code := do("POST", "/api/profiles", `{"name":"orphan","parents":["nope"]}`); code != http.StatusUnprocessableEntity {
+		t.Errorf("unknown parent status = %d, want 422", code)
+	}
+	if code := do("PUT", "/api/profiles/base", `{"name":"base","parents":["base"]}`); code != http.StatusUnprocessableEntity {
+		t.Errorf("self parent status = %d, want 422", code)
+	}
+	// Cycle: base inherits child, which already inherits base.
+	if code := do("PUT", "/api/profiles/base", `{"name":"base","parents":["child"]}`); code != http.StatusUnprocessableEntity {
+		t.Errorf("cycle status = %d, want 422", code)
+	}
+
+	// base is used as a parent, so it cannot be deleted yet.
+	if code := do("DELETE", "/api/profiles/base", ""); code != http.StatusUnprocessableEntity {
+		t.Errorf("delete parent status = %d, want 422", code)
+	}
+	for _, name := range []string{"child", "padded", "other"} {
+		if code := do("DELETE", "/api/profiles/"+name, ""); code != http.StatusNoContent {
+			t.Fatalf("delete %s status = %d, want 204", name, code)
+		}
+	}
+	if code := do("DELETE", "/api/profiles/base", ""); code != http.StatusNoContent {
+		t.Errorf("delete base after children status = %d, want 204", code)
+	}
+}
+
 func TestKeysPauseResumeDelete(t *testing.T) {
 	_, h := setup(t)
 
@@ -533,7 +633,7 @@ func TestConfigExport(t *testing.T) {
 	})
 	if _, err := st.CreateProfile(t.Context(), "glm-only",
 		store.KeyFilter{Mode: "include", Values: []string{"hyper"}},
-		store.KeyFilter{Mode: "exclude", Values: []string{"hyper/hidden"}}); err != nil {
+		store.KeyFilter{Mode: "exclude", Values: []string{"hyper/hidden"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -620,12 +720,16 @@ func TestConfigExport(t *testing.T) {
 }
 
 // TestConfigExportProfilesRoundTrip proves the exported YAML parses as a config
-// file and re-seeds an equivalent profile into a fresh store.
+// file and re-seeds equivalent leaf and derived profiles into a fresh store.
 func TestConfigExportProfilesRoundTrip(t *testing.T) {
 	st, h := setup(t)
 	if _, err := st.CreateProfile(t.Context(), "glm-only",
 		store.KeyFilter{Mode: "include", Values: []string{"hyper"}},
-		store.KeyFilter{}); err != nil {
+		store.KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateProfile(t.Context(), "combined",
+		store.KeyFilter{}, store.KeyFilter{}, []string{"glm-only"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -646,7 +750,7 @@ func TestConfigExportProfilesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("export did not parse as config: %v\n%s", err, rec.Body.String())
 	}
-	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "glm-only" {
+	if len(cfg.Profiles) != 2 {
 		t.Fatalf("parsed profiles = %+v", cfg.Profiles)
 	}
 
@@ -661,6 +765,7 @@ func TestConfigExportProfilesRoundTrip(t *testing.T) {
 			Name:           p.Name,
 			ProviderFilter: store.KeyFilter{Mode: p.ProviderFilter.Mode, Values: p.ProviderFilter.Values},
 			ModelFilter:    store.KeyFilter{Mode: p.ModelFilter.Mode, Values: p.ModelFilter.Values},
+			Parents:        p.Parents,
 		})
 	}
 	if err := fresh.SeedProfiles(t.Context(), seeds); err != nil {
@@ -673,6 +778,13 @@ func TestConfigExportProfilesRoundTrip(t *testing.T) {
 	if got.ProviderFilter.Mode != "include" || len(got.ProviderFilter.Values) != 1 ||
 		got.ProviderFilter.Values[0] != "hyper" || got.ModelFilter.Mode != "none" {
 		t.Errorf("round-tripped profile = %+v", got)
+	}
+	derived, err := fresh.ProfileByName(t.Context(), "combined")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(derived.Parents) != 1 || derived.Parents[0] != "glm-only" {
+		t.Errorf("round-tripped derived parents = %v", derived.Parents)
 	}
 }
 

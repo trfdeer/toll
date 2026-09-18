@@ -116,7 +116,7 @@ func startGateway(t *testing.T, stub *stubUpstream, provider, model store.KeyFil
 	plaintext, hash, _ := keys.Generate()
 	profileID := int64(1) // the seeded All profile
 	if constrained(provider) || constrained(model) {
-		id, err := st.CreateProfile(t.Context(), "app", provider, model)
+		id, err := st.CreateProfile(t.Context(), "app", provider, model, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

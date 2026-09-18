@@ -34,10 +34,30 @@ func TestAllows(t *testing.T) {
 		{"bare model id", "hyper", none, inc("glm"), "glm", true},
 	}
 	for _, tc := range cases {
-		if got := Allows(tc.provider, tc.providerFlt, tc.modelFlt, tc.modelID); got != tc.want {
+		rules := []Rule{{ProviderFilter: tc.providerFlt, ModelFilter: tc.modelFlt}}
+		if got := Allows(tc.provider, tc.modelID, false, rules); got != tc.want {
 			t.Errorf("%s: Allows(%q, %+v, %+v, %q) = %v, want %v",
 				tc.name, tc.provider, tc.providerFlt, tc.modelFlt, tc.modelID, got, tc.want)
 		}
+	}
+
+	// allowAll (an All profile in the ancestry) permits everything.
+	if !Allows("any", "any/thing", true, nil) {
+		t.Error("allowAll should permit every model")
+	}
+	// Union: a model passes when any rule passes, even across providers.
+	union := []Rule{
+		{ProviderFilter: inc("b"), ModelFilter: none},
+		{ProviderFilter: inc("a"), ModelFilter: inc("a/one", "a/two")},
+	}
+	if !Allows("b", "b/anything", false, union) {
+		t.Error("second rule should allow provider b")
+	}
+	if !Allows("a", "a/one", false, union) {
+		t.Error("first rule should allow a/one")
+	}
+	if Allows("a", "a/three", false, union) {
+		t.Error("a/three is in neither rule")
 	}
 }
 

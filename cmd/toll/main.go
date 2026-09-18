@@ -175,7 +175,7 @@ func resolveKeyProfile(ctx context.Context, db *store.Store, keyName, profileNam
 		}
 		name += "-profile"
 	}
-	return db.CreateProfile(ctx, name, provider, model)
+	return db.CreateProfile(ctx, name, provider, model, nil)
 }
 
 // noConstraint reports whether a filter imposes no restriction.
@@ -277,6 +277,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 				Name:           p.Name,
 				ProviderFilter: store.KeyFilter{Mode: p.ProviderFilter.Mode, Values: p.ProviderFilter.Values},
 				ModelFilter:    store.KeyFilter{Mode: p.ModelFilter.Mode, Values: p.ModelFilter.Values},
+				Parents:        p.Parents,
 			})
 		}
 		if err := db.SeedProfiles(ctx, seeds); err != nil {

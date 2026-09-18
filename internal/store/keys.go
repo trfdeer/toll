@@ -48,55 +48,56 @@ func (s *Store) CreateVirtualKey(ctx context.Context, name, keyHash string, prof
 	return res.LastInsertId()
 }
 
-// VirtualKey is a stored key row with its profile's filters resolved.
+// VirtualKey is a stored key row with its profile's rules resolved. A key
+// allows a model when AllowAll is set or any of Rules allows it.
 type VirtualKey struct {
-	ID             int64
-	Name           string
-	ProfileID      int64
-	ProfileName    string
-	ProviderFilter KeyFilter
-	ModelFilter    KeyFilter
-	Revoked        bool
-	Paused         bool
-}
-
-// scanKey reads a key row from a query selecting id, name, profile_id,
-// profile name, provider_filter, model_filter — the filters joined from the
-// key's profile.
-func scanKey(row interface{ Scan(...any) error }) (VirtualKey, error) {
-	var vk VirtualKey
-	var provider, model string
-	if err := row.Scan(&vk.ID, &vk.Name, &vk.ProfileID, &vk.ProfileName, &provider, &model); err != nil {
-		return vk, err
-	}
-	_ = json.Unmarshal([]byte(provider), &vk.ProviderFilter)
-	_ = json.Unmarshal([]byte(model), &vk.ModelFilter)
-	vk.ProviderFilter = vk.ProviderFilter.normalize()
-	vk.ModelFilter = vk.ModelFilter.normalize()
-	return vk, nil
+	ID          int64
+	Name        string
+	ProfileID   int64
+	ProfileName string
+	// AllowAll is set when the profile (or any ancestor) is the All profile:
+	// every model is permitted.
+	AllowAll bool
+	// Rules is the resolved union of leaf clauses the profile permits.
+	Rules   []KeyRule
+	Revoked bool
+	Paused  bool
 }
 
 // KeyByHash resolves an active key by plaintext hash. Revoked and paused
 // keys are both treated as inactive.
 func (s *Store) KeyByHash(ctx context.Context, keyHash string) (*VirtualKey, error) {
-	vk, err := scanKey(s.db.QueryRowContext(ctx, `
-		SELECT vk.id, vk.name, vk.profile_id, p.name, p.provider_filter, p.model_filter
+	var vk VirtualKey
+	err := s.db.QueryRowContext(ctx, `
+		SELECT vk.id, vk.name, vk.profile_id, p.name
 		FROM virtual_keys vk JOIN profiles p ON p.id = vk.profile_id
-		WHERE vk.key_hash = ? AND vk.revoked_at IS NULL AND vk.paused_at IS NULL`, keyHash))
+		WHERE vk.key_hash = ? AND vk.revoked_at IS NULL AND vk.paused_at IS NULL`, keyHash).
+		Scan(&vk.ID, &vk.Name, &vk.ProfileID, &vk.ProfileName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrKeyNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lookup key: %w", err)
 	}
+	graph, err := s.loadProfileGraph(ctx)
+	if err != nil {
+		return nil, err
+	}
+	vk.AllowAll, vk.Rules = resolveProfileRules(graph, vk.ProfileID)
 	return &vk, nil
 }
 
 // ListVirtualKeys returns all keys, including revoked and paused ones, with
 // their profiles resolved.
 func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
+	// Resolve the profile graph first: the outer query below keeps the pool's
+	// single connection open for its duration.
+	graph, err := s.loadProfileGraph(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT vk.id, vk.name, vk.profile_id, p.name, p.provider_filter, p.model_filter,
+		SELECT vk.id, vk.name, vk.profile_id, p.name,
 		       vk.revoked_at, vk.paused_at
 		FROM virtual_keys vk JOIN profiles p ON p.id = vk.profile_id
 		ORDER BY vk.id`)
@@ -107,15 +108,11 @@ func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
 	var out []VirtualKey
 	for rows.Next() {
 		var vk VirtualKey
-		var provider, model string
 		var revoked, paused sql.NullString
-		if err := rows.Scan(&vk.ID, &vk.Name, &vk.ProfileID, &vk.ProfileName, &provider, &model, &revoked, &paused); err != nil {
+		if err := rows.Scan(&vk.ID, &vk.Name, &vk.ProfileID, &vk.ProfileName, &revoked, &paused); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal([]byte(provider), &vk.ProviderFilter)
-		_ = json.Unmarshal([]byte(model), &vk.ModelFilter)
-		vk.ProviderFilter = vk.ProviderFilter.normalize()
-		vk.ModelFilter = vk.ModelFilter.normalize()
+		vk.AllowAll, vk.Rules = resolveProfileRules(graph, vk.ProfileID)
 		vk.Revoked = revoked.Valid
 		vk.Paused = paused.Valid
 		out = append(out, vk)

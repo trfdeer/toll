@@ -341,6 +341,18 @@ ALTER TABLE virtual_keys ADD COLUMN profile_id INTEGER NOT NULL DEFAULT 1 REFERE
 ALTER TABLE virtual_keys DROP COLUMN provider_filter;
 ALTER TABLE virtual_keys DROP COLUMN model_filter;
 `,
+	// 12: derived profiles. A profile may union other profiles (its parents)
+	// instead of carrying its own filters: a leaf has filters and no parents,
+	// a derived profile has parents and neutral filters. Deletion of a profile
+	// used as a parent is refused in code; the cascade is a safety net.
+	`
+CREATE TABLE profile_parents (
+	profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+	parent_id  INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+	PRIMARY KEY (profile_id, parent_id),
+	CHECK (profile_id <> parent_id)
+);
+`,
 }
 
 // contentMigrations are applied to the content database (content.db), which

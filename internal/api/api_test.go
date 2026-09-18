@@ -40,7 +40,7 @@ func makeKey(t *testing.T, st *store.Store, name string, provider, model store.K
 	t.Helper()
 	profileID := int64(1) // the seeded All profile
 	if constrained(provider) || constrained(model) {
-		id, err := st.CreateProfile(t.Context(), name, provider, model)
+		id, err := st.CreateProfile(t.Context(), name, provider, model, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -306,5 +306,62 @@ func TestRevokedKeyRejected(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 for revoked key", rec.Code)
+	}
+}
+
+// TestModelsDerivedProfileUnion proves /v1/models gating unions a derived
+// profile's parents: a key sees models from every parent's provider and
+// nothing else.
+func TestModelsDerivedProfileUnion(t *testing.T) {
+	st, h := setup(t)
+
+	upA, _ := st.UpsertUpstream(t.Context(), "a", "https://a/v1", "k", 300, 0)
+	upB, _ := st.UpsertUpstream(t.Context(), "b", "https://b/v1", "k", 300, 1)
+	upC, _ := st.UpsertUpstream(t.Context(), "c", "https://c/v1", "k", 300, 2)
+	seedModel(t, st, upA, "a/one", `{"id":"one"}`)
+	seedModel(t, st, upB, "b/two", `{"id":"two"}`)
+	seedModel(t, st, upC, "c/three", `{"id":"three"}`)
+
+	if _, err := st.CreateProfile(t.Context(), "a-only",
+		store.KeyFilter{Mode: "include", Values: []string{"a"}}, store.KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateProfile(t.Context(), "b-only",
+		store.KeyFilter{Mode: "include", Values: []string{"b"}}, store.KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	unionID, err := st.CreateProfile(t.Context(), "union",
+		store.KeyFilter{}, store.KeyFilter{}, []string{"a-only", "b-only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plaintext, hash, _ := keys.Generate()
+	if _, err := st.CreateVirtualKey(t.Context(), "derived", hash, unionID); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+plaintext)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, m := range body.Data {
+		ids[m["id"].(string)] = true
+	}
+	if len(ids) != 2 || !ids["a/one"] || !ids["b/two"] {
+		t.Errorf("derived union models = %v, want a/one and b/two only", ids)
+	}
+	if ids["c/three"] {
+		t.Error("derived union leaked a model from an unlisted provider")
 	}
 }

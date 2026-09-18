@@ -377,3 +377,77 @@ func readAllBody(r *http.Request) string {
 	n, _ := r.Body.Read(b)
 	return string(b[:n])
 }
+
+// TestCaptureDerivedProfileGate proves the proxy gate unions a derived
+// profile's parents: allowed providers route, an unlisted one is a 404 that
+// does not leak existence.
+func TestCaptureDerivedProfileGate(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"1","model":"one","choices":[],
+		  "usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	for i, name := range []string{"a", "b", "c"} {
+		id, err := st.UpsertUpstream(t.Context(), name, upstream.URL+"/v1", "k", 0, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ReplaceModels(t.Context(), id, []store.DiscoveredModel{{
+			UpstreamModelID: name + "-one",
+			GatewayID:       name + "/one",
+			DisplayName:     name + "/one",
+			Metadata:        []byte(`{}`),
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := st.CreateProfile(t.Context(), "a-only",
+		store.KeyFilter{Mode: "include", Values: []string{"a"}}, store.KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateProfile(t.Context(), "b-only",
+		store.KeyFilter{Mode: "include", Values: []string{"b"}}, store.KeyFilter{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	unionID, err := st.CreateProfile(t.Context(), "union",
+		store.KeyFilter{}, store.KeyFilter{}, []string{"a-only", "b-only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext, hash, _ := keys.Generate()
+	if _, err := st.CreateVirtualKey(t.Context(), "derived", hash, unionID); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := log.NewWithOptions(nil, log.Options{Level: log.ErrorLevel})
+	handler := api.Auth(st, logger, NewCapture(st, logger))
+
+	do := func(model string) int {
+		req := httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"`+model+`","messages":[]}`))
+		req.Header.Set("Authorization", "Bearer "+plaintext)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := do("a/one"); code != http.StatusOK {
+		t.Errorf("parent a model status = %d, want 200", code)
+	}
+	if code := do("b/one"); code != http.StatusOK {
+		t.Errorf("parent b model status = %d, want 200", code)
+	}
+	if code := do("c/one"); code != http.StatusNotFound {
+		t.Errorf("unlisted provider model status = %d, want 404", code)
+	}
+}

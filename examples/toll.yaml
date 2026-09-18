@@ -22,7 +22,9 @@ data_dir: ./data         # SQLite lives here (TOLL_DATA_DIR overrides)
 # database at startup; afterwards the admin UI is authoritative (export the
 # config to persist UI edits). Modes: none (unconstrained), include (only
 # Values), exclude (everything but Values); include/exclude need at least one
-# value.
+# value. A profile is either a leaf (its own filters) or derived (a `parents`
+# list whose sets are unioned; it has no filters of its own). Parents may
+# reference a profile defined later in this list, or "All".
 # profiles:
 #   - name: glm-only
 #     provider_filter:
@@ -31,6 +33,12 @@ data_dir: ./data         # SQLite lives here (TOLL_DATA_DIR overrides)
 #     model_filter:
 #       mode: exclude
 #       values: [openrouter/deepseek-v3]
+#   - name: glm-plus-openai          # derived: union of the parents below
+#     parents: [glm-only, openai-only]
+#   - name: openai-only
+#     provider_filter:
+#       mode: include
+#       values: [openai]
 
 upstreams:
   # --- An OpenAI-compatible provider (https://openrouter.ai) ---
