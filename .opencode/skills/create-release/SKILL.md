@@ -133,8 +133,18 @@ commit.
 ### 6. Tag and push
 
 ```sh
-git tag -a vX.Y.Z -F /tmp/toll-release-notes.md   # git tag rejects -m and -F together
+git tag -a vX.Y.Z -F /tmp/toll-release-notes.md --cleanup=verbatim
 git push origin vX.Y.Z
+```
+
+`--cleanup=verbatim` is required: `git tag` rejects `-m` and `-F` together, and
+its default cleanup treats every line starting with `#` as a comment, which
+would silently drop the `## [X.Y.Z]` and `### Added` headings from the notes.
+After tagging, confirm the message survived and the tag is signed:
+
+```sh
+git cat-file -p vX.Y.Z | sed -n '5,10p'          # headings present
+git cat-file -p vX.Y.Z | grep -q 'BEGIN SSH SIGNATURE' && echo signed
 ```
 
 The tag name must match `v*` (`.github/workflows/release.yml`). CI then builds
@@ -174,13 +184,17 @@ gh release create vX.Y.Z --title "toll X.Y.Z" --notes-file /tmp/toll-release-not
   published. Fix the cause on `main`, push it, wait for the snapshot build, then
   move the tag onto the fix: `git push origin :vX.Y.Z`, `git tag -d vX.Y.Z`,
   re-tag and push. A failed run never moves `:latest`.
-- **The notes are wrong** — edit `/tmp/toll-release-notes.md` and re-tag. If the
-  tag was already pushed and consumed, do not move it: cut a new patch version.
+- **The notes are wrong, or the tag message lost its `##` / `###` headings** —
+  edit `/tmp/toll-release-notes.md`, delete the tag (`git push origin :vX.Y.Z`,
+  `git tag -d vX.Y.Z`), and re-tag with `--cleanup=verbatim`. If the tag was
+  already pushed and consumed, do not move it: cut a new patch version.
 
 ## Do not
 
 - Do not create unsigned commits or tags, or disable signing to get past a
   failure.
+- Do not tag with `-F` without `--cleanup=verbatim`; the default cleanup strips
+  the Markdown headings from the notes.
 - Do not tag a version whose prefix was not bumped in the same commit — the
   binary would report the old `x.y.z` with only the hash changed.
 - Do not tag from a dirty tree or a commit that is not on `main`.
