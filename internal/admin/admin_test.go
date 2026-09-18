@@ -243,7 +243,7 @@ func TestKeysCreateListRevoke(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(created.Plaintext, "gw_") {
+	if !strings.HasPrefix(created.Plaintext, "sk-tl-") {
 		t.Errorf("plaintext missing: %s", rec.Body.String())
 	}
 

@@ -66,7 +66,7 @@ func TestGenerateHashRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plaintext) != len(Prefix)+48 {
+	if len(plaintext) != len(Prefix)+40 {
 		t.Errorf("key length = %d", len(plaintext))
 	}
 	if Hash(plaintext) != hash {
@@ -86,7 +86,7 @@ func TestParseBearer(t *testing.T) {
 	if _, ok := ParseBearer("Bearer "); ok {
 		t.Error("empty token accepted")
 	}
-	if tok, ok := ParseBearer("Bearer gw_abc"); !ok || tok != "gw_abc" {
+	if tok, ok := ParseBearer("Bearer sk-tl-abc"); !ok || tok != "sk-tl-abc" {
 		t.Errorf("token = %q ok=%v", tok, ok)
 	}
 }

@@ -51,14 +51,14 @@ Create a virtual API key for your clients:
 
 ```sh
 $ toll keys add my-app
-key created (store this now — it is not recoverable) name=my-app key=gw_3f2a…
+key created (store this now — it is not recoverable) name=my-app key=sk-tl-3f2a…
 ```
 
 Point any OpenAI-compatible client at the gateway, authenticating with the virtual key:
 
 ```sh
 curl -s http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer gw_3f2a…" \
+  -H "Authorization: Bearer sk-tl-3f2a…" \
   -H "content-type: application/json" \
   -d '{"model": "openrouter/deepseek-v3.2", "messages": [{"role": "user", "content": "hi"}]}'
 ```
@@ -83,7 +83,7 @@ Cost comes from a `pricing` object in model metadata (per-Mtok USD: `input`, `ou
 
 ### Virtual keys
 
-Clients authenticate with `gw_…` keys (SHA-256 hashed at rest, plaintext shown once). Each key carries optional provider and model filters — include or exclude — checked against the upstream a model was discovered from, so aliasing can't smuggle a model past a filter. `GET /v1/models` is filtered per key.
+Clients authenticate with `sk-tl-…` keys (SHA-256 hashed at rest, plaintext shown once). Each key carries optional provider and model filters — include or exclude — checked against the upstream a model was discovered from, so aliasing can't smuggle a model past a filter. `GET /v1/models` is filtered per key.
 
 ```sh
 toll keys add restricted --allow-provider openrouter --deny-model openrouter/some-pricey-model

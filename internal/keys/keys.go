@@ -12,7 +12,7 @@ import (
 
 // Prefix makes gateway keys recognizable in client configs and lets leaked
 // keys be identified in scans.
-const Prefix = "gw_"
+const Prefix = "sk-tl-"
 
 // FilterMode is how a key's provider or model filter treats its value list.
 type FilterMode string
@@ -49,10 +49,10 @@ type VirtualKey struct {
 	Rules    []Rule
 }
 
-// Generate returns a new plaintext key. It is shown once at creation; only
-// its SHA-256 is stored.
+// Generate returns a new plaintext key: Prefix followed by 40 lowercase hex
+// characters. It is shown once at creation; only its SHA-256 is stored.
 func Generate() (plaintext string, hash string, err error) {
-	raw := make([]byte, 24)
+	raw := make([]byte, 20)
 	if _, err = rand.Read(raw); err != nil {
 		return "", "", fmt.Errorf("generate key: %w", err)
 	}
