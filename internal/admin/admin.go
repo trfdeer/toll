@@ -395,12 +395,17 @@ func (h *handlers) modelsRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	total := 0
 	warnings := make([]string, 0)
+	h.logger.Info("models refresh: starting", "providers", len(ups))
 	for _, u := range ups {
 		n, warning := h.syncProvider(r.Context(), u.Name, u.BaseURL, u.APIKey, u.ID)
 		total += n
 		if warning != "" {
 			warnings = append(warnings, u.Name+": "+warning)
 		}
+	}
+	h.logger.Info("models refresh: done", "providers", len(ups), "models", total, "warnings", len(warnings))
+	for _, w := range warnings {
+		h.logger.Warn("models refresh: provider warning", "warning", w)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"providers": len(ups),

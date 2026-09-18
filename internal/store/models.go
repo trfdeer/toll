@@ -139,31 +139,48 @@ func (s *Store) ReplaceModels(ctx context.Context, upstreamID int64, models []Di
 		}
 	}
 
-	// Delete models no longer reported by the upstream. The IN list is
-	// bounded by upstream catalog size; chunk to stay well under
-	// SQLITE_MAX_VARIABLE_NUMBER.
-	ids := make([]string, len(models))
-	for i, m := range models {
-		ids[i] = m.UpstreamModelID
+	// Delete models no longer reported by the upstream. Compare against the
+	// full reported set in memory, then delete the stale IDs in chunks. A
+	// chunked `NOT IN (chunk)` would be wrong: each chunk would delete the
+	// rows belonging to the other chunks (regression: catalogs >400 models
+	// were wiped on every sync).
+	reported := make(map[string]struct{}, len(models))
+	for _, m := range models {
+		reported[m.UpstreamModelID] = struct{}{}
 	}
-	if len(ids) == 0 {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM models WHERE upstream_id = ?`, upstreamID); err != nil {
-			return 0, fmt.Errorf("sync models: delete all: %w", err)
+	rows, err := tx.QueryContext(ctx, `SELECT upstream_model_id FROM models WHERE upstream_id = ?`, upstreamID)
+	if err != nil {
+		return 0, fmt.Errorf("sync models: select stale: %w", err)
+	}
+	var stale []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("sync models: select stale: %w", err)
 		}
-	} else {
-		const chunk = 400
-		for start := 0; start < len(ids); start += chunk {
-			end := start + chunk
-			if end > len(ids) {
-				end = len(ids)
-			}
-			batch := ids[start:end]
-			qmarks := "(" + strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",") + ")"
-			args := append([]any{upstreamID}, toAny(batch)...)
-			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM models WHERE upstream_id = ? AND upstream_model_id NOT IN `+qmarks, args...); err != nil {
-				return 0, fmt.Errorf("sync models: delete stale: %w", err)
-			}
+		if _, ok := reported[id]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("sync models: select stale: %w", err)
+	}
+	rows.Close()
+
+	const chunk = 400
+	for start := 0; start < len(stale); start += chunk {
+		end := start + chunk
+		if end > len(stale) {
+			end = len(stale)
+		}
+		batch := stale[start:end]
+		qmarks := "(" + strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",") + ")"
+		args := append([]any{upstreamID}, toAny(batch)...)
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM models WHERE upstream_id = ? AND upstream_model_id IN `+qmarks, args...); err != nil {
+			return 0, fmt.Errorf("sync models: delete stale: %w", err)
 		}
 	}
 

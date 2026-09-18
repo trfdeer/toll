@@ -22,25 +22,31 @@ const providerSyncTimeout = 20 * time.Second
 func (h *handlers) syncProvider(ctx context.Context, name, baseURL, apiKey string, upstreamID int64) (int, string) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
+		h.logger.Error("provider model sync: invalid base URL", "provider", name, "err", err)
 		return 0, "model sync skipped: " + err.Error()
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, providerSyncTimeout)
 	defer cancel()
 
-	discovered, err := discovery.NewClient().Models(ctx, u, apiKey)
+	h.logger.Debug("provider model sync: starting", "provider", name, "base_url", u.Redacted(), "upstream_id", upstreamID)
+	discovered, err := discovery.NewClient(h.logger).Models(ctx, u, apiKey)
 	if err != nil {
-		h.logger.Warn("provider model sync failed", "provider", name, "err", err)
+		h.logger.Error("provider model sync: catalog fetch failed", "provider", name, "base_url", u.Redacted(), "err", err)
 		h.markProviderReachable(name, false, err.Error())
 		return 0, "models could not be fetched: " + err.Error()
 	}
+	h.logger.Debug("provider model sync: catalog discovered", "provider", name, "models", len(discovered))
 
 	engine := registry.NewEngine(&config.Upstream{Name: name})
 	models := make([]store.DiscoveredModel, 0, len(discovered))
+	unresolved := 0
 	for _, d := range discovered {
 		r, err := engine.Resolve(d.UpstreamModelID, d.Metadata)
 		if err != nil {
-			h.logger.Warn("skipping model with unresolvable metadata", "provider", name, "err", err)
+			unresolved++
+			h.logger.Warn("provider model sync: skipping model with unresolvable metadata",
+				"provider", name, "model", d.UpstreamModelID, "err", err)
 			continue
 		}
 		models = append(models, store.DiscoveredModel{
@@ -50,14 +56,26 @@ func (h *handlers) syncProvider(ctx context.Context, name, baseURL, apiKey strin
 			Metadata:        r.Metadata,
 		})
 	}
+	if unresolved > 0 {
+		h.logger.Warn("provider model sync: some models could not be resolved",
+			"provider", name, "skipped", unresolved, "resolved", len(models))
+	}
 
-	if _, err := h.store.ReplaceModels(ctx, upstreamID, models); err != nil {
+	skipped, err := h.store.ReplaceModels(ctx, upstreamID, models)
+	if err != nil {
 		h.logger.Error("provider registry sync failed", "provider", name, "err", err)
 		h.markProviderReachable(name, false, err.Error())
 		return 0, "models could not be stored: " + err.Error()
 	}
+	if skipped > 0 {
+		h.logger.Warn("provider model sync: gateway ID collisions, entries skipped",
+			"provider", name, "skipped", skipped, "reported", len(models))
+	}
+	stored := len(models) - skipped
 	h.markProviderReachable(name, true, "")
-	return len(models), ""
+	h.logger.Info("provider model sync: done",
+		"provider", name, "discovered", len(discovered), "mapped", len(models), "registered", stored)
+	return stored, ""
 }
 
 // markProviderReachable records a sync outcome on a detached context, so a

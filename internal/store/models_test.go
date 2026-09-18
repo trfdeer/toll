@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -66,6 +67,63 @@ func TestUpsertUpstreamAndReplaceModels(t *testing.T) {
 	sync()
 	if got := count(); got != 0 {
 		t.Fatalf("after empty sync: %d models, want 0", got)
+	}
+}
+
+// TestReplaceModelsLargeCatalogStaleDelete guards the chunked stale-delete:
+// a catalog larger than one delete chunk must not have the chunks delete each
+// other's rows (regression: >400 models vanished after every sync).
+func TestReplaceModelsLargeCatalogStaleDelete(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := t.Context()
+
+	id, err := s.UpsertUpstream(ctx, "hyper", "https://x.example/v1", "k", 300, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 842 models spans two full 400-chunks plus a remainder.
+	const total = 842
+	models := make([]DiscoveredModel, 0, total)
+	for i := 0; i < total; i++ {
+		models = append(models, m("m"+strconv.Itoa(i)))
+	}
+	if _, err := s.ReplaceModels(ctx, id, models); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ModelCount(ctx, id); err != nil {
+		t.Fatal(err)
+	} else if got != total {
+		t.Fatalf("after large sync: %d models, want %d", got, total)
+	}
+
+	// Keep only every third model so the stale set (561) itself exceeds one
+	// 400-row delete chunk; stale detection must work across chunk
+	// boundaries too. Add one new model to exercise insert-plus-delete.
+	kept := make([]DiscoveredModel, 0, total/3+1)
+	for i := 0; i < total; i++ {
+		if i%3 != 0 {
+			continue
+		}
+		kept = append(kept, m("m"+strconv.Itoa(i)))
+	}
+	kept = append(kept, m("fresh"))
+	if _, err := s.ReplaceModels(ctx, id, kept); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ModelCount(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != len(kept) {
+		t.Fatalf("after pruned sync: %d models, want %d", got, len(kept))
+	}
+	if stale := total - got; stale <= 400 {
+		t.Fatalf("test setup wrong: stale set must exceed one chunk (have %d kept, %d stale)", got, stale)
 	}
 }
 

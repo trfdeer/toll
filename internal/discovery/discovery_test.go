@@ -38,7 +38,7 @@ func TestModelsFetchParsesVerbatim(t *testing.T) {
 	defer srv.Close()
 
 	base, _ := url.Parse(srv.URL + "/v1")
-	got, err := NewClient().Models(t.Context(), base, "k")
+	got, err := NewClient(testLogger()).Models(t.Context(), base, "k")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestModelsNonOK(t *testing.T) {
 	defer srv.Close()
 
 	base, _ := url.Parse(srv.URL + "/v1")
-	_, err := NewClient().Models(t.Context(), base, "k")
+	_, err := NewClient(testLogger()).Models(t.Context(), base, "k")
 	if err == nil {
 		t.Fatal("expected error for non-200 upstream")
 	}

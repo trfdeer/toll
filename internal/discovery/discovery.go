@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/log"
@@ -28,34 +29,48 @@ const fetchTimeout = 30 * time.Second
 
 // Client fetches model catalogs from OpenAI-compatible upstreams.
 type Client struct {
-	hc *http.Client
+	hc     *http.Client
+	logger *log.Logger
 }
 
-func NewClient() *Client {
-	return &Client{hc: &http.Client{Timeout: fetchTimeout}}
+func NewClient(logger *log.Logger) *Client {
+	if logger == nil {
+		logger = log.Default()
+	}
+	return &Client{hc: &http.Client{Timeout: fetchTimeout}, logger: logger}
 }
 
 // Models fetches and parses the upstream's model list. Each entry's JSON is
-// returned byte-identical to what the upstream sent.
+// returned byte-identical to what the upstream sent. Every request and its
+// outcome is logged so discovery problems are visible in the server logs.
 func (c *Client) Models(ctx context.Context, base *url.URL, apiKey string) ([]store.DiscoveredModel, error) {
 	u := *base
 	u.Path = joinModelPath(base.Path)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
+		c.logger.Error("upstream models: could not build request", "url", u.Redacted(), "err", err)
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
 
+	c.logger.Debug("upstream models: request", "url", u.Redacted())
+	start := time.Now()
 	resp, err := c.hc.Do(req)
 	if err != nil {
+		c.logger.Error("upstream models: request failed",
+			"url", u.Redacted(), "err", err, "duration", time.Since(start).Round(time.Millisecond))
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		c.logger.Error("upstream models: non-200 response",
+			"url", u.Redacted(), "status", resp.StatusCode,
+			"body", strings.TrimSpace(string(body)),
+			"duration", time.Since(start).Round(time.Millisecond))
 		return nil, fmt.Errorf("GET %s: status %d: %s", u.Redacted(), resp.StatusCode, body)
 	}
 
@@ -63,16 +78,21 @@ func (c *Client) Models(ctx context.Context, base *url.URL, apiKey string) ([]st
 		Data []json.RawMessage `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		c.logger.Error("upstream models: could not decode response",
+			"url", u.Redacted(), "status", resp.StatusCode, "err", err,
+			"duration", time.Since(start).Round(time.Millisecond))
 		return nil, fmt.Errorf("decode model list: %w", err)
 	}
 
 	models := make([]store.DiscoveredModel, 0, len(catalog.Data))
+	skipped := 0
 	for _, raw := range catalog.Data {
 		var entry struct {
 			ID string `json:"id"`
 		}
 		if err := json.Unmarshal(raw, &entry); err != nil || entry.ID == "" {
 			// Not a model entry (or malformed) — skip it, keep the rest.
+			skipped++
 			continue
 		}
 		models = append(models, store.DiscoveredModel{
@@ -80,6 +100,10 @@ func (c *Client) Models(ctx context.Context, base *url.URL, apiKey string) ([]st
 			Metadata:        raw,
 		})
 	}
+	c.logger.Info("upstream models: catalog fetched",
+		"url", u.Redacted(), "status", resp.StatusCode, "models", len(models),
+		"skipped", skipped, "entries", len(catalog.Data),
+		"duration", time.Since(start).Round(time.Millisecond))
 	return models, nil
 }
 
@@ -97,12 +121,15 @@ type Syncer struct {
 }
 
 func NewSyncer(st *store.Store, cfg *config.Config, logger *log.Logger) *Syncer {
+	if logger == nil {
+		logger = log.Default()
+	}
 	engines := make(map[string]*registry.Engine, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
 		engines[u.Name] = registry.NewEngine(u)
 	}
 	return &Syncer{
-		store: st, cfg: cfg, client: NewClient(), logger: logger,
+		store: st, cfg: cfg, client: NewClient(logger), logger: logger,
 		engines: engines, seeded: make(map[string]bool, len(cfg.Upstreams)),
 	}
 }
@@ -140,6 +167,7 @@ func (s *Syncer) sync(ctx context.Context, u *config.Upstream) {
 	fetchCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
 
+	s.logger.Debug("model discovery: sync starting", "upstream", u.Name, "url", u.URL.Redacted())
 	discovered, err := s.client.Models(fetchCtx, u.URL, u.APIKey)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -152,10 +180,12 @@ func (s *Syncer) sync(ctx context.Context, u *config.Upstream) {
 
 	engine := s.engines[u.Name]
 	models := make([]store.DiscoveredModel, 0, len(discovered))
+	unresolved := 0
 	for _, d := range discovered {
 		r, err := engine.Resolve(d.UpstreamModelID, d.Metadata)
 		if err != nil {
-			s.logger.Warn("skipping model with unresolvable metadata", "upstream", u.Name, "err", err)
+			unresolved++
+			s.logger.Warn("skipping model with unresolvable metadata", "upstream", u.Name, "model", d.UpstreamModelID, "err", err)
 			continue
 		}
 		models = append(models, store.DiscoveredModel{
@@ -166,12 +196,17 @@ func (s *Syncer) sync(ctx context.Context, u *config.Upstream) {
 			Disabled:        r.Disabled,
 		})
 	}
+	if unresolved > 0 {
+		s.logger.Warn("model discovery: some models could not be resolved",
+			"upstream", u.Name, "skipped", unresolved, "resolved", len(models))
+	}
 
 	if err := s.replace(ctx, u, models); err != nil {
 		s.logger.Error("model registry sync failed", "upstream", u.Name, "err", err)
 		return
 	}
-	s.logger.Debug("model discovery synced", "upstream", u.Name, "models", len(models))
+	s.logger.Info("model discovery synced",
+		"upstream", u.Name, "discovered", len(discovered), "registered", len(models))
 }
 
 func (s *Syncer) replace(ctx context.Context, u *config.Upstream, models []store.DiscoveredModel) error {
@@ -194,8 +229,10 @@ func (s *Syncer) replace(ctx context.Context, u *config.Upstream, models []store
 	}
 	if skipped > 0 {
 		s.logger.Warn("alias collisions: gateway IDs already owned by an earlier upstream",
-			"upstream", u.Name, "skipped", skipped)
+			"upstream", u.Name, "skipped", skipped, "reported", len(models))
 	}
+	s.logger.Debug("model registry replaced", "upstream", u.Name, "upstream_id", id,
+		"reported", len(models), "registered", len(models)-skipped)
 	return nil
 }
 
