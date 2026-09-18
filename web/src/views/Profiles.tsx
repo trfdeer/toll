@@ -253,8 +253,12 @@ export default function Profiles() {
         </Stack>
       </Column>
 
+      {/* Carbon's dialogs must not stack: a Modal never triggers another Modal,
+          because the outer modal's focus trap steals focus from the inner one,
+          leaving the picker's search box and page-size dropdown inert. So the
+          form closes while the model picker is open and reopens on close. */}
       <Modal
-        open={open}
+        open={open && !pickingModels}
         size="md"
         modalHeading={editing ? "Edit profile" : "New profile"}
         primaryButtonText={editing ? "Save" : "Create"}
