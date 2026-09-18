@@ -19,6 +19,15 @@
   min-height: calc(100vh - 3rem);
 }
 
+// The toll mark in the UI shell sits inline with the wordmark. The header name
+// is a flex row, so `display: block` lets the flex parent center it and keeps
+// the svg from picking up inline-baseline spacing.
+.cds--header__name .toll-mark {
+  display: block;
+  flex: none;
+  margin-inline-end: 0.5rem;
+}
+
 // Carbon themes (from @carbon/themes, formerly packages/themes in v10):
 // light = white, dark = g100.
 .theme-light {
@@ -83,20 +92,8 @@
   }
 }
 
-// The new-key modal fills the viewport height, leaving a margin around it.
-.key-modal .cds--modal-container {
-  height: calc(100vh - 4rem);
-  max-height: calc(100vh - 4rem);
-}
-
-.key-modal .cds--modal-content {
-  min-height: 16rem;
-}
-
-.key-modal .cds--list-box__menu {
-  max-height: 8rem;
-}
-
+// The new-key modal now holds only a name and a profile picker, so it sizes
+// to its content rather than the viewport.
 // The summary table's total row stands apart from the data rows.
 .structured-table__total {
   font-weight: 600;

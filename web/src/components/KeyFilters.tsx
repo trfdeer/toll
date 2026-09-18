@@ -1,4 +1,5 @@
 import {
+  Button,
   FilterableMultiSelect,
   MultiSelect,
   Select,
@@ -28,6 +29,11 @@ export interface KeyFiltersProps {
   onValues: (values: string[]) => void;
   filterable?: boolean;
   itemToString?: (item: string) => string;
+  /**
+   * When set, the value picker becomes a button that opens a modal instead of
+   * an inline multiselect. Use it when the item list can be very large.
+   */
+  onPickValues?: () => void;
 }
 
 // KeyFilters edits one dimension: a mode dropdown plus a value picker shown
@@ -42,6 +48,7 @@ export default function KeyFilters({
   onValues,
   filterable = false,
   itemToString = (x) => x,
+  onPickValues,
 }: KeyFiltersProps) {
   const pickerProps = {
     id: `${id}-values`,
@@ -71,7 +78,11 @@ export default function KeyFilters({
         ))}
       </Select>
       {mode !== "none" &&
-        (filterable ? (
+        (onPickValues ? (
+          <Button size="sm" kind="tertiary" onClick={onPickValues}>
+            {values.length > 0 ? `${values.length} selected` : "Select…"}
+          </Button>
+        ) : filterable ? (
           <FilterableMultiSelect {...pickerProps} />
         ) : (
           <MultiSelect {...pickerProps} />

@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/charmbracelet/log"
 	"gopkg.in/yaml.v3"
 
+	"github.com/trfdeer/toll/internal/config"
 	"github.com/trfdeer/toll/internal/store"
 )
 
@@ -103,7 +105,7 @@ func TestUsageAndRequestFilters(t *testing.T) {
 	st, h := setup(t)
 
 	upID, _ := st.UpsertUpstream(t.Context(), "hyper", "https://x/v1", "k", 300, 0)
-	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", store.KeyFilter{}, store.KeyFilter{})
+	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", 1)
 	st.RecordUsage(t.Context(), store.UsageEvent{
 		KeyID: keyID, UpstreamID: upID, GatewayModel: "m", UpstreamModel: "m",
 		PromptTokens: 1, CompletionToken: 1,
@@ -171,7 +173,7 @@ func TestUsageAndRequestFilters(t *testing.T) {
 func TestRequestDetailBuildsConversation(t *testing.T) {
 	st, h := setup(t)
 
-	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", store.KeyFilter{}, store.KeyFilter{})
+	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", 1)
 	st.EnsureConversation(t.Context(), "conv", keyID)
 	reqBody := `{"model":"m","messages":[{"role":"system","content":"be nice"},{"role":"user","content":"hi"}]}`
 	id, _ := st.CreateTranscript(t.Context(), "conv", "m", "m-upstream", reqBody)
@@ -218,10 +220,16 @@ func TestRequestDetailBuildsConversation(t *testing.T) {
 }
 
 func TestKeysCreateListRevoke(t *testing.T) {
-	_, h := setup(t)
+	st, h := setup(t)
 
-	// Create.
-	body := `{"name": "my-app", "providerFilter": {"mode": "include", "values": ["hyper"]}, "modelFilter": {"mode": "exclude", "values": ["hyper/glm"]}}`
+	if _, err := st.CreateProfile(t.Context(), "restricted",
+		store.KeyFilter{Mode: "include", Values: []string{"hyper"}},
+		store.KeyFilter{Mode: "exclude", Values: []string{"hyper/glm"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create referencing the profile.
+	body := `{"name": "my-app", "profile": "restricted"}`
 	req := httptest.NewRequest("POST", "/api/keys", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -251,19 +259,18 @@ func TestKeysCreateListRevoke(t *testing.T) {
 	if len(listed.Keys) != 1 || listed.Keys[0].Name != "my-app" || listed.Keys[0].Revoked {
 		t.Errorf("unexpected keys: %s", rec.Body.String())
 	}
-	if k := listed.Keys[0]; k.ProviderFilter.Mode != "include" || len(k.ProviderFilter.Values) != 1 ||
-		k.ModelFilter.Mode != "exclude" || len(k.ModelFilter.Values) != 1 {
-		t.Errorf("filters not stored: %s", rec.Body.String())
+	if k := listed.Keys[0]; k.Profile != "restricted" {
+		t.Errorf("profile not stored: %s", rec.Body.String())
 	}
 
-	// An include/exclude filter with no values is rejected.
-	bad := `{"name": "bad", "providerFilter": {"mode": "include", "values": []}}`
+	// Unknown profile → 422.
+	bad := `{"name": "bad", "profile": "nope"}`
 	req = httptest.NewRequest("POST", "/api/keys", strings.NewReader(bad))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("empty include status = %d, want 422", rec.Code)
+		t.Fatalf("unknown profile status = %d, want 422", rec.Code)
 	}
 
 	// Duplicate name → 422.
@@ -295,15 +302,19 @@ func TestKeysCreateListRevoke(t *testing.T) {
 
 func TestKeysUpdate(t *testing.T) {
 	st, h := setup(t)
-	if _, err := st.CreateVirtualKey(t.Context(), "old", "hash-a", store.KeyFilter{}, store.KeyFilter{}); err != nil {
+	if _, err := st.CreateVirtualKey(t.Context(), "old", "hash-a", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CreateVirtualKey(t.Context(), "other", "hash-b", store.KeyFilter{}, store.KeyFilter{}); err != nil {
+	if _, err := st.CreateVirtualKey(t.Context(), "other", "hash-b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateProfile(t.Context(), "zeph-only",
+		store.KeyFilter{Mode: "include", Values: []string{"zeph"}}, store.KeyFilter{}); err != nil {
 		t.Fatal(err)
 	}
 
-	// Rename plus new filters.
-	body := `{"name":"renamed","providerFilter":{"mode":"include","values":["zeph"]},"modelFilter":{"mode":"none","values":[]}}`
+	// Rename plus a new profile.
+	body := `{"name":"renamed","profile":"zeph-only"}`
 	req := httptest.NewRequest("PUT", "/api/keys/old", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -329,9 +340,8 @@ func TestKeysUpdate(t *testing.T) {
 	if found == nil {
 		t.Fatalf("rename did not take: %s", rec.Body.String())
 	}
-	if found.ProviderFilter.Mode != "include" || len(found.ProviderFilter.Values) != 1 ||
-		found.ProviderFilter.Values[0] != "zeph" {
-		t.Errorf("provider filter not updated: %+v", found.ProviderFilter)
+	if found.Profile != "zeph-only" {
+		t.Errorf("profile not updated: %+v", found)
 	}
 
 	// Unknown key → 404.
@@ -344,7 +354,7 @@ func TestKeysUpdate(t *testing.T) {
 	}
 
 	// Rename onto an existing name → 422.
-	dup := `{"name":"other","providerFilter":{"mode":"none","values":[]},"modelFilter":{"mode":"none","values":[]}}`
+	dup := `{"name":"other","profile":"All"}`
 	req = httptest.NewRequest("PUT", "/api/keys/renamed", strings.NewReader(dup))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
@@ -354,13 +364,102 @@ func TestKeysUpdate(t *testing.T) {
 	}
 
 	// Empty name → 422.
-	empty := `{"name":"  ","providerFilter":{"mode":"none","values":[]},"modelFilter":{"mode":"none","values":[]}}`
+	empty := `{"name":"  ","profile":"All"}`
 	req = httptest.NewRequest("PUT", "/api/keys/renamed", strings.NewReader(empty))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("empty name status = %d, want 422", rec.Code)
+	}
+}
+
+func TestProfilesCRUD(t *testing.T) {
+	st, h := setup(t)
+
+	type profileList struct {
+		Profiles []profileView `json:"profiles"`
+	}
+	list := func() profileList {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/profiles", nil))
+		var out profileList
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	do := func(method, path, body string) int {
+		t.Helper()
+		var req *http.Request
+		if body == "" {
+			req = httptest.NewRequest(method, path, nil)
+		} else {
+			req = httptest.NewRequest(method, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// The seeded All profile is present, default and read-only.
+	got := list()
+	if len(got.Profiles) != 1 || got.Profiles[0].Name != "All" || !got.Profiles[0].IsDefault {
+		t.Fatalf("seeded profiles = %+v", got.Profiles)
+	}
+
+	// Create.
+	if code := do("POST", "/api/profiles",
+		`{"name":"zeph","providerFilter":{"mode":"include","values":["zeph"]},"modelFilter":{"mode":"none","values":[]}}`); code != http.StatusNoContent {
+		t.Fatalf("create status = %d, want 204", code)
+	}
+
+	// Duplicate name → 422.
+	if code := do("POST", "/api/profiles",
+		`{"name":"zeph","providerFilter":{"mode":"none","values":[]},"modelFilter":{"mode":"none","values":[]}}`); code != http.StatusUnprocessableEntity {
+		t.Fatalf("duplicate status = %d, want 422", code)
+	}
+
+	// Empty include values → 422.
+	if code := do("POST", "/api/profiles",
+		`{"name":"bad","providerFilter":{"mode":"include","values":[]}}`); code != http.StatusUnprocessableEntity {
+		t.Fatalf("empty include status = %d, want 422", code)
+	}
+
+	// The All profile cannot be edited or deleted.
+	if code := do("PUT", "/api/profiles/All",
+		`{"name":"All","providerFilter":{"mode":"none","values":[]},"modelFilter":{"mode":"none","values":[]}}`); code != http.StatusUnprocessableEntity {
+		t.Fatalf("update All status = %d, want 422", code)
+	}
+	if code := do("DELETE", "/api/profiles/All", ""); code != http.StatusUnprocessableEntity {
+		t.Fatalf("delete All status = %d, want 422", code)
+	}
+
+	// Rename.
+	if code := do("PUT", "/api/profiles/zeph",
+		`{"name":"zeph-renamed","providerFilter":{"mode":"include","values":["zeph"]},"modelFilter":{"mode":"none","values":[]}}`); code != http.StatusNoContent {
+		t.Fatalf("rename status = %d, want 204", code)
+	}
+
+	// A profile in use cannot be deleted.
+	if _, err := st.CreateVirtualKey(t.Context(), "app", "hash", 2); err != nil {
+		t.Fatal(err)
+	}
+	if code := do("DELETE", "/api/profiles/zeph-renamed", ""); code != http.StatusUnprocessableEntity {
+		t.Fatalf("in-use delete status = %d, want 422", code)
+	}
+
+	// Delete once unused.
+	if err := st.DeleteVirtualKey(t.Context(), "app"); err != nil {
+		t.Fatal(err)
+	}
+	if code := do("DELETE", "/api/profiles/zeph-renamed", ""); code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want 204", code)
+	}
+	if code := do("DELETE", "/api/profiles/zeph-renamed", ""); code != http.StatusNotFound {
+		t.Fatalf("re-delete status = %d, want 404", code)
 	}
 }
 
@@ -432,6 +531,11 @@ func TestConfigExport(t *testing.T) {
 		{UpstreamModelID: "qwen", GatewayID: "qwen", DisplayName: "Qwen",
 			Metadata: []byte(`{"id":"qwen"}`)},
 	})
+	if _, err := st.CreateProfile(t.Context(), "glm-only",
+		store.KeyFilter{Mode: "include", Values: []string{"hyper"}},
+		store.KeyFilter{Mode: "exclude", Values: []string{"hyper/hidden"}}); err != nil {
+		t.Fatal(err)
+	}
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/config", nil))
@@ -446,6 +550,17 @@ func TestConfigExport(t *testing.T) {
 	}
 
 	var got struct {
+		Profiles []struct {
+			Name           string `yaml:"name"`
+			ProviderFilter struct {
+				Mode   string   `yaml:"mode"`
+				Values []string `yaml:"values"`
+			} `yaml:"provider_filter"`
+			ModelFilter struct {
+				Mode   string   `yaml:"mode"`
+				Values []string `yaml:"values"`
+			} `yaml:"model_filter"`
+		} `yaml:"profiles"`
 		Upstreams []struct {
 			Name      string `yaml:"name"`
 			URL       string `yaml:"url"`
@@ -488,6 +603,76 @@ func TestConfigExport(t *testing.T) {
 	}
 	if second := u.Models[1]; second.ID != "qwen" || second.Alias != "" {
 		t.Errorf("alias should be omitted when identical to upstream id: %+v", second)
+	}
+
+	if len(got.Profiles) != 1 {
+		t.Fatalf("profiles = %d, want 1\n%s", len(got.Profiles), rec.Body.String())
+	}
+	p := got.Profiles[0]
+	if p.Name != "glm-only" ||
+		p.ProviderFilter.Mode != "include" || len(p.ProviderFilter.Values) != 1 || p.ProviderFilter.Values[0] != "hyper" ||
+		p.ModelFilter.Mode != "exclude" || len(p.ModelFilter.Values) != 1 || p.ModelFilter.Values[0] != "hyper/hidden" {
+		t.Errorf("unexpected exported profile: %+v", p)
+	}
+	if strings.Contains(rec.Body.String(), "name: All") {
+		t.Errorf("the default profile should not be exported:\n%s", rec.Body.String())
+	}
+}
+
+// TestConfigExportProfilesRoundTrip proves the exported YAML parses as a config
+// file and re-seeds an equivalent profile into a fresh store.
+func TestConfigExportProfilesRoundTrip(t *testing.T) {
+	st, h := setup(t)
+	if _, err := st.CreateProfile(t.Context(), "glm-only",
+		store.KeyFilter{Mode: "include", Values: []string{"hyper"}},
+		store.KeyFilter{}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/config", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	path := filepath.Join(t.TempDir(), "toll.yaml")
+	if err := os.WriteFile(path, rec.Body.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TOLL_CONFIG", path)
+	t.Setenv("TOLL_UPSTREAM_URL", "")
+	t.Setenv("TOLL_UPSTREAM_API_KEY", "")
+	cfg, err := config.Load(t.Context(), config.Flags{})
+	if err != nil {
+		t.Fatalf("export did not parse as config: %v\n%s", err, rec.Body.String())
+	}
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "glm-only" {
+		t.Fatalf("parsed profiles = %+v", cfg.Profiles)
+	}
+
+	fresh, err := store.Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	seeds := make([]store.SeedProfile, 0, len(cfg.Profiles))
+	for _, p := range cfg.Profiles {
+		seeds = append(seeds, store.SeedProfile{
+			Name:           p.Name,
+			ProviderFilter: store.KeyFilter{Mode: p.ProviderFilter.Mode, Values: p.ProviderFilter.Values},
+			ModelFilter:    store.KeyFilter{Mode: p.ModelFilter.Mode, Values: p.ModelFilter.Values},
+		})
+	}
+	if err := fresh.SeedProfiles(t.Context(), seeds); err != nil {
+		t.Fatal(err)
+	}
+	got, err := fresh.ProfileByName(t.Context(), "glm-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProviderFilter.Mode != "include" || len(got.ProviderFilter.Values) != 1 ||
+		got.ProviderFilter.Values[0] != "hyper" || got.ModelFilter.Mode != "none" {
+		t.Errorf("round-tripped profile = %+v", got)
 	}
 }
 
@@ -563,6 +748,13 @@ func TestModelDisableEnable(t *testing.T) {
 	}
 	if _, disabled := list(); disabled {
 		t.Fatal("model should be enabled again")
+	}
+
+	// Only disabled models carry the flag; enabled ones omit it.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/config", nil))
+	if strings.Contains(rec.Body.String(), "disabled:") {
+		t.Errorf("enabled model should omit disabled:\n%s", rec.Body.String())
 	}
 
 	// Unknown id → 404.

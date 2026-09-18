@@ -4,43 +4,33 @@ import {
   Column,
   Grid,
   IconButton,
-  InlineLoading,
   InlineNotification,
   Modal,
+  Select,
+  SelectItem,
   Stack,
   TextInput,
 } from "@carbon/react";
 import { useCallback, useEffect, useState } from "react";
-import KeyFilters from "../components/KeyFilters";
+import PageState from "../components/PageState";
 import StatusTag, { type Status } from "../components/StatusTag";
 import StructuredTable from "../components/StructuredTable";
 import {
   createKey,
   deleteKey,
   getKeys,
-  getModels,
+  getProfiles,
   pauseKey,
   resumeKey,
   revokeKey,
   updateKey,
 } from "../lib/api";
 import { errorMessage } from "../lib/errors";
-import type { KeyFilter, Model, VirtualKey } from "../lib/types";
-
-const EMPTY: KeyFilter = { mode: "none", values: [] };
-
-// describe renders a filter for the table: "all providers" when unrestricted,
-// otherwise the mode and the selected values.
-function describe(filter: KeyFilter, noun: string): string {
-  if (!filter || filter.mode === "none" || !filter.values?.length)
-    return `all ${noun}`;
-  if (filter.mode === "include") return `${noun}: ${filter.values.join(", ")}`;
-  return `all ${noun} except: ${filter.values.join(", ")}`;
-}
+import type { Profile, VirtualKey } from "../lib/types";
 
 export default function Keys() {
   const [keys, setKeys] = useState<VirtualKey[] | null>(null);
-  const [models, setModels] = useState<Model[]>([]);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
@@ -48,27 +38,23 @@ export default function Keys() {
   // editing is the key being edited, or null when the modal creates one.
   const [editing, setEditing] = useState<VirtualKey | null>(null);
   const [name, setName] = useState("");
-  const [provider, setProvider] = useState<KeyFilter>(EMPTY);
-  const [model, setModel] = useState<KeyFilter>(EMPTY);
+  const [profile, setProfile] = useState("All");
   const [busy, setBusy] = useState(false);
 
   const reload = useCallback(() => {
     getKeys()
       .then((k) => setKeys(k.keys))
       .catch((e: unknown) => setError(errorMessage(e)));
+    getProfiles()
+      .then((res) => setProfiles(res.profiles))
+      .catch((e: unknown) => setError(errorMessage(e)));
   }, []);
 
-  useEffect(() => {
-    reload();
-    getModels()
-      .then(setModels)
-      .catch((e: unknown) => setError(errorMessage(e)));
-  }, [reload]);
+  useEffect(reload, [reload]);
 
   const resetForm = () => {
     setName("");
-    setProvider(EMPTY);
-    setModel(EMPTY);
+    setProfile("All");
   };
 
   const openCreate = () => {
@@ -81,8 +67,7 @@ export default function Keys() {
   const openEdit = (k: VirtualKey) => {
     setEditing(k);
     setName(k.name);
-    setProvider(k.providerFilter ?? EMPTY);
-    setModel(k.modelFilter ?? EMPTY);
+    setProfile(k.profile || "All");
     setFormError(null);
     setOpen(true);
   };
@@ -94,25 +79,18 @@ export default function Keys() {
     resetForm();
   };
 
-  const filtersValid = (f: KeyFilter) =>
-    f.mode === "none" || f.values.length > 0;
-
   const submit = async () => {
     setBusy(true);
     setFormError(null);
     try {
       if (editing) {
-        await updateKey(editing.name, {
-          name: name.trim(),
-          providerFilter: provider,
-          modelFilter: model,
-        });
+        await updateKey(editing.name, { name: name.trim(), profile });
         reload();
         setOpen(false);
         setEditing(null);
         resetForm();
       } else {
-        const res = await createKey(name.trim(), provider, model);
+        const res = await createKey(name.trim(), profile);
         setFlash(res.plaintext);
         reload();
         setOpen(false);
@@ -213,19 +191,8 @@ export default function Keys() {
     );
   };
 
-  if (error && keys === null) return <p>Failed to load: {error}</p>;
-  if (keys === null) return <InlineLoading description="Loading…" />;
-
-  // Providers are the upstreams models were discovered from, not a prefix of
-// the gateway ID (an alias rule may make the ID carry no provider at all).
-  const providers = Array.from(
-    new Set(models.map((m) => m.upstream).filter(Boolean)),
-  ).sort();
-  const modelIds = models.map((m) => m.gatewayId);
-  const modelLabel = (id: string) => {
-    const m = models.find((x) => x.gatewayId === id);
-    return m ? `${m.displayName} (${m.gatewayId})` : id;
-  };
+  if (error && keys === null) return <PageState error={error} />;
+  if (keys === null) return <PageState />;
 
   return (
     <Grid>
@@ -251,7 +218,7 @@ export default function Keys() {
           )}
 
           <StructuredTable
-            headers={["Name", "Providers", "Models", "Status", ""]}
+            headers={["Name", "Profile", "Status", ""]}
             searchable={false}
             className="keys-table"
             actions={
@@ -264,8 +231,7 @@ export default function Keys() {
               const s = status(k);
               return [
                 k.name,
-                describe(k.providerFilter, "providers"),
-                describe(k.modelFilter, "models"),
+                k.profile,
                 <StatusTag status={s} />,
                 <div className="key-actions">{actionsFor(k)}</div>,
               ];
@@ -280,12 +246,7 @@ export default function Keys() {
         modalHeading={editing ? "Edit virtual key" : "New virtual key"}
         primaryButtonText={editing ? "Save" : "Create"}
         secondaryButtonText="Cancel"
-        primaryButtonDisabled={
-          busy ||
-          !name.trim() ||
-          !filtersValid(provider) ||
-          !filtersValid(model)
-        }
+        primaryButtonDisabled={busy || !name.trim() || !profile}
         onRequestSubmit={submit}
         onRequestClose={closeModal}
         onSecondarySubmit={closeModal}
@@ -299,30 +260,24 @@ export default function Keys() {
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
-          <KeyFilters
-            id="key-provider"
-            title="Provider filter"
-            mode={provider.mode}
-            values={provider.values}
-            items={providers}
-            onMode={(mode) => setProvider({ mode, values: [] })}
-            onValues={(values) => setProvider((p) => ({ ...p, values }))}
-          />
-          <KeyFilters
-            id="key-model"
-            title="Model filter"
-            mode={model.mode}
-            values={model.values}
-            items={modelIds}
-            itemToString={modelLabel}
-            filterable
-            onMode={(mode) => setModel({ mode, values: [] })}
-            onValues={(values) => setModel((m) => ({ ...m, values }))}
-          />
+          <Select
+            id="key-profile"
+            size="sm"
+            labelText="Profile"
+            value={profile}
+            onChange={(e) => setProfile(e.target.value)}
+          >
+            {profiles.map((p) => (
+              <SelectItem
+                key={p.name}
+                value={p.name}
+                text={p.isDefault ? `${p.name} (default)` : p.name}
+              />
+            ))}
+          </Select>
           <p>
-            A model is allowed when its provider passes the provider filter and
-            the model itself passes the model filter. No filter allows
-            everything.
+            The profile defines which providers and models this key may use. It
+            can be shared by multiple keys and is managed on the Profiles page.
           </p>
           {formError && (
             <InlineNotification

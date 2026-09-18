@@ -25,7 +25,7 @@ func captureSetup(t *testing.T) (*store.Store, http.Handler, string) {
 	t.Cleanup(func() { st.Close() })
 
 	plaintext, hash, _ := keys.Generate()
-	if _, err := st.CreateVirtualKey(t.Context(), "test", hash, store.KeyFilter{}, store.KeyFilter{}); err != nil {
+	if _, err := st.CreateVirtualKey(t.Context(), "test", hash, 1); err != nil {
 		t.Fatal(err)
 	}
 

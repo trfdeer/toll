@@ -322,6 +322,25 @@ CREATE TABLE model_aliases (
 ALTER TABLE models ADD COLUMN base_gateway_id TEXT NOT NULL DEFAULT '';
 UPDATE models SET base_gateway_id = gateway_id WHERE base_gateway_id = '';
 `,
+	// 11: virtual keys gain reusable provider/model filters. A "profile" is a
+	// named filter pair shared by any number of keys; every key references
+	// exactly one, and a seeded read-only "All" profile (no constraint) is the
+	// default. The old per-key filter columns are dropped: this install starts
+	// fresh, so existing keys simply fall back to All.
+	`
+CREATE TABLE profiles (
+	id INTEGER PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE,
+	is_default INTEGER NOT NULL DEFAULT 0,
+	provider_filter TEXT NOT NULL DEFAULT '{"mode":"none","values":[]}',
+	model_filter TEXT NOT NULL DEFAULT '{"mode":"none","values":[]}',
+	created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO profiles (id, name, is_default) VALUES (1, 'All', 1);
+ALTER TABLE virtual_keys ADD COLUMN profile_id INTEGER NOT NULL DEFAULT 1 REFERENCES profiles(id);
+ALTER TABLE virtual_keys DROP COLUMN provider_filter;
+ALTER TABLE virtual_keys DROP COLUMN model_filter;
+`,
 }
 
 // contentMigrations are applied to the content database (content.db), which

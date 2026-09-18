@@ -44,6 +44,14 @@ const fullYAML = `
 listen: ":9090"
 log_level: debug
 data_dir: /tmp/toll-test-data
+profiles:
+  - name: glm-only
+    provider_filter:
+      mode: include
+      values: [hyper]
+    model_filter:
+      mode: exclude
+      values: [hyper/secret]
 upstreams:
   - name: hyper
     url: https://hyper.charm.land/v1
@@ -110,6 +118,43 @@ func TestFileConfig(t *testing.T) {
 	}
 	if u.Models[0].Disabled == nil || !*u.Models[0].Disabled {
 		t.Errorf("model entry disabled not parsed: %+v", u.Models[0])
+	}
+
+	if len(cfg.Profiles) != 1 {
+		t.Fatalf("profiles = %d, want 1: %+v", len(cfg.Profiles), cfg.Profiles)
+	}
+	p := cfg.Profiles[0]
+	if p.Name != "glm-only" ||
+		p.ProviderFilter.Mode != "include" || len(p.ProviderFilter.Values) != 1 ||
+		p.ProviderFilter.Values[0] != "hyper" ||
+		p.ModelFilter.Mode != "exclude" || len(p.ModelFilter.Values) != 1 ||
+		p.ModelFilter.Values[0] != "hyper/secret" {
+		t.Errorf("profile not parsed: %+v", p)
+	}
+}
+
+func TestProfileValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"reserved default", "profiles:\n  - name: All\n    provider_filter: {mode: none}\n"},
+		{"empty name", "profiles:\n  - name: '  '\n    provider_filter: {mode: none}\n"},
+		{"duplicate", "profiles:\n  - name: a\n  - name: a\n"},
+		{"bad mode", "profiles:\n  - name: a\n    provider_filter: {mode: sometimes, values: [x]}\n"},
+		{"empty include", "profiles:\n  - name: a\n    model_filter: {mode: include, values: []}\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "toll.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TOLL_CONFIG", path)
+			if _, err := Load(t.Context(), Flags{}); err == nil {
+				t.Fatalf("expected error for %s", tc.name)
+			}
+		})
 	}
 }
 

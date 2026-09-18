@@ -38,14 +38,27 @@ func seedModel(t *testing.T, st *store.Store, upstreamID int64, gatewayID, meta 
 
 func makeKey(t *testing.T, st *store.Store, name string, provider, model store.KeyFilter) string {
 	t.Helper()
+	profileID := int64(1) // the seeded All profile
+	if constrained(provider) || constrained(model) {
+		id, err := st.CreateProfile(t.Context(), name, provider, model)
+		if err != nil {
+			t.Fatal(err)
+		}
+		profileID = id
+	}
 	plaintext, hash, err := keys.Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CreateVirtualKey(t.Context(), name, hash, provider, model); err != nil {
+	if _, err := st.CreateVirtualKey(t.Context(), name, hash, profileID); err != nil {
 		t.Fatal(err)
 	}
 	return plaintext
+}
+
+// constrained reports whether a filter actually restricts anything.
+func constrained(f store.KeyFilter) bool {
+	return f.Mode != "" && f.Mode != "none" && len(f.Values) > 0
 }
 
 func TestModelsRequiresAuth(t *testing.T) {

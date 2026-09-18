@@ -35,35 +35,38 @@ func (f KeyFilter) normalize() KeyFilter {
 	return f
 }
 
-// CreateVirtualKey stores a new key (hash only) and returns its id. The
-// provider and model filters are evaluated per request to decide which
-// gateway models the key may use.
-func (s *Store) CreateVirtualKey(ctx context.Context, name, keyHash string, provider, model KeyFilter) (int64, error) {
+// CreateVirtualKey stores a new key (hash only) and returns its id. The key's
+// provider and model filters come from the referenced profile, resolved on
+// every lookup, so edits to a profile apply immediately to all keys using it.
+func (s *Store) CreateVirtualKey(ctx context.Context, name, keyHash string, profileID int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO virtual_keys (name, key_hash, provider_filter, model_filter) VALUES (?, ?, ?, ?)`,
-		name, keyHash, marshalJSON(provider.normalize()), marshalJSON(model.normalize()))
+		INSERT INTO virtual_keys (name, key_hash, profile_id) VALUES (?, ?, ?)`,
+		name, keyHash, profileID)
 	if err != nil {
 		return 0, fmt.Errorf("create virtual key %q: %w", name, err)
 	}
 	return res.LastInsertId()
 }
 
-// VirtualKey is a stored key row.
+// VirtualKey is a stored key row with its profile's filters resolved.
 type VirtualKey struct {
 	ID             int64
 	Name           string
+	ProfileID      int64
+	ProfileName    string
 	ProviderFilter KeyFilter
 	ModelFilter    KeyFilter
 	Revoked        bool
 	Paused         bool
 }
 
-// scanKey reads a key row from a query selecting id, name, provider_filter,
-// model_filter.
+// scanKey reads a key row from a query selecting id, name, profile_id,
+// profile name, provider_filter, model_filter — the filters joined from the
+// key's profile.
 func scanKey(row interface{ Scan(...any) error }) (VirtualKey, error) {
 	var vk VirtualKey
 	var provider, model string
-	if err := row.Scan(&vk.ID, &vk.Name, &provider, &model); err != nil {
+	if err := row.Scan(&vk.ID, &vk.Name, &vk.ProfileID, &vk.ProfileName, &provider, &model); err != nil {
 		return vk, err
 	}
 	_ = json.Unmarshal([]byte(provider), &vk.ProviderFilter)
@@ -77,8 +80,9 @@ func scanKey(row interface{ Scan(...any) error }) (VirtualKey, error) {
 // keys are both treated as inactive.
 func (s *Store) KeyByHash(ctx context.Context, keyHash string) (*VirtualKey, error) {
 	vk, err := scanKey(s.db.QueryRowContext(ctx, `
-		SELECT id, name, provider_filter, model_filter FROM virtual_keys
-		WHERE key_hash = ? AND revoked_at IS NULL AND paused_at IS NULL`, keyHash))
+		SELECT vk.id, vk.name, vk.profile_id, p.name, p.provider_filter, p.model_filter
+		FROM virtual_keys vk JOIN profiles p ON p.id = vk.profile_id
+		WHERE vk.key_hash = ? AND vk.revoked_at IS NULL AND vk.paused_at IS NULL`, keyHash))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrKeyNotFound
 	}
@@ -88,11 +92,14 @@ func (s *Store) KeyByHash(ctx context.Context, keyHash string) (*VirtualKey, err
 	return &vk, nil
 }
 
-// ListVirtualKeys returns all keys, including revoked and paused ones.
+// ListVirtualKeys returns all keys, including revoked and paused ones, with
+// their profiles resolved.
 func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, provider_filter, model_filter, revoked_at, paused_at
-		FROM virtual_keys ORDER BY id`)
+		SELECT vk.id, vk.name, vk.profile_id, p.name, p.provider_filter, p.model_filter,
+		       vk.revoked_at, vk.paused_at
+		FROM virtual_keys vk JOIN profiles p ON p.id = vk.profile_id
+		ORDER BY vk.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +109,7 @@ func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
 		var vk VirtualKey
 		var provider, model string
 		var revoked, paused sql.NullString
-		if err := rows.Scan(&vk.ID, &vk.Name, &provider, &model, &revoked, &paused); err != nil {
+		if err := rows.Scan(&vk.ID, &vk.Name, &vk.ProfileID, &vk.ProfileName, &provider, &model, &revoked, &paused); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(provider), &vk.ProviderFilter)
@@ -116,15 +123,15 @@ func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
 	return out, rows.Err()
 }
 
-// UpdateVirtualKey edits a key's name and filters in place. The key material
-// (its hash) is unchanged, so existing clients keep working. Returns
+// UpdateVirtualKey edits a key's name and/or profile in place. The key
+// material (its hash) is unchanged, so existing clients keep working. Returns
 // ErrKeyNotFound when currentName does not exist; a rename onto an existing
 // name fails on the UNIQUE constraint.
-func (s *Store) UpdateVirtualKey(ctx context.Context, currentName, newName string, provider, model KeyFilter) error {
+func (s *Store) UpdateVirtualKey(ctx context.Context, currentName, newName string, profileID int64) error {
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE virtual_keys SET name = ?, provider_filter = ?, model_filter = ?
+		UPDATE virtual_keys SET name = ?, profile_id = ?
 		WHERE name = ?`,
-		newName, marshalJSON(provider.normalize()), marshalJSON(model.normalize()), currentName)
+		newName, profileID, currentName)
 	if err != nil {
 		return fmt.Errorf("update virtual key %q: %w", currentName, err)
 	}

@@ -54,6 +54,10 @@ func Handler(st *store.Store, logger *log.Logger) http.Handler {
 	mux.HandleFunc("GET /api/config", h.configExport)
 	mux.HandleFunc("GET /api/settings", h.settingsGet)
 	mux.HandleFunc("PUT /api/settings", h.settingsPut)
+	mux.HandleFunc("GET /api/profiles", h.profilesList)
+	mux.HandleFunc("POST /api/profiles", h.profilesCreate)
+	mux.HandleFunc("PUT /api/profiles/{name}", h.profilesUpdate)
+	mux.HandleFunc("DELETE /api/profiles/{name}", h.profilesDelete)
 	mux.HandleFunc("GET /api/keys", h.keysList)
 	mux.HandleFunc("POST /api/keys", h.keysCreate)
 	mux.HandleFunc("PUT /api/keys/{name}", h.keysUpdate)
@@ -524,14 +528,119 @@ func (h *handlers) settingsPut(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, settingsView{StorePrompts: h.store.PromptsEnabled()})
 }
 
-// ---- virtual keys ----
+// ---- profiles ----
 
-type keyView struct {
+type profileView struct {
 	Name           string          `json:"name"`
 	ProviderFilter store.KeyFilter `json:"providerFilter"`
 	ModelFilter    store.KeyFilter `json:"modelFilter"`
-	Revoked        bool            `json:"revoked"`
-	Paused         bool            `json:"paused"`
+	IsDefault      bool            `json:"isDefault"`
+	KeyCount       int             `json:"keyCount"`
+}
+
+func (h *handlers) profilesList(w http.ResponseWriter, r *http.Request) {
+	ps, err := h.store.ListProfiles(r.Context())
+	if err != nil {
+		h.fail(w, err, "profiles unavailable")
+		return
+	}
+	out := make([]profileView, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, profileView{
+			Name: p.Name, ProviderFilter: p.ProviderFilter, ModelFilter: p.ModelFilter,
+			IsDefault: p.IsDefault, KeyCount: p.KeyCount,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": out})
+}
+
+type profileRequest struct {
+	Name           string          `json:"name"`
+	ProviderFilter store.KeyFilter `json:"providerFilter"`
+	ModelFilter    store.KeyFilter `json:"modelFilter"`
+}
+
+// validateProfileRequest checks the name and both filters before a write.
+func validateProfileRequest(req profileRequest) error {
+	if strings.TrimSpace(req.Name) == "" {
+		return errors.New("name is required")
+	}
+	for _, f := range []struct {
+		label  string
+		filter store.KeyFilter
+	}{{"provider", req.ProviderFilter}, {"model", req.ModelFilter}} {
+		if err := validateFilter(f.filter); err != nil {
+			return errors.New(f.label + " filter: " + err.Error())
+		}
+	}
+	return nil
+}
+
+func (h *handlers) profilesCreate(w http.ResponseWriter, r *http.Request) {
+	req, ok := readJSON[profileRequest](w, r)
+	if !ok {
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if err := validateProfileRequest(req); err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
+	if _, err := h.store.CreateProfile(r.Context(), req.Name, req.ProviderFilter, req.ModelFilter); err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "could not create profile: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusNoContent, nil)
+}
+
+func (h *handlers) profilesUpdate(w http.ResponseWriter, r *http.Request) {
+	current := r.PathValue("name")
+	req, ok := readJSON[profileRequest](w, r)
+	if !ok {
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if err := validateProfileRequest(req); err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.store.UpdateProfile(r.Context(), current, req.Name, req.ProviderFilter, req.ModelFilter); err != nil {
+		h.writeProfileError(w, err, "could not update profile")
+		return
+	}
+	writeJSON(w, http.StatusNoContent, nil)
+}
+
+func (h *handlers) profilesDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := h.store.DeleteProfile(r.Context(), name); err != nil {
+		h.writeProfileError(w, err, "could not delete profile")
+		return
+	}
+	writeJSON(w, http.StatusNoContent, nil)
+}
+
+// writeProfileError maps the store's profile sentinels to HTTP responses.
+func (h *handlers) writeProfileError(w http.ResponseWriter, err error, fallback string) {
+	switch {
+	case errors.Is(err, store.ErrProfileNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "profile not found"})
+	case errors.Is(err, store.ErrProfileImmutable):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "the All profile is read-only"})
+	case errors.Is(err, store.ErrProfileInUse):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+	default:
+		h.fail(w, err, fallback)
+	}
+}
+
+// ---- virtual keys ----
+
+type keyView struct {
+	Name    string `json:"name"`
+	Profile string `json:"profile"`
+	Revoked bool   `json:"revoked"`
+	Paused  bool   `json:"paused"`
 }
 
 func (h *handlers) keysList(w http.ResponseWriter, r *http.Request) {
@@ -551,20 +660,31 @@ func (h *handlers) keysFor(ctx context.Context) ([]keyView, error) {
 	out := make([]keyView, 0, len(vks))
 	for _, vk := range vks {
 		out = append(out, keyView{
-			Name:           vk.Name,
-			ProviderFilter: vk.ProviderFilter,
-			ModelFilter:    vk.ModelFilter,
-			Revoked:        vk.Revoked,
-			Paused:         vk.Paused,
+			Name:    vk.Name,
+			Profile: vk.ProfileName,
+			Revoked: vk.Revoked,
+			Paused:  vk.Paused,
 		})
 	}
 	return out, nil
 }
 
 type createKeyRequest struct {
-	Name           string          `json:"name"`
-	ProviderFilter store.KeyFilter `json:"providerFilter"`
-	ModelFilter    store.KeyFilter `json:"modelFilter"`
+	Name    string `json:"name"`
+	Profile string `json:"profile"`
+}
+
+// resolveProfileName maps an optional profile name to its id, defaulting to
+// the seeded "All" profile when the request omits one.
+func (h *handlers) resolveProfileName(ctx context.Context, name string) (int64, error) {
+	if strings.TrimSpace(name) == "" {
+		name = "All"
+	}
+	p, err := h.store.ProfileByName(ctx, name)
+	if err != nil {
+		return 0, err
+	}
+	return p.ID, nil
 }
 
 func (h *handlers) keysCreate(w http.ResponseWriter, r *http.Request) {
@@ -577,15 +697,14 @@ func (h *handlers) keysCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "name is required"})
 		return
 	}
-	for _, f := range []struct {
-		label  string
-		filter store.KeyFilter
-	}{{"provider", req.ProviderFilter}, {"model", req.ModelFilter}} {
-		if err := validateFilter(f.filter); err != nil {
-			writeJSON(w, http.StatusUnprocessableEntity,
-				map[string]string{"error": f.label + " filter: " + err.Error()})
+	profileID, err := h.resolveProfileName(r.Context(), req.Profile)
+	if err != nil {
+		if errors.Is(err, store.ErrProfileNotFound) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "profile not found"})
 			return
 		}
+		h.fail(w, err, "could not create key")
+		return
 	}
 
 	plaintext, hash, err := keys.Generate()
@@ -593,7 +712,7 @@ func (h *handlers) keysCreate(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err, "key generation failed")
 		return
 	}
-	if _, err := h.store.CreateVirtualKey(r.Context(), name, hash, req.ProviderFilter, req.ModelFilter); err != nil {
+	if _, err := h.store.CreateVirtualKey(r.Context(), name, hash, profileID); err != nil {
 		// Likely a duplicate name.
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "could not create key: " + err.Error()})
 		return
@@ -601,7 +720,7 @@ func (h *handlers) keysCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"plaintext": plaintext})
 }
 
-// keysUpdate edits an existing key's name and/or filters in place. The key
+// keysUpdate edits an existing key's name and/or profile in place. The key
 // material is unchanged, so clients keep working across the edit.
 func (h *handlers) keysUpdate(w http.ResponseWriter, r *http.Request) {
 	current := r.PathValue("name")
@@ -614,17 +733,16 @@ func (h *handlers) keysUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "name is required"})
 		return
 	}
-	for _, f := range []struct {
-		label  string
-		filter store.KeyFilter
-	}{{"provider", req.ProviderFilter}, {"model", req.ModelFilter}} {
-		if err := validateFilter(f.filter); err != nil {
-			writeJSON(w, http.StatusUnprocessableEntity,
-				map[string]string{"error": f.label + " filter: " + err.Error()})
+	profileID, err := h.resolveProfileName(r.Context(), req.Profile)
+	if err != nil {
+		if errors.Is(err, store.ErrProfileNotFound) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "profile not found"})
 			return
 		}
+		h.fail(w, err, "could not update key")
+		return
 	}
-	if err := h.store.UpdateVirtualKey(r.Context(), current, name, req.ProviderFilter, req.ModelFilter); err != nil {
+	if err := h.store.UpdateVirtualKey(r.Context(), current, name, profileID); err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found"})
 			return

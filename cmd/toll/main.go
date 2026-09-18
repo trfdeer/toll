@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -99,6 +98,7 @@ func openStoreForCmd() (*store.Store, func(), error) {
 
 func keysAddCmd() *cobra.Command {
 	var allowProviders, denyProviders, allowModels, denyModels []string
+	var profileName string
 	cmd := &cobra.Command{
 		Use:   "add <name>",
 		Short: "Create a virtual API key (plaintext shown once)",
@@ -118,12 +118,16 @@ func keysAddCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			profileID, err := resolveKeyProfile(cmd.Context(), db, args[0], profileName, provider, model)
+			if err != nil {
+				return err
+			}
 
 			plaintext, hash, err := keys.Generate()
 			if err != nil {
 				return err
 			}
-			if _, err := db.CreateVirtualKey(cmd.Context(), args[0], hash, provider, model); err != nil {
+			if _, err := db.CreateVirtualKey(cmd.Context(), args[0], hash, profileID); err != nil {
 				return err
 			}
 			logger := log.New(os.Stdout)
@@ -135,7 +139,48 @@ func keysAddCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&denyProviders, "deny-provider", nil, "these providers are unusable")
 	cmd.Flags().StringSliceVar(&allowModels, "allow-model", nil, "only these gateway model IDs are usable")
 	cmd.Flags().StringSliceVar(&denyModels, "deny-model", nil, "these gateway model IDs are unusable")
+	cmd.Flags().StringVar(&profileName, "profile", "", "reuse an existing profile by name (instead of the filter flags)")
+	cmd.MarkFlagsMutuallyExclusive("profile", "allow-provider")
+	cmd.MarkFlagsMutuallyExclusive("profile", "deny-provider")
+	cmd.MarkFlagsMutuallyExclusive("profile", "allow-model")
+	cmd.MarkFlagsMutuallyExclusive("profile", "deny-model")
 	return cmd
+}
+
+// resolveKeyProfile picks the profile a new key should reference. An explicit
+// --profile wins; otherwise the allow/deny flags are materialized into a
+// non-default profile named after the key (reusing the same profile if the
+// flags already produced one). No flags at all means the All profile.
+func resolveKeyProfile(ctx context.Context, db *store.Store, keyName, profileName string, provider, model store.KeyFilter) (int64, error) {
+	if profileName != "" {
+		p, err := db.ProfileByName(ctx, profileName)
+		if err != nil {
+			return 0, err
+		}
+		return p.ID, nil
+	}
+	if noConstraint(provider) && noConstraint(model) {
+		p, err := db.ProfileByName(ctx, "All")
+		if err != nil {
+			return 0, err
+		}
+		return p.ID, nil
+	}
+	name := keyName
+	for {
+		if _, err := db.ProfileByName(ctx, name); errors.Is(err, store.ErrProfileNotFound) {
+			break
+		} else if err != nil {
+			return 0, err
+		}
+		name += "-profile"
+	}
+	return db.CreateProfile(ctx, name, provider, model)
+}
+
+// noConstraint reports whether a filter imposes no restriction.
+func noConstraint(f store.KeyFilter) bool {
+	return f.Mode == "" || f.Mode == "none" || len(f.Values) == 0
 }
 
 // filterFromFlags builds an include filter from allow, or an exclude filter
@@ -151,13 +196,6 @@ func filterFromFlags(label string, allow, deny []string) (store.KeyFilter, error
 	default:
 		return store.KeyFilter{Mode: "none"}, nil
 	}
-}
-
-func describeFilter(label string, f store.KeyFilter) string {
-	if f.Mode == "none" || f.Mode == "" {
-		return label + ": all"
-	}
-	return label + " " + f.Mode + ": " + strings.Join(f.Values, ",")
 }
 
 func keysListCmd() *cobra.Command {
@@ -176,9 +214,7 @@ func keysListCmd() *cobra.Command {
 			}
 			logger := log.New(os.Stdout)
 			for _, vk := range vks {
-				logger.Info("key", "name", vk.Name,
-					"providers", describeFilter("provider", vk.ProviderFilter),
-					"models", describeFilter("model", vk.ModelFilter))
+				logger.Info("key", "name", vk.Name, "profile", vk.ProfileName)
 			}
 			return nil
 		},
@@ -230,6 +266,23 @@ func run(ctx context.Context, cfg *config.Config) error {
 			return fmt.Errorf("apply store_prompts: %w", err)
 		}
 		logger.Info("prompt storage configured", "store_prompts", *cfg.StorePrompts)
+	}
+
+	// Config profiles seed the DB at startup, mirroring model aliases: config
+	// wins at boot, then the admin UI is authoritative until the next restart.
+	if len(cfg.Profiles) > 0 {
+		seeds := make([]store.SeedProfile, 0, len(cfg.Profiles))
+		for _, p := range cfg.Profiles {
+			seeds = append(seeds, store.SeedProfile{
+				Name:           p.Name,
+				ProviderFilter: store.KeyFilter{Mode: p.ProviderFilter.Mode, Values: p.ProviderFilter.Values},
+				ModelFilter:    store.KeyFilter{Mode: p.ModelFilter.Mode, Values: p.ModelFilter.Values},
+			})
+		}
+		if err := db.SeedProfiles(ctx, seeds); err != nil {
+			return fmt.Errorf("apply profiles: %w", err)
+		}
+		logger.Info("profiles configured", "count", len(seeds))
 	}
 
 	for _, u := range cfg.Upstreams {

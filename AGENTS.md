@@ -50,6 +50,7 @@ Nix (dendritic flake-parts layout — outputs are auto-imported from `nix/`; add
 - **Config `disabled` is a `*bool`**: omit it to leave the registry's toggle alone; set it to pin the state across discovery refreshes.
 - **Prompt bodies live in `content.db`** (`transcript_content`), never in `toll.db`; `transcripts` keeps only metadata. The `store_prompts` setting gates writes: the admin UI Settings toggle (DB) is authoritative at runtime, `TOLL_STORE_PROMPTS`/`store_prompts:` seed it at startup. When off, `Store.Transcript` returns empty bodies and the admin detail reports `contentStored: false`.
 - **Model aliases** are DB state (`model_aliases`), not config-resolved. Config `models[].alias` seeds them once at startup; after that the admin UI wins (export the config to persist edits). `ReplaceModels` re-applies aliases on every discovery sync and keeps `models.base_gateway_id` so clearing restores the computed ID.
+- **Profiles** are DB state (`profiles`), like aliases: config `profiles:` seeds them at startup (name + `provider_filter`/`model_filter`), then the admin UI wins (export the config to persist edits). The seeded `All` profile (`store.DefaultProfileName`) is read-only and reserved in config, and deleting a profile any key references is refused. Virtual keys are never exported — `toll.db` is their only home.
 - **Deleted keys** show as a reserved `key=__deleted__` value in the usage/requests filters (`admin.deletedKeysSentinel`), mapping to `vk.name IS NULL`.
 
 ## Commit conventions

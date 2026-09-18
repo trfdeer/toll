@@ -22,7 +22,23 @@ type configExport struct {
 	// StorePrompts is emitted only when prompt storage is disabled, so the
 	// exported file reproduces the current setting.
 	StorePrompts *bool            `yaml:"store_prompts,omitempty"`
+	Profiles     []exportProfile  `yaml:"profiles,omitempty"`
 	Upstreams    []exportUpstream `yaml:"upstreams"`
+}
+
+// exportProfile mirrors config.Profile so the emitted YAML seeds profiles on
+// import. The seeded "All" default is never exported.
+type exportProfile struct {
+	Name           string       `yaml:"name"`
+	ProviderFilter exportFilter `yaml:"provider_filter"`
+	ModelFilter    exportFilter `yaml:"model_filter"`
+}
+
+// exportFilter mirrors config.ProfileFilter. Empty values are omitted; the
+// mode is always written so the rule round-trips explicitly.
+type exportFilter struct {
+	Mode   string   `yaml:"mode"`
+	Values []string `yaml:"values,omitempty"`
 }
 
 type exportUpstream struct {
@@ -69,13 +85,20 @@ func exportConfig(ctx context.Context, st *store.Store) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	profiles, err := st.ListProfiles(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	byUpstream := make(map[int64][]store.ExportModel, len(ups))
 	for _, m := range models {
 		byUpstream[m.UpstreamID] = append(byUpstream[m.UpstreamID], m)
 	}
 
-	out := configExport{Upstreams: make([]exportUpstream, 0, len(ups))}
+	out := configExport{
+		Upstreams: make([]exportUpstream, 0, len(ups)),
+		Profiles:  exportProfiles(profiles),
+	}
 	if !st.PromptsEnabled() {
 		disabled := false
 		out.StorePrompts = &disabled
@@ -93,6 +116,26 @@ func exportConfig(ctx context.Context, st *store.Store) ([]byte, error) {
 		out.Upstreams = append(out.Upstreams, eu)
 	}
 	return yaml.Marshal(out)
+}
+
+// exportProfiles converts store profiles into config entries. The read-only
+// "All" default is omitted: the migration recreates it on import.
+func exportProfiles(rows []store.Profile) []exportProfile {
+	out := make([]exportProfile, 0, len(rows))
+	for _, p := range rows {
+		if p.IsDefault {
+			continue
+		}
+		out = append(out, exportProfile{
+			Name:           p.Name,
+			ProviderFilter: exportFilter{Mode: p.ProviderFilter.Mode, Values: p.ProviderFilter.Values},
+			ModelFilter:    exportFilter{Mode: p.ModelFilter.Mode, Values: p.ModelFilter.Values},
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // exportModels converts registry rows into explicit config model entries. A

@@ -4,13 +4,13 @@ import {
   Column,
   Grid,
   IconButton,
-  InlineLoading,
   InlineNotification,
   Modal,
   Stack,
   TextInput,
 } from "@carbon/react";
 import { useCallback, useEffect, useState } from "react";
+import PageState from "../components/PageState";
 import StatusTag, { type Status } from "../components/StatusTag";
 import StructuredTable from "../components/StructuredTable";
 import {
@@ -184,8 +184,8 @@ export default function Models() {
     }
   };
 
-  if (error && models === null) return <p>Failed to load: {error}</p>;
-  if (!models) return <InlineLoading description="Loading…" />;
+  if (error && models === null) return <PageState error={error} />;
+  if (!models) return <PageState />;
 
   return (
     <Grid>

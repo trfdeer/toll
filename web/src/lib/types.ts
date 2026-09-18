@@ -15,8 +15,8 @@ export interface KeyFilter {
 
 export interface VirtualKey {
   name: string;
-  providerFilter: KeyFilter;
-  modelFilter: KeyFilter;
+  /** Name of the profile whose filters govern this key's model access. */
+  profile: string;
   revoked: boolean;
   paused: boolean;
 }
@@ -29,8 +29,32 @@ export interface CreateKeyResponse {
   plaintext: string;
 }
 
-/** Fields editable on an existing key (name and both filters). */
+/** Fields editable on an existing key (name and its profile). */
 export interface UpdateKeyRequest {
+  name: string;
+  profile: string;
+}
+
+// ---- profiles ----
+
+// Profile is a named, reusable provider/model filter shared by virtual keys.
+// Its set of allowed models resolves live against the registry, so models
+// discovered later are picked up automatically.
+export interface Profile {
+  name: string;
+  providerFilter: KeyFilter;
+  modelFilter: KeyFilter;
+  /** The seeded "All" profile is read-only. */
+  isDefault: boolean;
+  /** Number of virtual keys referencing this profile. */
+  keyCount: number;
+}
+
+export interface ProfilesResponse {
+  profiles: Profile[];
+}
+
+export interface ProfileRequest {
   name: string;
   providerFilter: KeyFilter;
   modelFilter: KeyFilter;

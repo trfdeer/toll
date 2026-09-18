@@ -2,9 +2,10 @@ import type {
   CreateKeyResponse,
   CreateProviderRequest,
   CreateProviderResponse,
-  KeyFilter,
   KeysResponse,
   Model,
+  ProfileRequest,
+  ProfilesResponse,
   Provider,
   QueryParams,
   RequestDetail,
@@ -135,17 +136,40 @@ export const updateSettings = (settings: Settings): Promise<Settings> =>
     body: JSON.stringify(settings),
   });
 
+// ---- profiles ----
+
+export const getProfiles = (): Promise<ProfilesResponse> =>
+  request("/profiles");
+
+export const createProfile = (profile: ProfileRequest): Promise<void> =>
+  request("/profiles", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(profile),
+  });
+
+export const updateProfile = (
+  currentName: string,
+  profile: ProfileRequest,
+): Promise<void> =>
+  request(`/profiles/${encodeURIComponent(currentName)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(profile),
+  });
+
+export const deleteProfile = (name: string): Promise<void> =>
+  request(`/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
+
+// ---- virtual keys ----
+
 export const getKeys = (): Promise<KeysResponse> => request("/keys");
 
-export const createKey = (
-  name: string,
-  providerFilter: KeyFilter,
-  modelFilter: KeyFilter,
-): Promise<CreateKeyResponse> =>
+export const createKey = (name: string, profile: string): Promise<CreateKeyResponse> =>
   request("/keys", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, providerFilter, modelFilter }),
+    body: JSON.stringify({ name, profile }),
   });
 
 // updateKey edits an existing key in place (its secret is unchanged).

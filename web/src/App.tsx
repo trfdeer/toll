@@ -6,7 +6,6 @@ import {
   HeaderGlobalAction,
   HeaderGlobalBar,
   HeaderMenuButton,
-  HeaderName,
   InlineLoading,
   Modal,
   SideNav,
@@ -19,10 +18,12 @@ import { useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router";
 import { exportConfig, getSettings, updateSettings } from "./lib/api";
 import { errorMessage } from "./lib/errors";
+import TollMark from "./components/TollMark";
 import { THEME_ICONS, THEME_LABELS, THEME_ORDER, useTheme } from "./lib/theme";
 import type { Settings } from "./lib/types";
 import Keys from "./views/Keys";
 import Models from "./views/Models";
+import Profiles from "./views/Profiles";
 import Providers from "./views/Providers";
 import Usage from "./views/Usage";
 
@@ -32,6 +33,7 @@ const NAV = [
   { to: "/", label: "Usage", end: true },
   { to: "/providers", label: "Providers" },
   { to: "/models", label: "Models" },
+  { to: "/profiles", label: "Profiles" },
   { to: "/keys", label: "Virtual Keys" },
 ];
 
@@ -46,6 +48,14 @@ export default function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
   const { pathname } = useLocation();
+
+  // Keep the browser tab title in step with the active route. The catch-all
+  // route renders Usage, so unknown paths title as Usage too.
+  const pageLabel =
+    NAV.find((entry) => entry.to === pathname)?.label ?? "Usage";
+  useEffect(() => {
+    document.title = `${pageLabel} · toll`;
+  }, [pageLabel]);
 
   useEffect(() => {
     getSettings()
@@ -98,9 +108,10 @@ export default function App() {
     <Theme className={themeClass}>
       <Header aria-label="toll admin">
         <HeaderMenuButton aria-label="Open menu" onClick={() => {}} />
-        <HeaderName as={Link} to="/" prefix="">
+        <Link className="cds--header__name" to="/">
+          <TollMark />
           toll
-        </HeaderName>
+        </Link>
         <HeaderGlobalBar>
           <HeaderGlobalAction
             aria-label={`Theme: ${THEME_LABELS[pref]}`}
@@ -137,6 +148,7 @@ export default function App() {
           <Route path="/" element={<Usage />} />
           <Route path="/providers" element={<Providers />} />
           <Route path="/models" element={<Models />} />
+          <Route path="/profiles" element={<Profiles />} />
           <Route path="/keys" element={<Keys />} />
           {/* Unknown paths fall back to the Usage view. */}
           <Route path="*" element={<Usage />} />

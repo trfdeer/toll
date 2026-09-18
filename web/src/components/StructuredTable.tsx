@@ -99,6 +99,8 @@ export interface StructuredTableProps {
   className?: string;
   pageSize?: number;
   pageSizes?: number[];
+  /** Indices of columns that should not be sortable (e.g. a checkbox column). */
+  nonSortable?: number[];
 }
 
 // Read-only table on Carbon's DataTable (compact rows). rows: array of
@@ -118,6 +120,7 @@ export default function StructuredTable({
   className,
   pageSize: initialPageSize = 10,
   pageSizes = [10, 20, 50],
+  nonSortable = [],
 }: StructuredTableProps) {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(initialPageSize);
@@ -139,7 +142,11 @@ export default function StructuredTable({
     );
   }
 
-  const cols = headers.map((h, i) => ({ key: `col${i}`, header: h }));
+  const cols = headers.map((h, i) => ({
+    key: `col${i}`,
+    header: h,
+    isSortable: !nonSortable.includes(i),
+  }));
   const data: RowData[] = rows.map((cells, i) => ({
     id: `row-${i}`,
     ...Object.fromEntries(cells.map((v, j) => [`col${j}`, v] as const)),

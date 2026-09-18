@@ -16,6 +16,22 @@ data_dir: ./data         # SQLite lives here (TOLL_DATA_DIR overrides)
 # at runtime. Omit to leave the runtime/DB value in charge.
 # store_prompts: true
 
+# Named, reusable provider/model filters for virtual keys. A key references
+# exactly one profile; the "All" profile (no constraint) is seeded
+# automatically and cannot be redefined here. Config profiles seed the
+# database at startup; afterwards the admin UI is authoritative (export the
+# config to persist UI edits). Modes: none (unconstrained), include (only
+# Values), exclude (everything but Values); include/exclude need at least one
+# value.
+# profiles:
+#   - name: glm-only
+#     provider_filter:
+#       mode: include
+#       values: [openrouter]
+#     model_filter:
+#       mode: exclude
+#       values: [openrouter/deepseek-v3]
+
 upstreams:
   # --- An OpenAI-compatible provider (https://openrouter.ai) ---
   - name: openrouter

@@ -20,6 +20,7 @@ import {
 } from "@carbon/react";
 import type { FormEvent, ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
+import PageState from "../components/PageState";
 import RequestDetailPanel from "../components/RequestDetail";
 import StructuredTable from "../components/StructuredTable";
 import { getKeys, getRequest, getRequests, getUsage } from "../lib/api";
@@ -191,8 +192,8 @@ export default function Usage() {
   // A failed poll keeps the rows that are already on screen and reports the
   // error in the notification below; only a first load with nothing to show
   // replaces the view.
-  if (error && (!summary || !requests)) return <p>Failed to load: {error}</p>;
-  if (!summary || !requests) return <InlineLoading description="Loading…" />;
+  if (error && (!summary || !requests)) return <PageState error={error} />;
+  if (!summary || !requests) return <PageState />;
 
   const total = summary.rows.reduce(
     (acc, r) => ({

@@ -16,7 +16,7 @@ func TestPromptContentLivesInContentDB(t *testing.T) {
 	ctx := t.Context()
 
 	upID, _ := s.UpsertUpstream(ctx, "hyper", "https://x/v1", "k", 300, 0)
-	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", KeyFilter{}, KeyFilter{})
+	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", 1)
 	s.EnsureConversation(ctx, "conv", keyID)
 	id, err := s.CreateTranscript(ctx, "conv", "m", "m-up", `{"messages":[{"role":"user","content":"s3cret"}]}`)
 	if err != nil {
@@ -80,7 +80,7 @@ func TestPromptsDisabledKeepsMetadata(t *testing.T) {
 	}
 
 	upID, _ := s.UpsertUpstream(ctx, "hyper", "https://x/v1", "k", 300, 0)
-	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", KeyFilter{}, KeyFilter{})
+	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", 1)
 	s.EnsureConversation(ctx, "conv", keyID)
 	id, _ := s.CreateTranscript(ctx, "conv", "m", "m-up", `{"prompt":"hidden"}`)
 	s.CompleteTranscript(ctx, id, `{"answer":"hidden"}`, 200, UsageEvent{KeyID: keyID, UpstreamID: upID})
@@ -165,8 +165,8 @@ func TestUsageDeletedKeyFilter(t *testing.T) {
 	ctx := t.Context()
 
 	upID, _ := s.UpsertUpstream(ctx, "hyper", "https://x/v1", "k", 300, 0)
-	appID, _ := s.CreateVirtualKey(ctx, "app", "h1", KeyFilter{}, KeyFilter{})
-	otherID, _ := s.CreateVirtualKey(ctx, "other", "h2", KeyFilter{}, KeyFilter{})
+	appID, _ := s.CreateVirtualKey(ctx, "app", "h1", 1)
+	otherID, _ := s.CreateVirtualKey(ctx, "other", "h2", 1)
 	s.RecordUsage(ctx, UsageEvent{KeyID: appID, UpstreamID: upID, GatewayModel: "m", UpstreamModel: "m"})
 	s.RecordUsage(ctx, UsageEvent{KeyID: otherID, UpstreamID: upID, GatewayModel: "m", UpstreamModel: "m"})
 	if err := s.DeleteVirtualKey(ctx, "app"); err != nil {

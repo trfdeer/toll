@@ -76,6 +76,26 @@ type Overlay struct {
 // Regexp returns the compiled match pattern.
 func (o *Overlay) Regexp() *regexp.Regexp { return o.compiled }
 
+// DefaultProfileName is the seeded, read-only profile every virtual key falls
+// back to. It is reserved: a config may not redefine it.
+const DefaultProfileName = "All"
+
+// ProfileFilter is one dimension of a profile's rule set: a mode plus the
+// values it includes or excludes. Mode "" or "none" imposes no constraint.
+type ProfileFilter struct {
+	Mode   string   `yaml:"mode"`
+	Values []string `yaml:"values"`
+}
+
+// Profile is a named, reusable provider/model filter. Config profiles seed the
+// store's profiles table at startup; afterwards the admin UI is authoritative
+// (export the config to persist UI edits), mirroring model aliases.
+type Profile struct {
+	Name           string        `yaml:"name"`
+	ProviderFilter ProfileFilter `yaml:"provider_filter"`
+	ModelFilter    ProfileFilter `yaml:"model_filter"`
+}
+
 // Upstream describes one OpenAI-compatible API backend.
 type Upstream struct {
 	Name           string        `yaml:"name"`
@@ -109,6 +129,10 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	DataDir         string
 	Upstreams       []*Upstream
+	// Profiles are config-defined named provider/model filters. They seed the
+	// store's profiles table at startup and are written back by the config
+	// export, so the exported file round-trips them.
+	Profiles []Profile
 	// StorePrompts controls whether prompt/response bodies are persisted (to
 	// the separate content database). Nil means "leave it to the store's
 	// setting" (set from the admin UI); true/false seeds the setting at
@@ -134,6 +158,7 @@ type fileConfig struct {
 	LogLevel     string         `yaml:"log_level"`
 	DataDir      string         `yaml:"data_dir"`
 	StorePrompts *bool          `yaml:"store_prompts"`
+	Profiles     []Profile      `yaml:"profiles"`
 	Upstreams    []yamlUpstream `yaml:"upstreams"`
 }
 
@@ -271,6 +296,13 @@ func loadFile(path string, cfg *Config) error {
 		cfg.DataDir = fc.DataDir
 	}
 
+	profiles, err := buildProfiles(fc.Profiles)
+	if err != nil {
+		errs = append(errs, err)
+	} else {
+		cfg.Profiles = profiles
+	}
+
 	for i, yu := range fc.Upstreams {
 		u, err := buildUpstream(yu)
 		if err != nil {
@@ -285,6 +317,73 @@ func loadFile(path string, cfg *Config) error {
 		cfg.Upstreams = append(cfg.Upstreams, &u)
 	}
 	return errors.Join(errs...)
+}
+
+// buildProfiles validates config-defined profiles, rejecting the reserved
+// default name and duplicates up front so a misconfigured file fails at load
+// rather than at seeding.
+func buildProfiles(in []Profile) ([]Profile, error) {
+	var errs []error
+	seen := make(map[string]bool, len(in))
+	out := make([]Profile, 0, len(in))
+	for i, p := range in {
+		p.Name = strings.TrimSpace(p.Name)
+		label := fmt.Sprintf("profiles[%d]", i)
+		switch {
+		case p.Name == "":
+			errs = append(errs, fmt.Errorf("%s: name is required", label))
+			continue
+		case p.Name == DefaultProfileName:
+			errs = append(errs, fmt.Errorf("%s: %q is reserved", label, p.Name))
+			continue
+		case seen[p.Name]:
+			errs = append(errs, fmt.Errorf("%s: duplicate profile %q", label, p.Name))
+			continue
+		}
+		seen[p.Name] = true
+		label = fmt.Sprintf("profiles[%d] (%s)", i, p.Name)
+		if err := validateProfileFilter(p.ProviderFilter); err != nil {
+			errs = append(errs, fmt.Errorf("%s: provider_filter: %w", label, err))
+		}
+		if err := validateProfileFilter(p.ModelFilter); err != nil {
+			errs = append(errs, fmt.Errorf("%s: model_filter: %w", label, err))
+		}
+		p.ProviderFilter = normalizeProfileFilter(p.ProviderFilter)
+		p.ModelFilter = normalizeProfileFilter(p.ModelFilter)
+		out = append(out, p)
+	}
+	return out, errors.Join(errs...)
+}
+
+// validateProfileFilter mirrors the admin API's filter validation.
+func validateProfileFilter(f ProfileFilter) error {
+	switch f.Mode {
+	case "", "none":
+		return nil
+	case "include", "exclude":
+		if len(f.Values) == 0 {
+			return errors.New("mode " + f.Mode + " requires at least one value")
+		}
+		return nil
+	default:
+		return errors.New("mode must be none, include or exclude")
+	}
+}
+
+// normalizeProfileFilter gives a filter a concrete mode and non-nil values.
+func normalizeProfileFilter(f ProfileFilter) ProfileFilter {
+	switch f.Mode {
+	case "include", "exclude":
+	default:
+		f.Mode = "none"
+	}
+	if f.Values == nil {
+		f.Values = []string{}
+	}
+	if f.Mode == "none" {
+		f.Values = []string{}
+	}
+	return f
 }
 
 func buildUpstream(yu yamlUpstream) (Upstream, error) {

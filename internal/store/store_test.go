@@ -23,7 +23,7 @@ func TestMigrationsRunAndAreIdempotent(t *testing.T) {
 	defer s.Close()
 
 	for _, table := range []string{
-		"schema_migrations", "upstreams", "models", "virtual_keys",
+		"schema_migrations", "upstreams", "models", "virtual_keys", "profiles",
 		"usage_events", "conversations", "transcripts",
 	} {
 		var name string
@@ -55,7 +55,7 @@ func TestDeleteVirtualKeyKeepsUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyID, err := s.CreateVirtualKey(ctx, "app", "hash", KeyFilter{}, KeyFilter{})
+	keyID, err := s.CreateVirtualKey(ctx, "app", "hash", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,29 +100,35 @@ func TestUpdateVirtualKey(t *testing.T) {
 	defer s.Close()
 
 	hash := "hash-update"
-	if _, err := s.CreateVirtualKey(t.Context(), "before", hash, KeyFilter{}, KeyFilter{}); err != nil {
+	if _, err := s.CreateVirtualKey(t.Context(), "before", hash, 1); err != nil {
 		t.Fatal(err)
 	}
 
 	provider := KeyFilter{Mode: "include", Values: []string{"zeph"}}
 	model := KeyFilter{Mode: "exclude", Values: []string{"zeph/secret"}}
-	if err := s.UpdateVirtualKey(t.Context(), "before", "after", provider, model); err != nil {
+	profileID, err := s.CreateProfile(t.Context(), "restricted", provider, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateVirtualKey(t.Context(), "before", "after", profileID); err != nil {
 		t.Fatal(err)
 	}
 
-	// The key material is unchanged: the same hash still resolves.
+	// The key material is unchanged: the same hash still resolves, and the
+	// filters come from the profile it now points at.
 	vk, err := s.KeyByHash(t.Context(), hash)
 	if err != nil {
 		t.Fatalf("key hash changed by update: %v", err)
 	}
-	if vk.Name != "after" || vk.ProviderFilter.Mode != "include" ||
+	if vk.Name != "after" || vk.ProfileName != "restricted" ||
+		vk.ProviderFilter.Mode != "include" ||
 		len(vk.ProviderFilter.Values) != 1 || vk.ProviderFilter.Values[0] != "zeph" ||
 		vk.ModelFilter.Mode != "exclude" {
 		t.Errorf("updated key = %+v", vk)
 	}
 
 	// Unknown key.
-	if err := s.UpdateVirtualKey(t.Context(), "missing", "x", KeyFilter{}, KeyFilter{}); err != ErrKeyNotFound {
+	if err := s.UpdateVirtualKey(t.Context(), "missing", "x", 1); err != ErrKeyNotFound {
 		t.Errorf("update missing = %v, want ErrKeyNotFound", err)
 	}
 }
@@ -135,7 +141,7 @@ func TestPausedKeyInactive(t *testing.T) {
 	defer s.Close()
 
 	ctx := t.Context()
-	if _, err := s.CreateVirtualKey(ctx, "app", "hash", KeyFilter{}, KeyFilter{}); err != nil {
+	if _, err := s.CreateVirtualKey(ctx, "app", "hash", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PauseVirtualKey(ctx, "app"); err != nil {
@@ -161,7 +167,7 @@ func TestUsageAndRequestFilters(t *testing.T) {
 	ctx := t.Context()
 
 	upID, _ := s.UpsertUpstream(ctx, "hyper", "https://x/v1", "k", 300, 0)
-	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", KeyFilter{}, KeyFilter{})
+	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", 1)
 	if err := s.RecordUsage(ctx, UsageEvent{
 		KeyID: keyID, UpstreamID: upID, GatewayModel: "m", UpstreamModel: "m",
 		PromptTokens: 1, CompletionToken: 1,
@@ -245,5 +251,56 @@ func TestForeignKeysEnforced(t *testing.T) {
 		`INSERT INTO usage_events (key_id, upstream_id, gateway_model, upstream_model, prompt_tokens, completion_tokens)
 		 VALUES (1, 1, 'm', 'm', 1, 1)`); err == nil {
 		t.Fatal("expected FK violation inserting usage without parents")
+	}
+}
+
+func TestSeedProfiles(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := t.Context()
+
+	// An existing profile to be updated by the seed.
+	if _, err := s.CreateProfile(ctx, "keep", KeyFilter{}, KeyFilter{}); err != nil {
+		t.Fatal(err)
+	}
+
+	seeds := []SeedProfile{
+		{Name: "zeph", ProviderFilter: KeyFilter{Mode: "include", Values: []string{"zeph"}}},
+		{Name: "keep", ModelFilter: KeyFilter{Mode: "exclude", Values: []string{"zeph/secret"}}},
+	}
+	if err := s.SeedProfiles(ctx, seeds); err != nil {
+		t.Fatal(err)
+	}
+
+	zeph, err := s.ProfileByName(ctx, "zeph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zeph.ProviderFilter.Mode != "include" || len(zeph.ProviderFilter.Values) != 1 ||
+		zeph.ProviderFilter.Values[0] != "zeph" {
+		t.Errorf("seeded profile = %+v", zeph)
+	}
+	keep, err := s.ProfileByName(ctx, "keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keep.ModelFilter.Mode != "exclude" || len(keep.ModelFilter.Values) != 1 {
+		t.Errorf("existing profile not updated: %+v", keep.ModelFilter)
+	}
+
+	// The reserved default is never modified.
+	if err := s.SeedProfiles(ctx, []SeedProfile{{Name: DefaultProfileName}}); err == nil {
+		t.Error("seeding the default profile should fail")
+	}
+
+	// Profiles the config omits survive untouched.
+	if err := s.SeedProfiles(ctx, []SeedProfile{{Name: "later"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProfileByName(ctx, "keep"); err != nil {
+		t.Errorf("unmentioned profile should survive: %v", err)
 	}
 }

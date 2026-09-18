@@ -74,6 +74,7 @@ in
             ../web/package.json
             ../web/tsconfig.json
             ../web/vite.config.ts
+            ../web/public
             ../web/src
           ];
         };

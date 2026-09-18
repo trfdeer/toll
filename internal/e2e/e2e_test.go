@@ -76,6 +76,11 @@ type gateway struct {
 	cfg *config.Config
 }
 
+// constrained reports whether a filter actually restricts anything.
+func constrained(f store.KeyFilter) bool {
+	return f.Mode != "" && f.Mode != "none" && len(f.Values) > 0
+}
+
 func startGateway(t *testing.T, stub *stubUpstream, provider, model store.KeyFilter) *gateway {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "toll.db"))
@@ -109,7 +114,15 @@ func startGateway(t *testing.T, stub *stubUpstream, provider, model store.KeyFil
 	})
 
 	plaintext, hash, _ := keys.Generate()
-	if _, err := st.CreateVirtualKey(t.Context(), "app", hash, provider, model); err != nil {
+	profileID := int64(1) // the seeded All profile
+	if constrained(provider) || constrained(model) {
+		id, err := st.CreateProfile(t.Context(), "app", provider, model)
+		if err != nil {
+			t.Fatal(err)
+		}
+		profileID = id
+	}
+	if _, err := st.CreateVirtualKey(t.Context(), "app", hash, profileID); err != nil {
 		t.Fatal(err)
 	}
 

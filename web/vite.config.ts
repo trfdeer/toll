@@ -6,6 +6,7 @@ import type {
   CreateProviderResponse,
   KeyFilter,
   Model,
+  Profile,
   Provider,
   RequestDetail,
   RequestRow,
@@ -21,6 +22,11 @@ interface CreateProviderBody {
 
 interface CreateKeyBody {
   name?: string;
+  profile?: string;
+}
+
+interface ProfileBody {
+  name?: string;
   providerFilter?: KeyFilter;
   modelFilter?: KeyFilter;
 }
@@ -30,15 +36,19 @@ interface CreateKeyBody {
 // shapes under /admin/api/*.
 function mockApi(): Plugin {
   const none: KeyFilter = { mode: 'none', values: [] };
-  const keys: VirtualKey[] = [
-    { name: 'web', providerFilter: none, modelFilter: none, paused: false, revoked: false },
+  const profiles: Profile[] = [
+    { name: 'All', providerFilter: none, modelFilter: none, isDefault: true, keyCount: 0 },
     {
-      name: 'batch',
+      name: 'hyper-chat',
       providerFilter: { mode: 'include', values: ['hyper'] },
       modelFilter: { mode: 'exclude', values: ['hyper/deepseek-v3'] },
-      paused: false,
-      revoked: true,
+      isDefault: false,
+      keyCount: 0,
     },
+  ];
+  const keys: VirtualKey[] = [
+    { name: 'web', profile: 'All', paused: false, revoked: false },
+    { name: 'batch', profile: 'hyper-chat', paused: false, revoked: true },
   ];
   
 
@@ -62,15 +72,15 @@ function mockApi(): Plugin {
 
   const providers: Provider[] = [
     {
-      name: 'default', baseURL: 'http://zeph:9931/v1', modelCount: 3,
+      name: 'hyper', baseURL: 'http://zeph:9931/v1', modelCount: 3,
       disabled: false, reachable: true, lastError: '', lastSyncedAt: '2026-09-15T00:00:00.000Z',
     },
   ];
   let storePrompts = true;
   const models: Model[] = [
-    { id: 1, upstream: 'default', upstreamModelId: 'glm-4.6', gatewayId: 'hyper/glm-4.6', displayName: 'GLM 4.6', alias: '', metadata: { max_model_len: 262144, max_output_tokens: 8192 }, disabled: false, providerDisabled: false, providerReachable: true },
-    { id: 2, upstream: 'default', upstreamModelId: 'glm-4.5-air', gatewayId: 'hyper/glm-4.5-air', displayName: 'GLM 4.5 Air', alias: '', metadata: { context_window: 128000 }, disabled: false, providerDisabled: false, providerReachable: true },
-    { id: 3, upstream: 'default', upstreamModelId: 'deepseek-v3', gatewayId: 'hyper/deepseek-v3', displayName: 'DeepSeek V3', alias: '', metadata: {}, disabled: true, providerDisabled: false, providerReachable: true },
+    { id: 1, upstream: 'hyper', upstreamModelId: 'glm-4.6', gatewayId: 'hyper/glm-4.6', displayName: 'GLM 4.6', alias: '', metadata: { max_model_len: 262144, max_output_tokens: 8192 }, disabled: false, providerDisabled: false, providerReachable: true },
+    { id: 2, upstream: 'hyper', upstreamModelId: 'glm-4.5-air', gatewayId: 'hyper/glm-4.5-air', displayName: 'GLM 4.5 Air', alias: '', metadata: { context_window: 128000 }, disabled: false, providerDisabled: false, providerReachable: true },
+    { id: 3, upstream: 'hyper', upstreamModelId: 'deepseek-v3', gatewayId: 'hyper/deepseek-v3', displayName: 'DeepSeek V3', alias: '', metadata: {}, disabled: true, providerDisabled: false, providerReachable: true },
   ];
 
   const requestDetails: Record<number, RequestDetail> = {
@@ -243,6 +253,62 @@ function mockApi(): Plugin {
         if (method === 'GET' && path === '/keys') {
           return json(res, 200, { keys });
         }
+        if (method === 'GET' && path === '/profiles') {
+          return json(res, 200, {
+            profiles: profiles.map((p) => ({
+              ...p,
+              keyCount: keys.filter((k) => k.profile === p.name).length,
+            })),
+          });
+        }
+        if (method === 'POST' && path === '/profiles') {
+          const body = (await readBody(req)) as ProfileBody;
+          if (!body.name) return json(res, 422, { error: 'name is required' });
+          if (profiles.some((p) => p.name === body.name)) {
+            return json(res, 422, { error: 'profile already exists' });
+          }
+          profiles.push({
+            name: body.name,
+            providerFilter: body.providerFilter ?? none,
+            modelFilter: body.modelFilter ?? none,
+            isDefault: false,
+            keyCount: 0,
+          });
+          return json(res, 204, null);
+        }
+        if (method === 'PUT' && seg[0] === 'profiles' && seg[1]) {
+          const current = decodeURIComponent(seg[1]);
+          const p = profiles.find((p) => p.name === current);
+          if (!p) return json(res, 404, { error: 'profile not found' });
+          if (p.isDefault) return json(res, 422, { error: 'the All profile is read-only' });
+          const body = (await readBody(req)) as ProfileBody;
+          if (!body.name) return json(res, 422, { error: 'name is required' });
+          if (body.name !== current && profiles.some((x) => x.name === body.name)) {
+            return json(res, 422, { error: 'profile already exists' });
+          }
+          const oldName = p.name;
+          p.name = body.name;
+          if (body.providerFilter) p.providerFilter = body.providerFilter;
+          if (body.modelFilter) p.modelFilter = body.modelFilter;
+          // Keys reference profiles by name, so keep them pointing at the
+          // renamed profile.
+          for (const k of keys) if (k.profile === oldName) k.profile = p.name;
+          return json(res, 204, null);
+        }
+        if (method === 'DELETE' && seg[0] === 'profiles' && seg[1]) {
+          const name = decodeURIComponent(seg[1]);
+          const i = profiles.findIndex((p) => p.name === name);
+          if (i < 0) return json(res, 404, { error: 'profile not found' });
+          if (profiles[i]?.isDefault) {
+            return json(res, 422, { error: 'the All profile is read-only' });
+          }
+          const inUse = keys.filter((k) => k.profile === name).length;
+          if (inUse > 0) {
+            return json(res, 422, { error: `profile is in use by ${inUse} virtual key(s)` });
+          }
+          profiles.splice(i, 1);
+          return json(res, 204, null);
+        }
         if (method === 'POST' && path === '/keys') {
           const body = (await readBody(req)) as CreateKeyBody;
           if (!body.name) return json(res, 422, { error: 'name is required' });
@@ -251,8 +317,7 @@ function mockApi(): Plugin {
           }
           keys.push({
             name: body.name,
-            providerFilter: body.providerFilter ?? none,
-            modelFilter: body.modelFilter ?? none,
+            profile: body.profile ?? 'All',
             paused: false,
             revoked: false,
           });
@@ -268,8 +333,7 @@ function mockApi(): Plugin {
             return json(res, 422, { error: 'key already exists' });
           }
           k.name = body.name;
-          if (body.providerFilter) k.providerFilter = body.providerFilter;
-          if (body.modelFilter) k.modelFilter = body.modelFilter;
+          if (body.profile) k.profile = body.profile;
           return json(res, 204, null);
         }
         if (method === 'POST' && seg[0] === 'keys' && seg[2] === 'revoke') {

@@ -46,7 +46,7 @@ func TestDeletedKeysUsageEndpoint(t *testing.T) {
 	st, h := setup(t)
 
 	upID, _ := st.UpsertUpstream(t.Context(), "hyper", "https://x/v1", "k", 300, 0)
-	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", store.KeyFilter{}, store.KeyFilter{})
+	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", 1)
 	st.RecordUsage(t.Context(), store.UsageEvent{
 		KeyID: keyID, UpstreamID: upID, GatewayModel: "m", UpstreamModel: "m",
 	})
@@ -87,7 +87,7 @@ func TestRequestDetailReportsMissingContent(t *testing.T) {
 	if err := st.SetSetting(t.Context(), store.SettingStorePrompts, "false"); err != nil {
 		t.Fatal(err)
 	}
-	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", store.KeyFilter{}, store.KeyFilter{})
+	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", 1)
 	st.EnsureConversation(t.Context(), "conv", keyID)
 	id, _ := st.CreateTranscript(t.Context(), "conv", "m", "m-up", `{"messages":[]}`)
 	st.CompleteTranscript(t.Context(), id, `{}`, 200, store.UsageEvent{KeyID: keyID, UpstreamID: 1})
