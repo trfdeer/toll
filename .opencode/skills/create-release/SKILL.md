@@ -169,12 +169,9 @@ docker pull ghcr.io/trfdeer/toll:vX.Y.Z
 docker run --rm ghcr.io/trfdeer/toll:vX.Y.Z --version   # -> toll version X.Y.Z-<sha>
 ```
 
-Confirm `:latest` points at the same image, then optionally publish the notes
-(git-cliff generated them in step 3):
-
-```sh
-gh release create vX.Y.Z --title "toll X.Y.Z" --notes-file /tmp/toll-release-notes.md
-```
+Confirm `:latest` points at the same image. That is the release: the tag, its
+message (the git-cliff notes from step 3), and the container image. There is no
+separate GitHub release to create.
 
 ## If a step fails
 
