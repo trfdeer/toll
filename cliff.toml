@@ -1,0 +1,62 @@
+# git-cliff configuration for toll.
+#
+# Release notes are authored in commit bodies as Keep a Changelog sections
+# (Added / Changed / Deprecated / Removed / Fixed / Security). Conventional
+# commit parsing sees each heading as a footer, so this config merges those
+# sections across a release's commits and emits them in canonical order.
+#
+# Usage:
+#   git-cliff --unreleased --tag vX.Y.Z --strip header   # notes for one release
+#   git-cliff -o CHANGELOG.md                             # full changelog
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to toll are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""
+body = """
+{% if version %}## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}{% else %}## [Unreleased]{% endif %}
+{%- set_global sections = [] %}
+{%- for commit in commits %}
+{%- for footer in commit.footers %}
+{%- set_global sections = sections | concat(with=footer) %}
+{%- endfor %}
+{%- endfor %}
+{%- for section in ["Added", "Changed", "Deprecated", "Removed", "Fixed", "Security"] %}
+{%- set entries = sections | filter(attribute="token", value=section) %}
+{%- if entries | length > 0 %}
+
+### {{ section }}
+{%- for entry in entries %}
+{{ entry.value | trim }}
+{%- endfor %}
+{%- endif %}
+{%- endfor %}
+"""
+trim = true
+footer = "\n"
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+sort_commits = "oldest"
+tag_pattern = "v[0-9].*"
+
+[bump]
+# feat always bumps minor; a breaking change on 0.x bumps minor. Reaching 1.0.0
+# is a deliberate decision, not automatic (breaking_always_bump_major = false
+# still bumps major once the major version is >= 1).
+features_always_bump_minor = true
+breaking_always_bump_major = false
+# Version of the first release, used by `--bumped-version` when no tags exist.
+# Must match tag_pattern above (note the `v`).
+initial_tag = "v0.1.0"
+# Types that never cut a release. refactor/perf are user-visible "Changed" and
+# do bump a patch; these do not — which also keeps the `chore(nix): bump
+# version` release commit from triggering a further bump.
+no_increment_regex = "chore|ci|docs|style|test|build"

@@ -19,6 +19,8 @@
           gotools
           go-tools
           govulncheck
+
+          git-cliff
         ];
       };
     };
