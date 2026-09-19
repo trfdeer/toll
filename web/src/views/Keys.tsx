@@ -11,10 +11,10 @@ import {
   Stack,
   TextInput,
 } from "@carbon/react";
+import type { TableColumn } from "react-data-table-component";
 import { useCallback, useEffect, useState } from "react";
-import PageState from "../components/PageState";
 import StatusTag, { type Status } from "../components/StatusTag";
-import StructuredTable from "../components/StructuredTable";
+import Table from "../components/Table";
 import {
   createKey,
   deleteKey,
@@ -27,9 +27,18 @@ import {
 } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import type { Profile, VirtualKey } from "../lib/types";
+import {
+  serverTableProps,
+  useServerRows,
+  type ServerTableQuery,
+} from "../lib/useServerRows";
+
+// KeyRow adds the stable table key; keys are addressed by name.
+type KeyRow = VirtualKey & { id: string };
+
+const STATUS_VALUES = ["active", "paused", "revoked"];
 
 export default function Keys() {
-  const [keys, setKeys] = useState<VirtualKey[] | null>(null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
@@ -41,16 +50,26 @@ export default function Keys() {
   const [profile, setProfile] = useState("All");
   const [busy, setBusy] = useState(false);
 
-  const reload = useCallback(() => {
-    getKeys()
-      .then((k) => setKeys(k.keys))
-      .catch((e: unknown) => setError(errorMessage(e)));
-    getProfiles()
+  // The profile dropdown needs the full list, not one page.
+  const loadProfiles = useCallback(() => {
+    getProfiles({ limit: 0 })
       .then((res) => setProfiles(res.profiles))
       .catch((e: unknown) => setError(errorMessage(e)));
   }, []);
 
-  useEffect(reload, [reload]);
+  useEffect(loadProfiles, [loadProfiles]);
+
+  const fetchKeys = useCallback(
+    (q: ServerTableQuery) =>
+      getKeys(q).then((r) => ({
+        rows: r.keys.map((k) => ({ ...k, id: k.name })),
+        total: r.total,
+      })),
+    [],
+  );
+  const table = useServerRows<KeyRow>(fetchKeys, {
+    onError: (e) => setError(errorMessage(e)),
+  });
 
   const resetForm = () => {
     setName("");
@@ -85,14 +104,14 @@ export default function Keys() {
     try {
       if (editing) {
         await updateKey(editing.name, { name: name.trim(), profile });
-        reload();
+        table.reload();
         setOpen(false);
         setEditing(null);
         resetForm();
       } else {
         const res = await createKey(name.trim(), profile);
         setFlash(res.plaintext);
-        reload();
+        table.reload();
         setOpen(false);
         resetForm();
       }
@@ -107,7 +126,7 @@ export default function Keys() {
     setError(null);
     try {
       await revokeKey(keyName);
-      reload();
+      table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -117,7 +136,7 @@ export default function Keys() {
     setError(null);
     try {
       await pauseKey(keyName);
-      reload();
+      table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -127,7 +146,7 @@ export default function Keys() {
     setError(null);
     try {
       await resumeKey(keyName);
-      reload();
+      table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -137,7 +156,7 @@ export default function Keys() {
     setError(null);
     try {
       await deleteKey(keyName);
-      reload();
+      table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -191,8 +210,39 @@ export default function Keys() {
     );
   };
 
-  if (error && keys === null) return <PageState error={error} />;
-  if (keys === null) return <PageState />;
+  const columns: TableColumn<KeyRow>[] = [
+    {
+      id: "name",
+      name: "Name",
+      selector: (k) => k.name,
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "profile",
+      name: "Profile",
+      selector: (k) => k.profile,
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "status",
+      name: "Status",
+      selector: (k) => status(k),
+      sortable: true,
+      filterable: true,
+      filterType: "set",
+      filterOptions: { values: STATUS_VALUES },
+      cell: (k) => <StatusTag status={status(k)} />,
+    },
+    {
+      id: "actions",
+      name: "",
+      right: true,
+      width: "180px",
+      cell: (k) => <div className="key-actions">{actionsFor(k)}</div>,
+    },
+  ];
 
   return (
     <Grid>
@@ -217,26 +267,20 @@ export default function Keys() {
             />
           )}
 
-          <StructuredTable
-            headers={["Name", "Profile", "Status", ""]}
-            searchable={false}
-            className="keys-table"
-            actions={
+          <div className="table-block">
+            <div className="table-toolbar">
               <Button renderIcon={Add} onClick={openCreate}>
                 Create key
               </Button>
-            }
-            empty="No keys yet."
-            rows={keys.map((k) => {
-              const s = status(k);
-              return [
-                k.name,
-                k.profile,
-                <StatusTag status={s} />,
-                <div className="key-actions">{actionsFor(k)}</div>,
-              ];
-            })}
-          />
+            </div>
+            <Table
+              columns={columns}
+              data={table.rows}
+              noDataComponent="No keys yet."
+              persistTableHead
+              {...serverTableProps(table)}
+            />
+          </div>
         </Stack>
       </Column>
 

@@ -228,6 +228,27 @@ func TestUsageAndRequestFilters(t *testing.T) {
 		t.Errorf("requests offset = %d/%d, want 0/1", len(rows), total)
 	}
 
+	// Per-column filters (including the numeric columns the admin UI offers).
+	rows, total, err = s.Requests(ctx, RequestFilter{Filter: map[string]FilterSpec{
+		"model":  {Op: FilterIn, Values: []string{"m"}},
+		"status": {Op: FilterEq, Values: []string{"200"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || total != 1 {
+		t.Errorf("requests filtered = %d/%d, want 1/1", len(rows), total)
+	}
+	rows, total, err = s.Requests(ctx, RequestFilter{Filter: map[string]FilterSpec{
+		"model": {Op: FilterContains, Values: []string{"nope"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 || total != 0 {
+		t.Errorf("requests filtered out = %d/%d, want 0/0", len(rows), total)
+	}
+
 	// An in-flight transcript (no completed_at) has no duration.
 	s.EnsureConversation(ctx, "conv-2", keyID)
 	if _, err := s.CreateTranscript(ctx, "conv-2", "m", "m", `{"model":"m"}`); err != nil {
@@ -239,6 +260,149 @@ func TestUsageAndRequestFilters(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0].DurationMS != nil {
 		t.Errorf("in-flight duration = %v, want nil (rows=%d)", rows[0].DurationMS, len(rows))
+	}
+}
+
+func TestListPaginationSortFilter(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := t.Context()
+
+	// Two upstreams with models, so provider filtering and sorting matter.
+	upA, _ := s.UpsertUpstream(ctx, "alpha", "https://a/v1", "k", 300, 0)
+	upB, _ := s.UpsertUpstream(ctx, "beta", "https://b/v1", "k", 300, 1)
+	_, _ = s.ReplaceModels(ctx, upA, []DiscoveredModel{
+		{UpstreamModelID: "a1", GatewayID: "alpha/a1", DisplayName: "A one", Metadata: []byte(`{"max_model_len":1000}`)},
+		{UpstreamModelID: "a2", GatewayID: "alpha/a2", DisplayName: "A two", Metadata: []byte(`{"max_input_tokens":5000}`)},
+	})
+	_, _ = s.ReplaceModels(ctx, upB, []DiscoveredModel{
+		{UpstreamModelID: "b1", GatewayID: "beta/b1", DisplayName: "B one", Metadata: []byte(`{}`)},
+	})
+
+	// Models: windowing with a total, sorted ascending by gateway id.
+	page1, total, err := s.ListModelsPaged(ctx, ListParams{Limit: 2, Sort: "gatewayId", Dir: "asc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(page1) != 2 {
+		t.Fatalf("models page1 = %d/%d, want 2/3", len(page1), total)
+	}
+	if page1[0].GatewayID != "alpha/a1" || page1[1].GatewayID != "alpha/a2" {
+		t.Errorf("models sort asc = %q,%q", page1[0].GatewayID, page1[1].GatewayID)
+	}
+	page2, _, err := s.ListModelsPaged(ctx, ListParams{Limit: 2, Offset: 2, Sort: "gatewayId", Dir: "asc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 1 || page2[0].GatewayID != "beta/b1" {
+		t.Errorf("models page2 = %+v", page2)
+	}
+	// Descending sort.
+	desc, _, _ := s.ListModelsPaged(ctx, ListParams{Limit: 1, Sort: "gatewayId", Dir: "desc"})
+	if len(desc) != 1 || desc[0].GatewayID != "beta/b1" {
+		t.Errorf("models sort desc = %+v", desc)
+	}
+
+	// Models: provider membership filter.
+	filtered, ftotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]FilterSpec{
+		"upstream": {Op: FilterIn, Values: []string{"beta"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ftotal != 1 || len(filtered) != 1 || filtered[0].GatewayID != "beta/b1" {
+		t.Errorf("models provider filter = %+v (total %d)", filtered, ftotal)
+	}
+
+	// Models: contains filter.
+	contains, ctotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]FilterSpec{
+		"displayName": {Op: FilterContains, Values: []string{"two"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ctotal != 1 || len(contains) != 1 || contains[0].DisplayName != "A two" {
+		t.Errorf("models contains filter = %+v", contains)
+	}
+
+	// Derived columns from the model_search view (json_extract) sort and
+	// filter: input_limit is 1000/5000/null, so descending puts a2 first and
+	// the null last.
+	byLimit, _, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Sort: "inputLimit", Dir: "desc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byLimit) != 3 || byLimit[0].GatewayID != "alpha/a2" || byLimit[1].GatewayID != "alpha/a1" {
+		t.Errorf("models sort by inputLimit = %+v", byLimit)
+	}
+	limitFilter, lfTotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]FilterSpec{
+		"inputLimit": {Op: FilterIn, Values: []string{"5000"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lfTotal != 1 || len(limitFilter) != 1 || limitFilter[0].GatewayID != "alpha/a2" {
+		t.Errorf("models inputLimit filter = %+v", limitFilter)
+	}
+
+	// Unknown sort column and op are client errors.
+	if _, _, err := s.ListModelsPaged(ctx, ListParams{Sort: "nope"}); !errors.Is(err, ErrBadListParam) {
+		t.Errorf("unknown sort err = %v, want ErrBadListParam", err)
+	}
+	if _, _, err := s.ListModelsPaged(ctx, ListParams{
+		Filter: map[string]FilterSpec{"gatewayId": {Op: "bogus"}},
+	}); !errors.Is(err, ErrBadListParam) {
+		t.Errorf("unknown op err = %v, want ErrBadListParam", err)
+	}
+
+	// Upstreams: sort by modelCount descending.
+	ups, utotal, err := s.ListUpstreamsPaged(ctx, ListParams{Limit: -1, Sort: "modelCount", Dir: "desc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if utotal != 2 || len(ups) != 2 || ups[0].Name != "alpha" || ups[0].ModelCount != 2 {
+		t.Errorf("upstreams = %+v (total %d)", ups, utotal)
+	}
+
+	// Usage: the page holds one group, but the totals cover the whole filtered
+	// set.
+	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", 1)
+	for i := 0; i < 3; i++ {
+		_ = s.RecordUsage(ctx, UsageEvent{KeyID: keyID, UpstreamID: upA, GatewayModel: "m1", UpstreamModel: "m1", PromptTokens: 10, CompletionToken: 5})
+	}
+	_ = s.RecordUsage(ctx, UsageEvent{KeyID: keyID, UpstreamID: upA, GatewayModel: "m2", UpstreamModel: "m2", PromptTokens: 7, CompletionToken: 3})
+
+	sumRows, sumTotal, totals, err := s.UsageSummaryPaged(ctx, UsageFilter{}, ListParams{Limit: 1, Sort: "requests", Dir: "desc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sumTotal != 2 || len(sumRows) != 1 {
+		t.Fatalf("usage page = %d/%d, want 1/2", len(sumRows), sumTotal)
+	}
+	if sumRows[0].GatewayModel != "m1" {
+		t.Errorf("usage top = %q, want m1", sumRows[0].GatewayModel)
+	}
+	if totals.Requests != 4 || totals.PromptTokens != 37 {
+		t.Errorf("usage totals = %+v, want requests 4 prompt 37", totals)
+	}
+
+	// Keys and profiles page as well.
+	keys, ktotal, err := s.ListVirtualKeysPaged(ctx, ListParams{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ktotal != 1 || len(keys) != 1 {
+		t.Errorf("keys page = %d/%d, want 1/1", len(keys), ktotal)
+	}
+	profs, ptotal, err := s.ListProfilesPaged(ctx, ListParams{Limit: 1, Sort: "name", Dir: "asc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ptotal != 1 || len(profs) != 1 || profs[0].Name != DefaultProfileName {
+		t.Errorf("profiles page = %+v (total %d)", profs, ptotal)
 	}
 }
 

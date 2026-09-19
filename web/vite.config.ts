@@ -82,6 +82,141 @@ function mockApi(): Plugin {
       });
     });
 
+  // ---- list params (mirrors the Go admin list endpoints) ----
+
+  interface MockFilterSpec {
+    op: string;
+    values: string[];
+  }
+  interface MockList {
+    /** undefined = endpoint default; 0 = all rows. */
+    limit: number | undefined;
+    offset: number;
+    sort: string;
+    dir: number | undefined;
+    filters: Record<string, MockFilterSpec>;
+  }
+
+  const parseList = (params: URLSearchParams): MockList => {
+    const raw = params.get('filter');
+    let filters: Record<string, MockFilterSpec> = {};
+    if (raw) {
+      try {
+        filters = JSON.parse(raw) as Record<string, MockFilterSpec>;
+      } catch {
+        filters = {};
+      }
+    }
+    const limitRaw = params.get('limit');
+    const dirRaw = params.get('dir');
+    return {
+      limit: limitRaw === null ? undefined : Number(limitRaw),
+      offset: Number(params.get('offset') ?? 0),
+      sort: params.get('sort') ?? '',
+      dir: dirRaw === 'asc' ? 1 : dirRaw === 'desc' ? -1 : undefined,
+      filters,
+    };
+  };
+
+  // applyList applies the filter/sort/pagination of a MockList to rows. It
+  // mirrors the Go list endpoints: an unknown sort/filter column is an error
+  // (the real API answers 400), and an undefined limit falls back to the
+  // endpoint default.
+  const applyList = <T,>(
+    rows: T[],
+    p: MockList,
+    sortAccessors: Record<string, (r: T) => unknown>,
+    filterAccessors: Record<string, (r: T) => unknown>,
+    defaultLimit: number,
+    defaultCompare?: (a: T, b: T) => number,
+  ): { rows: T[]; total: number; error?: string } => {
+    let out = rows;
+    for (const [col, spec] of Object.entries(p.filters)) {
+      const acc = filterAccessors[col];
+      if (!acc) {
+        return { rows: [], total: 0, error: `unknown filter column "${col}"` };
+      }
+      out = out.filter((r) => {
+        const raw = acc(r);
+        const s = raw === null || raw === undefined ? '' : String(raw);
+        const lv = s.toLowerCase();
+        const vals = spec.values;
+        switch (spec.op) {
+          case 'in':
+            if (vals.includes('') && s === '') return true;
+            return vals.includes(s);
+          case 'notContains':
+            return !vals.some((v) => lv.includes(v.toLowerCase()));
+          case 'equals':
+            return vals.some((v) => lv === v.toLowerCase());
+          case 'notEquals':
+            return !vals.some((v) => lv === v.toLowerCase());
+          case 'startsWith':
+            return vals.some((v) => lv.startsWith(v.toLowerCase()));
+          case 'endsWith':
+            return vals.some((v) => lv.endsWith(v.toLowerCase()));
+          case 'blank':
+            return s === '';
+          case 'notBlank':
+            return s !== '';
+          default:
+            return vals.some((v) => lv.includes(v.toLowerCase()));
+        }
+      });
+    }
+    if (p.sort && !sortAccessors[p.sort]) {
+      return { rows: [], total: 0, error: `unknown sort column "${p.sort}"` };
+    }
+    if (p.sort && sortAccessors[p.sort]) {
+      const acc = sortAccessors[p.sort]!;
+      const dir = p.dir ?? 1;
+      out = out.slice().sort((a, b) => {
+        const av = acc(a);
+        const bv = acc(b);
+        if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
+        return String(av).localeCompare(String(bv), undefined, { numeric: true }) * dir;
+      });
+    } else if (defaultCompare) {
+      out = out.slice().sort(defaultCompare);
+    }
+    const total = out.length;
+    const limit = p.limit === undefined ? defaultLimit : p.limit;
+    const end = limit > 0 ? p.offset + limit : undefined;
+    return { rows: out.slice(p.offset, end), total };
+  };
+
+  const modelStatus = (m: Model): string =>
+    m.disabled ? 'disabled' : m.providerDisabled ? 'provider disabled' : !m.providerReachable ? 'unreachable' : 'active';
+  const providerStatus = (p: Provider): string =>
+    p.disabled ? 'disabled' : p.reachable ? 'active' : 'unreachable';
+  const keyStatus = (k: VirtualKey): string =>
+    k.revoked ? 'revoked' : k.paused ? 'paused' : 'active';
+
+  // Metadata-derived model columns, mirroring the model_search view's
+  // json_extract coalesce chains.
+  const metaLookup = (m: Model, path: string): unknown => {
+    let cur: unknown = m.metadata;
+    for (const part of path.split('.')) {
+      if (cur === null || typeof cur !== 'object') return undefined;
+      cur = (cur as Record<string, unknown>)[part];
+    }
+    return cur;
+  };
+  const metaLimit = (m: Model, paths: string[]): number | string => {
+    for (const path of paths) {
+      const v = metaLookup(m, path);
+      if (typeof v === 'number') return v;
+      if (typeof v === 'string' && v.trim() !== '') return v;
+    }
+    return '';
+  };
+  const INPUT_LIMITS = ['max_input_tokens', 'context_window', 'max_model_len', 'context_length', 'max_context_length'];
+  const OUTPUT_LIMITS = ['max_output_tokens', 'max_completion_tokens', 'max_tokens', 'top_provider.max_completion_tokens'];
+  const inputPrice = (m: Model): number | string => {
+    const v = metaLookup(m, 'pricing.input');
+    return typeof v === 'number' ? v : '';
+  };
+
   const providers: Provider[] = [
     {
       name: 'hyper', baseURL: 'http://zeph:9931/v1', modelCount: 3,
@@ -157,7 +292,21 @@ function mockApi(): Plugin {
         };
 
         if (method === 'GET' && path === '/providers') {
-          return json(res, 200, providers);
+          const p = parseList(params);
+          const r = applyList(
+            providers,
+            p,
+            {
+              name: (x) => x.name,
+              baseURL: (x) => x.baseURL,
+              modelCount: (x) => x.modelCount,
+              status: providerStatus,
+            },
+            { name: (x) => x.name, baseURL: (x) => x.baseURL, status: providerStatus },
+            50,
+          );
+          if (r.error) return json(res, 400, { error: r.error });
+          return json(res, 200, { providers: r.rows, total: r.total });
         }
         if (method === 'POST' && path === '/providers') {
           const body = (await readBody(req)) as CreateProviderBody;
@@ -196,7 +345,35 @@ function mockApi(): Plugin {
           return json(res, 204, null);
         }
         if (method === 'GET' && path === '/models') {
-          return json(res, 200, models);
+          const p = parseList(params);
+          const r = applyList(
+            models,
+            p,
+            {
+              gatewayId: (m) => m.gatewayId,
+              upstream: (m) => m.upstream,
+              displayName: (m) => m.displayName,
+              alias: (m) => m.alias,
+              status: modelStatus,
+              inputLimit: (m) => metaLimit(m, INPUT_LIMITS),
+              outputLimit: (m) => metaLimit(m, OUTPUT_LIMITS),
+              cost: (m) => inputPrice(m),
+            },
+            {
+              gatewayId: (m) => m.gatewayId,
+              upstream: (m) => m.upstream,
+              displayName: (m) => m.displayName,
+              alias: (m) => m.alias,
+              status: modelStatus,
+              inputLimit: (m) => metaLimit(m, INPUT_LIMITS),
+              outputLimit: (m) => metaLimit(m, OUTPUT_LIMITS),
+              cost: (m) => inputPrice(m),
+            },
+            50,
+            (a, b) => a.gatewayId.localeCompare(b.gatewayId),
+          );
+          if (r.error) return json(res, 400, { error: r.error });
+          return json(res, 200, { models: r.rows, total: r.total });
         }
         if (method === 'POST' && path === '/models/refresh') {
           return json(res, 200, { providers: providers.length, models: models.length, warnings: [] });
@@ -256,24 +433,75 @@ function mockApi(): Plugin {
             },
           ];
           const kept = applyFilter(rows);
+          const p = parseList(params);
+          const sortAcc = {
+            model: (x: UsageRow) => x.gatewayModel,
+            requests: (x: UsageRow) => x.requests,
+            prompt: (x: UsageRow) => x.promptTokens,
+            cached: (x: UsageRow) => x.cachedTokens,
+            completion: (x: UsageRow) => x.completionTokens,
+            cost: (x: UsageRow) => x.costUSD,
+          };
+          // Totals are over the whole filtered set, not just the page.
+          const all = applyList(
+            kept,
+            { ...p, limit: 0, offset: 0 },
+            sortAcc,
+            { model: (x) => x.gatewayModel },
+            50,
+            (a, b) => a.gatewayModel.localeCompare(b.gatewayModel),
+          );
+          if (all.error) return json(res, 400, { error: all.error });
+          const filtered = all.rows;
+          const limit = p.limit === undefined ? 50 : p.limit;
+          const start = p.offset;
+          const end = limit > 0 ? start + limit : undefined;
           return json(res, 200, {
-            rows: kept,
-            totalReqs: kept.reduce((n, r) => n + r.requests, 0),
-            totalCost: kept.reduce((n, r) => n + r.costUSD, 0).toFixed(4) + ' USD',
+            rows: filtered.slice(start, end),
+            total: filtered.length,
+            totalReqs: filtered.reduce((n, r) => n + r.requests, 0),
+            totalCost: filtered.reduce((n, r) => n + r.costUSD, 0).toFixed(4) + ' USD',
+            totals: {
+              requests: filtered.reduce((n, r) => n + r.requests, 0),
+              promptTokens: filtered.reduce((n, r) => n + r.promptTokens, 0),
+              cachedTokens: filtered.reduce((n, r) => n + r.cachedTokens, 0),
+              completionTokens: filtered.reduce((n, r) => n + r.completionTokens, 0),
+              costUSD: filtered.reduce((n, r) => n + r.costUSD, 0),
+            },
           });
         }
         if (method === 'GET' && path === '/keys') {
-          return json(res, 200, { keys });
+          const p = parseList(params);
+          const r = applyList(
+            keys,
+            p,
+            { name: (k) => k.name, profile: (k) => k.profile, status: keyStatus },
+            { name: (k) => k.name, profile: (k) => k.profile, status: keyStatus },
+            50,
+          );
+          if (r.error) return json(res, 400, { error: r.error });
+          return json(res, 200, { keys: r.rows, total: r.total });
         }
         if (method === 'GET' && path === '/profiles') {
-          return json(res, 200, {
-            profiles: profiles.map((p) => ({
-              ...p,
-              // Live counts: key references plus inheritance children.
-              keyCount: keys.filter((k) => k.profile === p.name).length,
-              childCount: profiles.filter((x) => x.parents.includes(p.name)).length,
-            })),
-          });
+          const p = parseList(params);
+          const withCounts = profiles.map((x) => ({
+            ...x,
+            // Live counts: key references plus inheritance children.
+            keyCount: keys.filter((k) => k.profile === x.name).length,
+            childCount: profiles.filter((y) => y.parents.includes(x.name)).length,
+          }));
+          const r = applyList(
+            withCounts,
+            p,
+            { name: (x) => x.name, keys: (x) => x.keyCount },
+            { name: (x) => x.name },
+            50,
+            (a, b) =>
+              Number(b.isDefault) - Number(a.isDefault) ||
+              a.name.localeCompare(b.name),
+          );
+          if (r.error) return json(res, 400, { error: r.error });
+          return json(res, 200, { profiles: r.rows, total: r.total });
         }
         if (method === 'POST' && path === '/profiles') {
           const body = (await readBody(req)) as ProfileBody;
@@ -400,12 +628,36 @@ function mockApi(): Plugin {
             },
           ].sort((a, b) => b.id - a.id);
           const kept = applyFilter(all);
-          const offset = Number(params.get('offset') ?? 0);
-          const limit = Number(params.get('limit') ?? 200);
-          return json(res, 200, {
-            requests: kept.slice(offset, offset + limit),
-            total: kept.length,
-          });
+          const p = parseList(params);
+          const r = applyList(
+            kept,
+            p,
+            {
+              time: (x: RequestRow) => x.createdAt,
+              key: (x: RequestRow) => x.keyName,
+              model: (x: RequestRow) => x.gatewayModel,
+              status: (x: RequestRow) => x.status,
+              prompt: (x: RequestRow) => x.promptTokens,
+              cached: (x: RequestRow) => x.cachedTokens,
+              completion: (x: RequestRow) => x.completionTokens,
+              cost: (x: RequestRow) => x.costUSD ?? -1,
+              duration: (x: RequestRow) => x.durationMs ?? -1,
+              id: (x: RequestRow) => x.id,
+            },
+            {
+              key: (x: RequestRow) => x.keyName,
+              model: (x: RequestRow) => x.gatewayModel,
+              status: (x: RequestRow) => x.status,
+              prompt: (x: RequestRow) => x.promptTokens,
+              cached: (x: RequestRow) => x.cachedTokens,
+              completion: (x: RequestRow) => x.completionTokens,
+              cost: (x: RequestRow) => x.costUSD,
+            },
+            200,
+            (a, b) => b.id - a.id,
+          );
+          if (r.error) return json(res, 400, { error: r.error });
+          return json(res, 200, { requests: r.rows, total: r.total });
         }
         if (method === 'GET' && seg[0] === 'requests' && seg[1]) {
           const id = Number(seg[1]);

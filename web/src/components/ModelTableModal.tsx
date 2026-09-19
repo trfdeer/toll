@@ -1,6 +1,7 @@
-import { Checkbox, Modal } from "@carbon/react";
+import { Modal } from "@carbon/react";
+import type { TableColumn } from "react-data-table-component";
 import { useState } from "react";
-import StructuredTable from "./StructuredTable";
+import Table from "./Table";
 import type { Model } from "../lib/types";
 
 export interface ModelTableModalProps {
@@ -17,8 +18,9 @@ export interface ModelTableModalProps {
 
 // ModelTableModal shows a model list in a paginated, searchable table. It is
 // used read-only to preview a profile's allowed models, and with selection to
-// pick the models a profile's model filter names. Selection lives in local
-// state keyed by gateway ID, so it survives paging and search changes.
+// pick the models a profile's model filter names. Selection is the table's
+// built-in row selection (keyed by gateway ID), so it survives paging and
+// filtering.
 export default function ModelTableModal({
   title,
   models,
@@ -31,36 +33,30 @@ export default function ModelTableModal({
     () => new Set(initialSelected),
   );
 
-  const toggle = (gatewayID: string, checked: boolean) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (checked) next.add(gatewayID);
-      else next.delete(gatewayID);
-      return next;
-    });
-  };
-
-  const headers = selectable
-    ? ["", "Display name", "Model ID", "Provider"]
-    : ["Display name", "Model ID", "Provider"];
-
-  const rows = models.map((m) =>
-    selectable
-      ? [
-          <Checkbox
-            key={m.gatewayId}
-            id={`model-pick-${m.id}`}
-            labelText={`Select ${m.gatewayId}`}
-            hideLabel
-            checked={selected.has(m.gatewayId)}
-            onChange={(_e, { checked }) => toggle(m.gatewayId, checked)}
-          />,
-          m.displayName,
-          m.gatewayId,
-          m.upstream,
-        ]
-      : [m.displayName, m.gatewayId, m.upstream],
-  );
+  const columns: TableColumn<Model>[] = [
+    {
+      id: "displayName",
+      name: "Display name",
+      selector: (m) => m.displayName,
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "gatewayId",
+      name: "Model ID",
+      selector: (m) => m.gatewayId,
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "upstream",
+      name: "Provider",
+      selector: (m) => m.upstream,
+      sortable: true,
+      filterable: true,
+      filterType: "set",
+    },
+  ];
 
   return (
     <Modal
@@ -76,13 +72,24 @@ export default function ModelTableModal({
       onRequestClose={onClose}
       onSecondarySubmit={onClose}
     >
-      <StructuredTable
-        headers={headers}
-        rows={rows}
-        pageSize={10}
-        pageSizes={[10, 20, 50]}
-        nonSortable={selectable ? [0] : undefined}
-        empty="No models match."
+      <Table
+        keyField="gatewayId"
+        columns={columns}
+        data={models}
+        noDataComponent="No models match."
+        selectableRows={selectable}
+        selectableRowsHighlight={selectable}
+        selectedRows={
+          selectable
+            ? models.filter((m) => selected.has(m.gatewayId))
+            : undefined
+        }
+        onSelectedRowsChange={
+          selectable
+            ? ({ selectedRows }) =>
+                setSelected(new Set(selectedRows.map((m) => m.gatewayId)))
+            : undefined
+        }
       />
     </Modal>
   );

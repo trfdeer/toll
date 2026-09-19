@@ -252,17 +252,57 @@ type RequestRow struct {
 }
 
 // RequestFilter narrows a request query. It reuses UsageFilter's timestamp
-// and key constraints, plus windowing.
+// and key constraints, plus windowing, sorting and per-column filters.
 type RequestFilter struct {
 	UsageFilter
 	Limit  int
 	Offset int
+	Sort   string
+	Dir    string
+	Filter map[string]FilterSpec
 }
 
-// Requests returns requests matching f, newest first, along with the total
-// number of matches before windowing.
+// requestKeyExpr matches the label the admin UI shows for requests of deleted
+// keys, so the per-column key filter and sort agree with what is displayed.
+const requestKeyExpr = "COALESCE(vk.name, '(deleted key)')"
+
+// requestFilterCols and requestSortCols map the admin column ids to SQL
+// expressions for the requests table.
+var (
+	requestFilterCols = map[string]string{
+		"key":        requestKeyExpr,
+		"model":      "t.gateway_model",
+		"status":     "COALESCE(t.status, 0)",
+		"prompt":     "COALESCE(t.prompt_tokens, 0)",
+		"cached":     "COALESCE(t.cached_tokens, 0)",
+		"completion": "COALESCE(t.completion_tokens, 0)",
+		"cost":       "t.cost_usd",
+	}
+	requestSortCols = map[string]string{
+		"id":         "t.id",
+		"time":       "t.created_at",
+		"key":        requestKeyExpr,
+		"model":      "t.gateway_model",
+		"status":     "COALESCE(t.status, 0)",
+		"prompt":     "COALESCE(t.prompt_tokens, 0)",
+		"cached":     "COALESCE(t.cached_tokens, 0)",
+		"completion": "COALESCE(t.completion_tokens, 0)",
+		"cost":       "t.cost_usd",
+		"duration":   "CAST((julianday(t.completed_at) - julianday(t.created_at)) * 86400000 AS INTEGER)",
+	}
+)
+
+// Requests returns requests matching f along with the total number of matches
+// before windowing. It sorts by the requested column (newest first by default)
+// and applies the per-column filters.
 func (s *Store) Requests(ctx context.Context, f RequestFilter) ([]RequestRow, int, error) {
 	conds, args := f.where("t.created_at", "vk.name")
+	fconds, fargs, err := buildFilters(f.Filter, requestFilterCols)
+	if err != nil {
+		return nil, 0, err
+	}
+	conds = append(conds, fconds...)
+	args = append(args, fargs...)
 	where := ""
 	if len(conds) > 0 {
 		where = "WHERE " + strings.Join(conds, " AND ")
@@ -278,11 +318,11 @@ func (s *Store) Requests(ctx context.Context, f RequestFilter) ([]RequestRow, in
 		return nil, 0, err
 	}
 
-	limit := f.Limit
-	if limit <= 0 {
-		limit = 200
+	order, err := buildOrder(ListParams{Sort: f.Sort, Dir: f.Dir}, requestSortCols, "id", "desc", "t.id")
+	if err != nil {
+		return nil, 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	query := `
 		SELECT t.id, t.conversation_id, COALESCE(vk.name, '(deleted key)'),
 		       t.gateway_model, COALESCE(t.status, 0),
 		       COALESCE(t.prompt_tokens,0), COALESCE(t.completion_tokens,0), COALESCE(t.cached_tokens,0),
@@ -291,8 +331,20 @@ func (s *Store) Requests(ctx context.Context, f RequestFilter) ([]RequestRow, in
 		FROM transcripts t
 		JOIN conversations c ON c.id = t.conversation_id
 		LEFT JOIN virtual_keys vk ON vk.id = c.key_id
-		`+where+`
-		ORDER BY t.id DESC LIMIT ? OFFSET ?`, append(args, limit, f.Offset)...)
+		` + where + order
+
+	limit := f.Limit
+	if limit == 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, limit, f.Offset)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, err
 	}

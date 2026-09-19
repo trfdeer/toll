@@ -3,10 +3,11 @@ import type {
   CreateProviderRequest,
   CreateProviderResponse,
   KeysResponse,
-  Model,
+  ListQuery,
+  ModelsResponse,
   ProfileRequest,
   ProfilesResponse,
-  Provider,
+  ProvidersResponse,
   QueryParams,
   RequestDetail,
   RequestQuery,
@@ -14,7 +15,7 @@ import type {
   RefreshModelsResponse,
   Settings,
   UpdateKeyRequest,
-  UsageQuery,
+  UsageListQuery,
   UsageSummary,
 } from "./types";
 
@@ -71,16 +72,33 @@ function qs(params: QueryParams | undefined): string {
   return s ? `?${s}` : "";
 }
 
-export const getUsage = (params: UsageQuery): Promise<UsageSummary> =>
-  request(`/usage${qs(params)}`);
+// listParams flattens a ListQuery into query params, encoding the column
+// filters as the API's single JSON `filter` parameter.
+function listParams(q: ListQuery | undefined): QueryParams {
+  if (!q) return {};
+  const { filters, ...rest } = q;
+  return {
+    ...rest,
+    filter:
+      filters && Object.keys(filters).length > 0
+        ? JSON.stringify(filters)
+        : undefined,
+  };
+}
+
+export const getUsage = (params: UsageListQuery): Promise<UsageSummary> =>
+  request(`/usage${qs(listParams(params))}`);
 
 export const getRequests = (params: RequestQuery): Promise<RequestsResponse> =>
-  request(`/requests${qs(params)}`);
+  request(`/requests${qs(listParams(params))}`);
 
 export const getRequest = (id: number): Promise<RequestDetail> =>
   request(`/requests/${encodeURIComponent(id)}`);
 
-export const getProviders = (): Promise<Provider[]> => request("/providers");
+export const getProviders = (
+  params?: ListQuery,
+): Promise<ProvidersResponse> =>
+  request(`/providers${qs(listParams(params))}`);
 
 export const addProvider = (
   provider: CreateProviderRequest,
@@ -100,7 +118,8 @@ export const disableProvider = (name: string): Promise<void> =>
 export const enableProvider = (name: string): Promise<void> =>
   request(`/providers/${encodeURIComponent(name)}/enable`, { method: "POST" });
 
-export const getModels = (): Promise<Model[]> => request("/models");
+export const getModels = (params?: ListQuery): Promise<ModelsResponse> =>
+  request(`/models${qs(listParams(params))}`);
 
 // refreshModels forces every provider's catalog to be re-pulled server-side.
 export const refreshModels = (): Promise<RefreshModelsResponse> =>
@@ -138,8 +157,8 @@ export const updateSettings = (settings: Settings): Promise<Settings> =>
 
 // ---- profiles ----
 
-export const getProfiles = (): Promise<ProfilesResponse> =>
-  request("/profiles");
+export const getProfiles = (params?: ListQuery): Promise<ProfilesResponse> =>
+  request(`/profiles${qs(listParams(params))}`);
 
 export const createProfile = (profile: ProfileRequest): Promise<void> =>
   request("/profiles", {
@@ -163,7 +182,8 @@ export const deleteProfile = (name: string): Promise<void> =>
 
 // ---- virtual keys ----
 
-export const getKeys = (): Promise<KeysResponse> => request("/keys");
+export const getKeys = (params?: ListQuery): Promise<KeysResponse> =>
+  request(`/keys${qs(listParams(params))}`);
 
 export const createKey = (name: string, profile: string): Promise<CreateKeyResponse> =>
   request("/keys", {

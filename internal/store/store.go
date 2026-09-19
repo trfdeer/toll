@@ -353,6 +353,45 @@ CREATE TABLE profile_parents (
 	CHECK (profile_id <> parent_id)
 );
 `,
+	// 13: a searchable projection of the model registry. It joins the upstream
+	// and alias rows and exposes the metadata-derived limits and pricing as
+	// real columns, so the admin list can sort and filter on them in SQL
+	// instead of resolving them in Go. json_valid guards json_extract against
+	// stray non-JSON metadata (an invalid document would otherwise error).
+	`
+CREATE VIEW model_search AS
+SELECT
+	m.id,
+	m.upstream_id,
+	m.upstream_model_id,
+	m.gateway_id,
+	m.display_name,
+	m.metadata,
+	m.disabled,
+	u.name AS upstream_name,
+	u.position AS upstream_position,
+	u.disabled AS upstream_disabled,
+	u.reachable AS upstream_reachable,
+	COALESCE(ma.alias, '') AS alias,
+	CASE WHEN json_valid(m.metadata) THEN COALESCE(
+		json_extract(m.metadata, '$.max_input_tokens'),
+		json_extract(m.metadata, '$.context_window'),
+		json_extract(m.metadata, '$.max_model_len'),
+		json_extract(m.metadata, '$.context_length'),
+		json_extract(m.metadata, '$.max_context_length')
+	) END AS input_limit,
+	CASE WHEN json_valid(m.metadata) THEN COALESCE(
+		json_extract(m.metadata, '$.max_output_tokens'),
+		json_extract(m.metadata, '$.max_completion_tokens'),
+		json_extract(m.metadata, '$.max_tokens'),
+		json_extract(m.metadata, '$.top_provider.max_completion_tokens')
+	) END AS output_limit,
+	CASE WHEN json_valid(m.metadata) THEN json_extract(m.metadata, '$.pricing.input') END AS input_price
+FROM models m
+JOIN upstreams u ON u.id = m.upstream_id
+LEFT JOIN model_aliases ma
+	ON ma.upstream_id = m.upstream_id AND ma.upstream_model_id = m.upstream_model_id;
+`,
 }
 
 // contentMigrations are applied to the content database (content.db), which

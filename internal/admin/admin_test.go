@@ -43,15 +43,19 @@ func TestProvidersAndUsage(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var ups []struct {
-		Name       string `json:"name"`
-		BaseURL    string `json:"baseURL"`
-		ModelCount int    `json:"modelCount"`
+	var upsBody struct {
+		Providers []struct {
+			Name       string `json:"name"`
+			BaseURL    string `json:"baseURL"`
+			ModelCount int    `json:"modelCount"`
+		} `json:"providers"`
+		Total int `json:"total"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &ups); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), &upsBody); err != nil {
 		t.Fatal(err)
 	}
-	if len(ups) != 1 || ups[0].Name != "hyper" || ups[0].BaseURL != "https://x/v1" || ups[0].ModelCount != 1 {
+	ups := upsBody.Providers
+	if upsBody.Total != 1 || len(ups) != 1 || ups[0].Name != "hyper" || ups[0].BaseURL != "https://x/v1" || ups[0].ModelCount != 1 {
 		t.Errorf("unexpected providers: %s", rec.Body.String())
 	}
 
@@ -60,12 +64,15 @@ func TestProvidersAndUsage(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var models []struct {
-		GatewayID string `json:"gatewayId"`
+	var modelsBody struct {
+		Models []struct {
+			GatewayID string `json:"gatewayId"`
+		} `json:"models"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &models); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), &modelsBody); err != nil {
 		t.Fatal(err)
 	}
+	models := modelsBody.Models
 	if len(models) != 1 || models[0].GatewayID != "hyper/glm" {
 		t.Errorf("unexpected models: %s", rec.Body.String())
 	}
@@ -165,7 +172,7 @@ func TestUsageAndRequestFilters(t *testing.T) {
 	if rec := get("/api/requests?from=not-a-time"); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad from status = %d, want 400", rec.Code)
 	}
-	if rec := get("/api/requests?limit=0"); rec.Code != http.StatusBadRequest {
+	if rec := get("/api/requests?limit=1001"); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad limit status = %d, want 400", rec.Code)
 	}
 }
@@ -809,13 +816,16 @@ func TestModelDisableEnable(t *testing.T) {
 		t.Helper()
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/models", nil))
-		var models []struct {
-			ID       int64 `json:"id"`
-			Disabled bool  `json:"disabled"`
+		var modelsBody struct {
+			Models []struct {
+				ID       int64 `json:"id"`
+				Disabled bool  `json:"disabled"`
+			} `json:"models"`
 		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &models); err != nil {
+		if err := json.Unmarshal(rec.Body.Bytes(), &modelsBody); err != nil {
 			t.Fatal(err)
 		}
+		models := modelsBody.Models
 		if len(models) != 1 {
 			t.Fatalf("models = %d, want 1", len(models))
 		}
@@ -917,15 +927,18 @@ func TestProvidersCreateAndDelete(t *testing.T) {
 	// Models carry their upstream linkage and an id for deletion.
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/models", nil))
-	var models []struct {
-		ID            int64  `json:"id"`
-		Upstream      string `json:"upstream"`
-		GatewayID     string `json:"gatewayId"`
-		UpstreamModel string `json:"upstreamModelId"`
+	var modelsBody struct {
+		Models []struct {
+			ID            int64  `json:"id"`
+			Upstream      string `json:"upstream"`
+			GatewayID     string `json:"gatewayId"`
+			UpstreamModel string `json:"upstreamModelId"`
+		} `json:"models"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &models); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), &modelsBody); err != nil {
 		t.Fatal(err)
 	}
+	models := modelsBody.Models
 	if len(models) != 2 || models[0].Upstream != "hyper" {
 		t.Fatalf("unexpected models: %s", rec.Body.String())
 	}
@@ -951,16 +964,20 @@ func TestProvidersCreateAndDelete(t *testing.T) {
 	}
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/providers", nil))
-	var providers []json.RawMessage
-	json.Unmarshal(rec.Body.Bytes(), &providers)
-	if len(providers) != 0 {
+	var providersBody struct {
+		Providers []json.RawMessage `json:"providers"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &providersBody)
+	if len(providersBody.Providers) != 0 {
 		t.Errorf("providers remain after delete: %s", rec.Body.String())
 	}
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/models", nil))
-	var remaining []json.RawMessage
-	json.Unmarshal(rec.Body.Bytes(), &remaining)
-	if len(remaining) != 0 {
+	var remainingBody struct {
+		Models []json.RawMessage `json:"models"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &remainingBody)
+	if len(remainingBody.Models) != 0 {
 		t.Errorf("models remain after provider delete: %s", rec.Body.String())
 	}
 }
@@ -1040,13 +1057,16 @@ func TestProviderDisableEnable(t *testing.T) {
 	// The providers endpoint surfaces the flag for the UI.
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/providers", nil))
-	var list []struct {
-		Name     string `json:"name"`
-		Disabled bool   `json:"disabled"`
+	var listBody struct {
+		Providers []struct {
+			Name     string `json:"name"`
+			Disabled bool   `json:"disabled"`
+		} `json:"providers"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), &listBody); err != nil {
 		t.Fatal(err)
 	}
+	list := listBody.Providers
 	if len(list) != 1 || !list[0].Disabled {
 		t.Errorf("providers response missing disabled: %s", rec.Body.String())
 	}

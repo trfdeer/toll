@@ -12,11 +12,11 @@ import {
   Stack,
   TextInput,
 } from "@carbon/react";
+import type { TableColumn } from "react-data-table-component";
 import { useCallback, useEffect, useState } from "react";
 import KeyFilters from "../components/KeyFilters";
 import ModelTableModal from "../components/ModelTableModal";
-import PageState from "../components/PageState";
-import StructuredTable from "../components/StructuredTable";
+import Table from "../components/Table";
 import {
   createProfile,
   deleteProfile,
@@ -33,10 +33,18 @@ import {
   summarizeFilter,
 } from "../lib/filters";
 import type { KeyFilter, Model, Profile } from "../lib/types";
+import {
+  serverTableProps,
+  useServerRows,
+  type ServerTableQuery,
+} from "../lib/useServerRows";
 
 // ProfileKind distinguishes a leaf (own filters) from a derived profile
 // (union of parents). The two are mutually exclusive, matching the server.
 type ProfileKind = "leaf" | "derived";
+
+// ProfileRow adds the stable table key; profiles are addressed by name.
+type ProfileRow = Profile & { id: string };
 
 // filtersValid rejects an include/exclude filter with no values, matching the
 // server-side validation.
@@ -45,7 +53,9 @@ function filtersValid(f: KeyFilter): boolean {
 }
 
 export default function Profiles() {
-  const [profiles, setProfiles] = useState<Profile[] | null>(null);
+  // allProfiles/models back the allowed-model computations and the picker;
+  // the table itself is server-paginated.
+  const [allProfiles, setAllProfiles] = useState<Profile[]>([]);
   const [models, setModels] = useState<Model[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
@@ -65,16 +75,36 @@ export default function Profiles() {
   // pickingModels opens the model picker modal for the profile being edited.
   const [pickingModels, setPickingModels] = useState(false);
 
-  const reload = useCallback(() => {
-    getProfiles()
-      .then((res) => setProfiles(res.profiles))
+  const loadAll = useCallback(() => {
+    getProfiles({ limit: 0 })
+      .then((res) => setAllProfiles(res.profiles))
       .catch((e: unknown) => setError(errorMessage(e)));
-    getModels()
-      .then(setModels)
+    getModels({ limit: 0 })
+      .then((res) => setModels(res.models))
       .catch((e: unknown) => setError(errorMessage(e)));
   }, []);
 
-  useEffect(reload, [reload]);
+  useEffect(loadAll, [loadAll]);
+
+  const fetchProfiles = useCallback(
+    (q: ServerTableQuery) =>
+      getProfiles(q).then((r) => ({
+        rows: r.profiles.map((p) => ({ ...p, id: p.name })),
+        total: r.total,
+      })),
+    [],
+  );
+  const table = useServerRows<ProfileRow>(fetchProfiles, {
+    onError: (e) => setError(errorMessage(e)),
+  });
+
+  // reload refreshes the table page and the full lists the allowed-model
+  // computations and picker rely on.
+  const reloadTable = table.reload;
+  const reload = useCallback(() => {
+    reloadTable();
+    loadAll();
+  }, [reloadTable, loadAll]);
 
   const resetForm = () => {
     setName("");
@@ -168,10 +198,7 @@ export default function Profiles() {
     }
   };
 
-  if (error && profiles === null) return <PageState error={error} />;
-  if (!profiles) return <PageState />;
-
-  const byName = new Map(profiles.map((p) => [p.name, p]));
+  const byName = new Map(allProfiles.map((p) => [p.name, p]));
 
   // Providers are the discovery sources, matching how the server gates keys.
   const providers = Array.from(
@@ -187,9 +214,9 @@ export default function Profiles() {
   // Parent candidates exclude the profile being edited and its descendants, so
   // the picker cannot build a cycle.
   const excluded = editing
-    ? new Set([editing.name, ...descendantsOf(editing.name, profiles)])
+    ? new Set([editing.name, ...descendantsOf(editing.name, allProfiles)])
     : new Set<string>();
-  const parentCandidates = profiles
+  const parentCandidates = allProfiles
     .map((p) => p.name)
     .filter((n) => !excluded.has(n));
 
@@ -203,6 +230,93 @@ export default function Profiles() {
     (kind === "derived"
       ? parents.length > 0
       : filtersValid(provider) && filtersValid(model));
+
+  const columns: TableColumn<ProfileRow>[] = [
+    {
+      id: "name",
+      name: "Name",
+      selector: (p) => p.name,
+      format: (p) => (p.isDefault ? `${p.name} (default)` : p.name),
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "providers",
+      name: "Providers",
+      selector: (p) =>
+        p.parents.length > 0
+          ? "—"
+          : summarizeFilter(p.providerFilter, "provider", "providers"),
+    },
+    {
+      id: "models",
+      name: "Models",
+      selector: (p) =>
+        p.parents.length > 0
+          ? "—"
+          : summarizeFilter(p.modelFilter, "model", "models"),
+    },
+    {
+      id: "basedOn",
+      name: "Based on",
+      selector: (p) => (p.parents.length > 0 ? p.parents.join(", ") : "—"),
+    },
+    {
+      id: "allowed",
+      name: "Allowed models",
+      selector: (p) => profileAllowedModels(p, byName, models).length,
+      right: true,
+    },
+    {
+      id: "keys",
+      name: "Keys",
+      selector: (p) => p.keyCount,
+      sortable: true,
+      right: true,
+    },
+    {
+      id: "actions",
+      name: "",
+      right: true,
+      width: "170px",
+      cell: (p) => (
+        <div className="row-actions">
+          <IconButton
+            kind="ghost"
+            size="sm"
+            label={`Preview allowed models for ${p.name}`}
+            onClick={() => setPreviewing(p)}
+          >
+            <View />
+          </IconButton>
+          <IconButton
+            kind="ghost"
+            size="sm"
+            label={`Edit ${p.name}`}
+            disabled={p.isDefault}
+            onClick={() => openEdit(p)}
+          >
+            <Edit />
+          </IconButton>
+          <IconButton
+            kind="ghost"
+            size="sm"
+            label={
+              p.keyCount > 0
+                ? `Cannot delete ${p.name}: in use by ${p.keyCount} key(s)`
+                : p.childCount > 0
+                  ? `Cannot delete ${p.name}: inherited by ${p.childCount} profile(s)`
+                  : `Delete ${p.name}`
+            }
+            disabled={p.isDefault || p.keyCount > 0 || p.childCount > 0}
+            onClick={() => setDeleting(p)}
+          >
+            <TrashCan />
+          </IconButton>
+        </div>
+      ),
+    },
+  ];
 
   return (
     <Grid>
@@ -218,73 +332,20 @@ export default function Profiles() {
             />
           )}
 
-          <StructuredTable
-            headers={[
-              "Name",
-              "Providers",
-              "Models",
-              "Based on",
-              "Allowed models",
-              "Keys",
-              "",
-            ]}
-            searchable={false}
-            className="profiles-table"
-            actions={
+          <div className="table-block">
+            <div className="table-toolbar">
               <Button renderIcon={Add} onClick={openCreate}>
                 Create profile
               </Button>
-            }
-            empty="No profiles yet."
-            rows={profiles.map((p) => {
-              const derived = p.parents.length > 0;
-              const allowed = profileAllowedModels(p, byName, models).length;
-              return [
-                p.isDefault ? `${p.name} (default)` : p.name,
-                derived ? "—" : summarizeFilter(p.providerFilter, "provider", "providers"),
-                derived ? "—" : summarizeFilter(p.modelFilter, "model", "models"),
-                derived ? p.parents.join(", ") : "—",
-                allowed,
-                p.keyCount,
-                <>
-                  <IconButton
-                    kind="ghost"
-                    size="sm"
-                    label={`Preview allowed models for ${p.name}`}
-                    onClick={() => setPreviewing(p)}
-                  >
-                    <View />
-                  </IconButton>
-                  <IconButton
-                    kind="ghost"
-                    size="sm"
-                    label={`Edit ${p.name}`}
-                    disabled={p.isDefault}
-                    onClick={() => openEdit(p)}
-                  >
-                    <Edit />
-                  </IconButton>
-                  <IconButton
-                    kind="ghost"
-                    size="sm"
-                    label={
-                      p.keyCount > 0
-                        ? `Cannot delete ${p.name}: in use by ${p.keyCount} key(s)`
-                        : p.childCount > 0
-                          ? `Cannot delete ${p.name}: inherited by ${p.childCount} profile(s)`
-                          : `Delete ${p.name}`
-                    }
-                    disabled={
-                      p.isDefault || p.keyCount > 0 || p.childCount > 0
-                    }
-                    onClick={() => setDeleting(p)}
-                  >
-                    <TrashCan />
-                  </IconButton>
-                </>,
-              ];
-            })}
-          />
+            </div>
+            <Table
+              columns={columns}
+              data={table.rows}
+              noDataComponent="No profiles yet."
+              persistTableHead
+              {...serverTableProps(table)}
+            />
+          </div>
         </Stack>
       </Column>
 

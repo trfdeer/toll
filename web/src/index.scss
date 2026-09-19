@@ -66,42 +66,32 @@
   max-width: none;
 }
 
-// Row actions in the virtual keys table sit side by side with separators.
+// Row actions hug the right edge of their action column. Keys keep a divider
+// between the buttons.
+.row-actions,
 .key-actions {
   display: flex;
   align-items: center;
-
-  > * + * {
-    border-left: 1px solid var(--cds-border-subtle-01);
-  }
+  justify-content: flex-end;
+  white-space: nowrap;
 }
 
-// The actions column hugs its icon buttons and aligns to the right.
-.keys-table,
-.providers-table,
-.models-table {
-  td:last-child,
-  th:last-child {
-    width: 1%;
-    white-space: nowrap;
-    text-align: right;
-  }
-
-  .key-actions {
-    justify-content: flex-end;
-  }
+.key-actions > * + * {
+  border-left: 1px solid var(--cds-border-subtle-01);
 }
 
-// The new-key modal now holds only a name and a profile picker, so it sizes
-// to its content rather than the viewport.
-// The summary table's total row stands apart from the data rows.
-.structured-table__total {
-  font-weight: 600;
-  background: var(--cds-layer-accent-01);
+// A table and the page action that belongs to it. The action sits in its own
+// toolbar above the table rather than in the table's header bar, so the header
+// only spans the columns.
+.table-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
 
-  td {
-    border-top: 1px solid var(--cds-border-strong-01);
-  }
+.table-toolbar {
+  display: flex;
+  justify-content: flex-end;
 }
 
 // Settings modal sections: a hint, an optional error and the actions.
@@ -119,15 +109,6 @@
 
 .settings-section__error {
   color: var(--cds-text-error);
-}
-
-// Rows that open a detail panel get a pointer and a hover cue.
-.structured-table__row--clickable {
-  cursor: pointer;
-
-  &:hover td {
-    background: var(--cds-layer-hover-01);
-  }
 }
 
 // Right-hand request drawer: fixed below the header, above the content.

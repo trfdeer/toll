@@ -131,10 +131,13 @@ func TestModelAliasEndpoint(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET /api/models = %d: %s", rec.Code, rec.Body.String())
 		}
-		var ms []model
-		if err := json.Unmarshal(rec.Body.Bytes(), &ms); err != nil {
+		var body struct {
+			Models []model `json:"models"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
+		ms := body.Models
 		out := make(map[string]model, len(ms))
 		for _, m := range ms {
 			out[m.UpstreamModelID] = m

@@ -23,6 +23,7 @@ export interface VirtualKey {
 
 export interface KeysResponse {
   keys: VirtualKey[];
+  total: number;
 }
 
 export interface CreateKeyResponse {
@@ -58,6 +59,7 @@ export interface Profile {
 
 export interface ProfilesResponse {
   profiles: Profile[];
+  total: number;
 }
 
 export interface ProfileRequest {
@@ -95,6 +97,11 @@ export interface CreateProviderResponse {
   modelCount: number;
   /** Set when the provider was stored but its model catalog could not be fetched. */
   warning?: string;
+}
+
+export interface ProvidersResponse {
+  providers: Provider[];
+  total: number;
 }
 
 // ---- models ----
@@ -149,6 +156,11 @@ export interface RefreshModelsResponse {
   warnings: string[];
 }
 
+export interface ModelsResponse {
+  models: Model[];
+  total: number;
+}
+
 // ---- settings ----
 
 /** Admin-editable runtime settings. */
@@ -168,10 +180,22 @@ export interface UsageRow {
   costUSD: number;
 }
 
+export interface UsageTotals {
+  requests: number;
+  promptTokens: number;
+  cachedTokens: number;
+  completionTokens: number;
+  costUSD: number;
+}
+
 export interface UsageSummary {
   rows: UsageRow[];
+  /** Number of grouped rows matching the filter (for pagination). */
+  total: number;
   totalReqs: number;
   totalCost: string;
+  /** Aggregate over the whole filtered set, not just the current page. */
+  totals: UsageTotals;
 }
 
 export interface RequestRow {
@@ -250,9 +274,45 @@ export type UsageQuery = {
   key?: readonly string[] | null;
 };
 
-export type RequestQuery = UsageQuery & {
+export type RequestQuery = UsageQuery & ListQuery;
+
+/** /usage accepts the usage constraints plus list params. */
+export type UsageListQuery = UsageQuery & ListQuery;
+
+// ---- list parameters ----
+
+// FilterOp is how a server-side column filter matches values. The text ops
+// mirror the library's filter operators; "in" is a set membership.
+export type FilterOp =
+  | "in"
+  | "contains"
+  | "notContains"
+  | "equals"
+  | "notEquals"
+  | "startsWith"
+  | "endsWith"
+  | "blank"
+  | "notBlank";
+
+// FilterSpec is one column's filter sent to the API. Values holds the selected
+// set for "in" (an empty string matches blanks) or the terms for "contains".
+export interface FilterSpec {
+  op: FilterOp;
+  values: string[];
+}
+
+// ColumnFilters maps a column id to its filter.
+export type ColumnFilters = Record<string, FilterSpec>;
+
+// ListQuery is the pagination, sorting and filtering shared by every admin
+// list endpoint. `filters` is encoded to the API's JSON `filter` parameter.
+export type ListQuery = {
+  /** Page size; 0 means every row. Omit for the endpoint default. */
   limit?: number;
   offset?: number;
+  sort?: string;
+  dir?: "asc" | "desc";
+  filters?: ColumnFilters;
 };
 
 // ---- errors ----

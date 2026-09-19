@@ -9,10 +9,10 @@ import {
   Stack,
   TextInput,
 } from "@carbon/react";
-import { useCallback, useEffect, useState } from "react";
-import PageState from "../components/PageState";
+import type { TableColumn } from "react-data-table-component";
+import { useCallback, useState } from "react";
 import StatusTag, { type Status } from "../components/StatusTag";
-import StructuredTable from "../components/StructuredTable";
+import Table from "../components/Table";
 import {
   addProvider,
   deleteProvider,
@@ -22,6 +22,11 @@ import {
 } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import type { Provider } from "../lib/types";
+import {
+  serverTableProps,
+  useServerRows,
+  type ServerTableQuery,
+} from "../lib/useServerRows";
 
 // status maps a provider onto a badge: disabled by an operator, or unreachable
 // on the last discovery sync (its models are hidden either way).
@@ -30,8 +35,13 @@ function status(p: Provider): Status {
   return p.reachable ? "active" : "unreachable";
 }
 
+// ProviderRow adds the stable key the table needs; providers are addressed by
+// name in the API, so that is the natural identity.
+type ProviderRow = Provider & { id: string };
+
+const STATUS_VALUES = ["active", "disabled", "unreachable"];
+
 export default function Providers() {
-  const [providers, setProviders] = useState<Provider[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
@@ -41,13 +51,17 @@ export default function Providers() {
   const [baseURL, setBaseURL] = useState("");
   const [apiKey, setApiKey] = useState("");
 
-  const reload = useCallback(() => {
-    getProviders()
-      .then(setProviders)
-      .catch((e: unknown) => setError(errorMessage(e)));
-  }, []);
-
-  useEffect(reload, [reload]);
+  const fetchProviders = useCallback(
+    (q: ServerTableQuery) =>
+      getProviders(q).then((r) => ({
+        rows: r.providers.map((p) => ({ ...p, id: p.name })),
+        total: r.total,
+      })),
+    [],
+  );
+  const table = useServerRows<ProviderRow>(fetchProviders, {
+    onError: (e) => setError(errorMessage(e)),
+  });
 
   const resetForm = () => {
     setName("");
@@ -80,7 +94,7 @@ export default function Providers() {
           ? res.warning
           : `Added ${res.name} with ${res.modelCount} model(s).`,
       );
-      reload();
+      table.reload();
       setOpen(false);
       resetForm();
     } catch (err) {
@@ -94,7 +108,7 @@ export default function Providers() {
     setError(null);
     try {
       await deleteProvider(providerName);
-      reload();
+      table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -104,14 +118,78 @@ export default function Providers() {
     setError(null);
     try {
       await (p.disabled ? enableProvider(p.name) : disableProvider(p.name));
-      reload();
+      table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
   };
 
-  if (error && providers === null) return <PageState error={error} />;
-  if (providers === null) return <PageState />;
+  const columns: TableColumn<ProviderRow>[] = [
+    {
+      id: "name",
+      name: "Name",
+      selector: (p) => p.name,
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "baseURL",
+      name: "Base URL",
+      selector: (p) => p.baseURL,
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "modelCount",
+      name: "Models in registry",
+      selector: (p) => p.modelCount,
+      sortable: true,
+      right: true,
+    },
+    {
+      id: "status",
+      name: "Status",
+      selector: (p) => status(p),
+      sortable: true,
+      filterable: true,
+      filterType: "set",
+      filterOptions: { values: STATUS_VALUES },
+      cell: (p) => (
+        <span title={p.lastError || undefined}>
+          <StatusTag status={status(p)} />
+        </span>
+      ),
+    },
+    {
+      id: "actions",
+      name: "",
+      right: true,
+      width: "120px",
+      cell: (p) => (
+        <div className="row-actions">
+          {/* Always clickable: enabling a disabled provider is allowed and
+              reachability is evaluated separately (the badge shows unreachable
+              until the next successful sync). */}
+          <IconButton
+            kind="ghost"
+            size="sm"
+            label={p.disabled ? `Enable ${p.name}` : `Disable ${p.name}`}
+            onClick={() => toggle(p)}
+          >
+            {p.disabled ? <Play /> : <Pause />}
+          </IconButton>
+          <IconButton
+            kind="ghost"
+            size="sm"
+            label={`Remove ${p.name}`}
+            onClick={() => remove(p.name)}
+          >
+            <TrashCan />
+          </IconButton>
+        </div>
+      ),
+    },
+  ];
 
   return (
     <Grid>
@@ -136,46 +214,20 @@ export default function Providers() {
             />
           )}
 
-          <StructuredTable
-            headers={["Name", "Base URL", "Models in registry", "Status", ""]}
-            searchable={false}
-            className="providers-table"
-            actions={
+          <div className="table-block">
+            <div className="table-toolbar">
               <Button renderIcon={Add} onClick={openModal}>
                 Add provider
               </Button>
-            }
-            empty="No providers configured."
-            rows={providers.map((p) => [
-              p.name,
-              p.baseURL,
-              p.modelCount,
-              <span title={p.lastError || undefined}>
-                <StatusTag status={status(p)} />
-              </span>,
-              <>
-                {/* Always clickable: enabling a disabled provider is allowed
-                    and reachability is evaluated separately (the badge shows
-                    unreachable until the next successful sync). */}
-                <IconButton
-                  kind="ghost"
-                  size="sm"
-                  label={p.disabled ? `Enable ${p.name}` : `Disable ${p.name}`}
-                  onClick={() => toggle(p)}
-                >
-                  {p.disabled ? <Play /> : <Pause />}
-                </IconButton>
-                <IconButton
-                  kind="ghost"
-                  size="sm"
-                  label={`Remove ${p.name}`}
-                  onClick={() => remove(p.name)}
-                >
-                  <TrashCan />
-                </IconButton>
-              </>,
-            ])}
-          />
+            </div>
+            <Table
+              columns={columns}
+              data={table.rows}
+              noDataComponent="No providers configured."
+              persistTableHead
+              {...serverTableProps(table)}
+            />
+          </div>
         </Stack>
       </Column>
 

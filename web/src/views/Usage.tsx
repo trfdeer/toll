@@ -18,15 +18,25 @@ import {
   Tabs,
   TextInput,
 } from "@carbon/react";
-import type { FormEvent, ReactNode } from "react";
-import { useEffect, useRef, useState } from "react";
-import PageState from "../components/PageState";
+import type { TableColumn } from "react-data-table-component";
+import type { FormEvent } from "react";
+import { useEffect, useState } from "react";
 import RequestDetailPanel from "../components/RequestDetail";
-import StructuredTable from "../components/StructuredTable";
+import Table from "../components/Table";
 import { getKeys, getRequest, getRequests, getUsage } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { formatDuration } from "../lib/format";
-import type { RequestDetail, RequestRow, UsageSummary } from "../lib/types";
+import type {
+  RequestDetail,
+  RequestRow,
+  UsageRow,
+  UsageTotals,
+} from "../lib/types";
+import {
+  serverTableProps,
+  useServerRows,
+  type ServerTableQuery,
+} from "../lib/useServerRows";
 
 // ymd formats a Date as YYYY-MM-DD in local time.
 function ymd(d: Date): string {
@@ -72,28 +82,54 @@ function defaultFilters(): Filters {
   };
 }
 
+// SummaryRow is a usage summary row with a stable table key.
+type SummaryRow = UsageRow & { id: string };
+
 export default function Usage() {
-  const [summary, setSummary] = useState<UsageSummary | null>(null);
-  const [requests, setRequests] = useState<RequestRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [keyOptions, setKeyOptions] = useState<string[]>([]);
   const [draft, setDraft] = useState<Filters>(defaultFilters);
   const [applied, setApplied] = useState<Filters>(defaultFilters);
-  // autoRefresh is the poll interval in seconds; 0 disables it. tick just
-  // re-triggers the fetch effect on each interval.
+  // autoRefresh is the poll interval in seconds; 0 disables it.
   const [autoRefresh, setAutoRefresh] = useState(0);
-  const [tick, setTick] = useState(0);
-  // refreshing/updatedAt drive the in-place status line: an auto-refresh keeps
-  // the current table on screen while the new numbers are on the wire.
+  // refreshing/updatedAt drive the in-place status line.
   const [refreshing, setRefreshing] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
-  // lastApplied lets the data effect tell a poll (same filters) from a new
-  // query (Apply/Reset), which is the difference between swapping the table
-  // and reloading the whole view.
-  const lastApplied = useRef<Filters | null>(null);
   const [detail, setDetail] = useState<RequestDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+
+  // The applied date range/time and keys are the shared server filters for
+  // both tables. Strings and the keys array keep a stable identity until the
+  // user applies a new filter set.
+  const [fromDay, toDay] = applied.dateRange;
+  const from = bound(fromDay, applied.fromTime || "00:00");
+  const to = bound(toDay, applied.toTime || "23:59");
+  const keys = applied.selectedKeys;
+
+  const fetchSummary = (q: ServerTableQuery) =>
+    getUsage({ from, to, key: keys, ...q }).then((r) => ({
+      rows: r.rows.map((row) => ({ ...row, id: row.gatewayModel })),
+      total: r.total,
+      meta: r.totals,
+    }));
+  const summaryTable = useServerRows<SummaryRow, UsageTotals>(fetchSummary, {
+    deps: [from, to, keys],
+    onError: (e) => setError(errorMessage(e)),
+  });
+
+  const fetchRequests = (q: ServerTableQuery) =>
+    getRequests({ from, to, key: keys, ...q }).then((r) => ({
+      rows: r.requests,
+      total: r.total,
+    }));
+  const requestsTable = useServerRows<RequestRow>(fetchRequests, {
+    deps: [from, to, keys],
+    onError: (e) => setError(errorMessage(e)),
+  });
+
+  const { reload: reloadSummary } = summaryTable;
+  const { reload: reloadRequests } = requestsTable;
 
   // openDetail loads one request's conversation into the side panel.
   const openDetail = (id: number) => {
@@ -126,119 +162,161 @@ export default function Usage() {
     setApplied(d);
   };
 
-  // Auto-refresh: while enabled, bump tick on the chosen interval. The data
-  // effect below depends on tick, so it re-fetches with the applied filters.
+  // Auto-refresh: while enabled, re-run both server queries on the interval.
   useEffect(() => {
     if (autoRefresh <= 0) return;
-    const id = setInterval(() => setTick((t) => t + 1), autoRefresh * 1000);
+    const id = setInterval(() => {
+      setRefreshing(true);
+      reloadSummary();
+      reloadRequests();
+    }, autoRefresh * 1000);
     return () => clearInterval(id);
-  }, [autoRefresh]);
+  }, [autoRefresh, reloadSummary, reloadRequests]);
+
+  // Once both tables have settled, mark the status line as up to date.
+  useEffect(() => {
+    if (!summaryTable.loading && !requestsTable.loading) {
+      setRefreshing(false);
+      setUpdatedAt(new Date());
+    }
+  }, [summaryTable.loading, requestsTable.loading]);
 
   // Key filter options come from the full key list, not just what a filtered
   // result happens to contain.
   useEffect(() => {
-    getKeys()
+    getKeys({ limit: 0 })
       .then((k) => setKeyOptions(k.keys.map((x) => x.name)))
       .catch((e: unknown) => setError(errorMessage(e)));
   }, []);
 
-  // The API applies the filters; only the draft changes on edit, so a fetch
-  // happens when the user applies (or resets) rather than on every keystroke.
-  // tick is in the deps so auto-refresh re-runs the same query.
-  useEffect(() => {
-    const { dateRange, fromTime, toTime, selectedKeys } = applied;
-    // applied is replaced with a new object on Apply/Reset, so an unchanged
-    // identity means this is a poll: keep the rows on screen and swap them in
-    // when the response lands.
-    const isPoll = lastApplied.current === applied;
-    lastApplied.current = applied;
+  const totals = summaryTable.meta;
 
-    const [fromDayDate, toDayDate] = dateRange;
-    const from = bound(fromDayDate, fromTime || "00:00");
-    const to = bound(toDayDate, toTime || "23:59");
-
-    if (!isPoll) {
-      // A new query: the current rows are for different filters, so there is
-      // nothing worth keeping.
-      setSummary(null);
-      setRequests(null);
-    }
-    setRefreshing(true);
-    // A slow response must not land after a later one and replace fresher
-    // rows, so the effect's cleanup marks it stale.
-    let stale = false;
-    Promise.all([
-      getUsage({ from, to, key: selectedKeys }),
-      getRequests({ from, to, key: selectedKeys }),
-    ])
-      .then(([usage, rq]) => {
-        if (stale) return;
-        setSummary(usage);
-        setRequests(rq.requests);
-        setUpdatedAt(new Date());
-        setError(null);
-      })
-      .catch((e: unknown) => {
-        if (!stale) setError(errorMessage(e));
-      })
-      .finally(() => {
-        if (!stale) setRefreshing(false);
-      });
-    return () => {
-      stale = true;
-    };
-  }, [applied, tick]);
-
-  // A failed poll keeps the rows that are already on screen and reports the
-  // error in the notification below; only a first load with nothing to show
-  // replaces the view.
-  if (error && (!summary || !requests)) return <PageState error={error} />;
-  if (!summary || !requests) return <PageState />;
-
-  const total = summary.rows.reduce(
-    (acc, r) => ({
-      requests: acc.requests + r.requests,
-      promptTokens: acc.promptTokens + r.promptTokens,
-      cachedTokens: acc.cachedTokens + r.cachedTokens,
-      completionTokens: acc.completionTokens + r.completionTokens,
-      costUSD: acc.costUSD + (r.costUSD ?? 0),
-    }),
+  // The footer shows the true totals over the whole filtered set, which the
+  // API computes independently of the current page.
+  const summaryColumns: TableColumn<SummaryRow>[] = [
     {
-      requests: 0,
-      promptTokens: 0,
-      cachedTokens: 0,
-      completionTokens: 0,
-      costUSD: 0,
+      id: "model",
+      name: "Model",
+      selector: (r) => r.gatewayModel,
+      sortable: true,
+      filterable: true,
+      footer: "Total",
     },
-  );
-
-  const summaryRows: ReactNode[][] = summary.rows.map((r) => [
-    r.gatewayModel,
-    r.requests,
-    r.promptTokens,
-    r.cachedTokens,
-    r.completionTokens,
-    r.costUSD,
-  ]);
-  const summaryFooter: ReactNode[] = [
-    total.requests,
-    total.promptTokens,
-    total.cachedTokens,
-    total.completionTokens,
-    Number(total.costUSD.toFixed(4)),
+    {
+      id: "requests",
+      name: "Requests",
+      selector: (r) => r.requests,
+      sortable: true,
+      right: true,
+      footer: totals?.requests ?? "",
+    },
+    {
+      id: "prompt",
+      name: "Prompt",
+      selector: (r) => r.promptTokens,
+      sortable: true,
+      right: true,
+      footer: totals?.promptTokens ?? "",
+    },
+    {
+      id: "cached",
+      name: "Cached",
+      selector: (r) => r.cachedTokens,
+      sortable: true,
+      right: true,
+      footer: totals?.cachedTokens ?? "",
+    },
+    {
+      id: "completion",
+      name: "Completion",
+      selector: (r) => r.completionTokens,
+      sortable: true,
+      right: true,
+      footer: totals?.completionTokens ?? "",
+    },
+    {
+      id: "cost",
+      name: "Cost",
+      selector: (r) => r.costUSD,
+      sortable: true,
+      right: true,
+      footer: totals ? Number(totals.costUSD.toFixed(4)) : "",
+    },
   ];
 
-  const requestRows: ReactNode[][] = requests.map((r) => [
-    r.createdAt,
-    r.keyName,
-    r.gatewayModel,
-    r.status,
-    r.promptTokens,
-    r.cachedTokens,
-    r.completionTokens,
-    r.costUSD ?? "—",
-    formatDuration(r.durationMs),
-  ]);
+  const requestColumns: TableColumn<RequestRow>[] = [
+    {
+      id: "time",
+      name: "Time",
+      selector: (r) => r.createdAt,
+      sortable: true,
+    },
+    {
+      id: "key",
+      name: "Key",
+      selector: (r) => r.keyName,
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "model",
+      name: "Model",
+      selector: (r) => r.gatewayModel,
+      sortable: true,
+      filterable: true,
+    },
+    {
+      id: "status",
+      name: "Status",
+      selector: (r) => r.status,
+      sortable: true,
+      right: true,
+      filterable: true,
+    },
+    {
+      id: "prompt",
+      name: "Prompt",
+      selector: (r) => r.promptTokens,
+      sortable: true,
+      right: true,
+      filterable: true,
+    },
+    {
+      id: "cached",
+      name: "Cached",
+      selector: (r) => r.cachedTokens,
+      sortable: true,
+      right: true,
+      filterable: true,
+    },
+    {
+      id: "completion",
+      name: "Completion",
+      selector: (r) => r.completionTokens,
+      sortable: true,
+      right: true,
+      filterable: true,
+      width: "150px",
+      grow: 0,
+    },
+    {
+      id: "cost",
+      name: "Cost",
+      selector: (r) => r.costUSD,
+      format: (r) => r.costUSD ?? "—",
+      sortable: true,
+      right: true,
+      filterable: true,
+    },
+    {
+      id: "duration",
+      name: "Duration",
+      selector: (r) => r.durationMs,
+      format: (r) => formatDuration(r.durationMs),
+      sortable: true,
+      right: true,
+    },
+  ];
 
   return (
     <Grid>
@@ -357,42 +435,23 @@ export default function Usage() {
             </TabList>
             <TabPanels>
               <TabPanel>
-                <StructuredTable
-                  headers={[
-                    "Model",
-                    "Requests",
-                    "Prompt",
-                    "Cached",
-                    "Completion",
-                    "Cost",
-                  ]}
-                  rows={summaryRows}
-                  footer={summaryFooter}
-                  searchable={false}
-                  empty="No usage recorded for this filter."
+                <Table
+                  columns={summaryColumns}
+                  data={summaryTable.rows}
+                  noDataComponent="No usage recorded for this filter."
+                  {...serverTableProps(summaryTable)}
                 />
               </TabPanel>
 
               <TabPanel>
-                <StructuredTable
-                  headers={[
-                    "Time",
-                    "Key",
-                    "Model",
-                    "Status",
-                    "Prompt",
-                    "Cached",
-                    "Completion",
-                    "Cost",
-                    "Duration",
-                  ]}
-                  rows={requestRows}
-                  searchable={false}
-                  onRowClick={(i) => {
-                    const r = requests[i];
-                    if (r) openDetail(r.id);
-                  }}
-                  empty="No requests recorded for this filter."
+                <Table
+                  columns={requestColumns}
+                  data={requestsTable.rows}
+                  noDataComponent="No requests recorded for this filter."
+                  highlightOnHover
+                  pointerOnHover
+                  onRowClicked={(r) => openDetail(r.id)}
+                  {...serverTableProps(requestsTable)}
                 />
               </TabPanel>
             </TabPanels>

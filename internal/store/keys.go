@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrKeyNotFound is returned when no active virtual key matches a hash.
@@ -87,22 +88,65 @@ func (s *Store) KeyByHash(ctx context.Context, keyHash string) (*VirtualKey, err
 	return &vk, nil
 }
 
-// ListVirtualKeys returns all keys, including revoked and paused ones, with
-// their profiles resolved.
-func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
+// virtualKeyFilterCols and virtualKeySortCols map the admin column ids to SQL
+// expressions for the keys table. Status is derived from the timestamps.
+var (
+	virtualKeyStatusExpr = "(CASE WHEN vk.revoked_at IS NOT NULL THEN 'revoked' WHEN vk.paused_at IS NOT NULL THEN 'paused' ELSE 'active' END)"
+	virtualKeyFilterCols = map[string]string{
+		"name":    "vk.name",
+		"profile": "p.name",
+		"status":  virtualKeyStatusExpr,
+	}
+	virtualKeySortCols = map[string]string{
+		"id":      "vk.id",
+		"name":    "vk.name",
+		"profile": "p.name",
+		"status":  virtualKeyStatusExpr,
+	}
+)
+
+// ListVirtualKeysPaged returns a page of keys, including revoked and paused
+// ones, with their profiles resolved, plus the total before windowing.
+func (s *Store) ListVirtualKeysPaged(ctx context.Context, p ListParams) ([]VirtualKey, int, error) {
 	// Resolve the profile graph first: the outer query below keeps the pool's
 	// single connection open for its duration.
 	graph, err := s.loadProfileGraph(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	fconds, fargs, err := buildFilters(p.Filter, virtualKeyFilterCols)
+	if err != nil {
+		return nil, 0, err
+	}
+	where := ""
+	if len(fconds) > 0 {
+		where = "WHERE " + strings.Join(fconds, " AND ")
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM virtual_keys vk JOIN profiles p ON p.id = vk.profile_id
+		`+where, fargs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	order, err := buildOrder(p, virtualKeySortCols, "id", "asc", "vk.id")
+	if err != nil {
+		return nil, 0, err
+	}
+	query := `
 		SELECT vk.id, vk.name, vk.profile_id, p.name,
 		       vk.revoked_at, vk.paused_at
 		FROM virtual_keys vk JOIN profiles p ON p.id = vk.profile_id
-		ORDER BY vk.id`)
+		` + where + order
+	if limit := p.pageLimit(50, 1000); limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		fargs = append(fargs, limit, p.Offset)
+	}
+	rows, err := s.db.QueryContext(ctx, query, fargs...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var out []VirtualKey
@@ -110,14 +154,24 @@ func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
 		var vk VirtualKey
 		var revoked, paused sql.NullString
 		if err := rows.Scan(&vk.ID, &vk.Name, &vk.ProfileID, &vk.ProfileName, &revoked, &paused); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		vk.AllowAll, vk.Rules = resolveProfileRules(graph, vk.ProfileID)
 		vk.Revoked = revoked.Valid
 		vk.Paused = paused.Valid
 		out = append(out, vk)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+
+// ListVirtualKeys returns every key (no paging), for callers that need the
+// full set.
+func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
+	keys, _, err := s.ListVirtualKeysPaged(ctx, ListParams{Limit: -1})
+	return keys, err
 }
 
 // UpdateVirtualKey edits a key's name and/or profile in place. The key
@@ -219,18 +273,72 @@ type ModelRow struct {
 	Alias             string // custom gateway-ID alias, empty when unset
 }
 
-// ListModels returns every registered model across all upstreams, including
-// provider status, so callers can decide visibility.
-func (s *Store) ListModels(ctx context.Context) ([]ModelRow, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT m.id, u.name, m.upstream_model_id, m.gateway_id, m.display_name, m.metadata,
-		       m.disabled, u.disabled, u.reachable, COALESCE(ma.alias, '')
-		FROM models m JOIN upstreams u ON u.id = m.upstream_id
-		LEFT JOIN model_aliases ma
-		       ON ma.upstream_id = m.upstream_id AND ma.upstream_model_id = m.upstream_model_id
-		ORDER BY m.gateway_id`)
+// modelStatusExpr derives a model's effective status in SQL, matching the
+// admin UI's modelStatus(): the model, its provider, or a failed sync.
+const modelStatusExpr = "(CASE WHEN m.disabled = 1 THEN 'disabled' " +
+	"WHEN m.upstream_disabled = 1 THEN 'provider disabled' " +
+	"WHEN m.upstream_reachable = 0 THEN 'unreachable' ELSE 'active' END)"
+
+// modelFilterCols and modelSortCols map the admin column ids to columns of the
+// model_search view, which exposes the metadata-derived limits and price. Cost
+// sorts/filters on the numeric input price (the cell still renders the full
+// pricing summary).
+var (
+	modelFilterCols = map[string]string{
+		"gatewayId":   "m.gateway_id",
+		"upstream":    "m.upstream_name",
+		"displayName": "m.display_name",
+		"alias":       "m.alias",
+		"status":      modelStatusExpr,
+		"inputLimit":  "m.input_limit",
+		"outputLimit": "m.output_limit",
+		"cost":        "m.input_price",
+	}
+	modelSortCols = map[string]string{
+		"id":          "m.id",
+		"gatewayId":   "m.gateway_id",
+		"upstream":    "m.upstream_name",
+		"displayName": "m.display_name",
+		"alias":       "m.alias",
+		"status":      modelStatusExpr,
+		"inputLimit":  "m.input_limit",
+		"outputLimit": "m.output_limit",
+		"cost":        "m.input_price",
+	}
+)
+
+// ListModelsPaged returns a page of registered models across all upstreams,
+// including provider status, plus the total before windowing.
+func (s *Store) ListModelsPaged(ctx context.Context, p ListParams) ([]ModelRow, int, error) {
+	fconds, fargs, err := buildFilters(p.Filter, modelFilterCols)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	where := ""
+	if len(fconds) > 0 {
+		where = "WHERE " + strings.Join(fconds, " AND ")
+	}
+
+	const from = ` FROM model_search m`
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from+` `+where, fargs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	order, err := buildOrder(p, modelSortCols, "gatewayId", "asc", "m.id")
+	if err != nil {
+		return nil, 0, err
+	}
+	query := `
+		SELECT m.id, m.upstream_name, m.upstream_model_id, m.gateway_id, m.display_name, m.metadata,
+		       m.disabled, m.upstream_disabled, m.upstream_reachable, m.alias` + from + ` ` + where + order
+	if limit := p.pageLimit(50, 1000); limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		fargs = append(fargs, limit, p.Offset)
+	}
+	rows, err := s.db.QueryContext(ctx, query, fargs...)
+	if err != nil {
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var out []ModelRow
@@ -238,11 +346,21 @@ func (s *Store) ListModels(ctx context.Context) ([]ModelRow, error) {
 		var m ModelRow
 		if err := rows.Scan(&m.ID, &m.UpstreamName, &m.UpstreamModelID, &m.GatewayID, &m.DisplayName, &m.Metadata,
 			&m.Disabled, &m.UpstreamDisabled, &m.UpstreamReachable, &m.Alias); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out = append(out, m)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+
+// ListModels returns every registered model (no paging), for callers that need
+// the full set.
+func (s *Store) ListModels(ctx context.Context) ([]ModelRow, error) {
+	rows, _, err := s.ListModelsPaged(ctx, ListParams{Limit: -1})
+	return rows, err
 }
 
 // UpstreamRow is one upstream with registry counts and sync status, for the
@@ -289,16 +407,64 @@ func (s *Store) ListUpstreamsForSync(ctx context.Context) ([]SyncUpstream, error
 	return out, rows.Err()
 }
 
-// ListUpstreams returns all configured upstreams with their registry sizes.
-func (s *Store) ListUpstreams(ctx context.Context) ([]UpstreamRow, error) {
-	rows, err := s.db.QueryContext(ctx, `
+// upstreamStatusExpr derives a provider's status in SQL, matching status().
+const upstreamStatusExpr = "(CASE WHEN u.disabled = 1 THEN 'disabled' " +
+	"WHEN u.reachable = 0 THEN 'unreachable' ELSE 'active' END)"
+
+// upstreamFilterCols and upstreamSortCols map the admin column ids to SQL
+// expressions. modelCount is an aggregate, valid in ORDER BY under GROUP BY.
+var (
+	upstreamFilterCols = map[string]string{
+		"name":    "u.name",
+		"baseURL": "u.base_url",
+		"status":  upstreamStatusExpr,
+	}
+	upstreamSortCols = map[string]string{
+		"id":         "u.id",
+		"position":   "u.position",
+		"name":       "u.name",
+		"baseURL":    "u.base_url",
+		"modelCount": "COUNT(m.id)",
+		"status":     upstreamStatusExpr,
+	}
+)
+
+// ListUpstreamsPaged returns a page of configured upstreams with their registry
+// sizes, plus the total before windowing.
+func (s *Store) ListUpstreamsPaged(ctx context.Context, p ListParams) ([]UpstreamRow, int, error) {
+	fconds, fargs, err := buildFilters(p.Filter, upstreamFilterCols)
+	if err != nil {
+		return nil, 0, err
+	}
+	where := ""
+	if len(fconds) > 0 {
+		where = "WHERE " + strings.Join(fconds, " AND ")
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM upstreams u `+where, fargs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	order, err := buildOrder(p, upstreamSortCols, "position", "asc", "u.id")
+	if err != nil {
+		return nil, 0, err
+	}
+	query := `
 		SELECT u.id, u.name, u.base_url, u.position, u.refresh_seconds,
 		       u.disabled, u.reachable, u.last_error, COALESCE(u.last_synced_at, ''),
 		       COUNT(m.id)
 		FROM upstreams u LEFT JOIN models m ON m.upstream_id = u.id
-		GROUP BY u.id ORDER BY u.position`)
+		` + where + `
+		GROUP BY u.id` + order
+	if limit := p.pageLimit(50, 1000); limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		fargs = append(fargs, limit, p.Offset)
+	}
+	rows, err := s.db.QueryContext(ctx, query, fargs...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var out []UpstreamRow
@@ -306,11 +472,21 @@ func (s *Store) ListUpstreams(ctx context.Context) ([]UpstreamRow, error) {
 		var u UpstreamRow
 		if err := rows.Scan(&u.ID, &u.Name, &u.BaseURL, &u.Position, &u.RefreshSeconds,
 			&u.Disabled, &u.Reachable, &u.LastError, &u.LastSyncedAt, &u.ModelCount); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out = append(out, u)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+
+// ListUpstreams returns every configured upstream (no paging), for callers
+// that need the full set.
+func (s *Store) ListUpstreams(ctx context.Context) ([]UpstreamRow, error) {
+	ups, _, err := s.ListUpstreamsPaged(ctx, ListParams{Limit: -1})
+	return ups, err
 }
 
 // SetUpstreamDisabled enables or disables a provider. A disabled provider

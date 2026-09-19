@@ -148,27 +148,94 @@ func (f UsageFilter) where(tsCol, keyCol string) ([]string, []any) {
 	return conds, args
 }
 
-// UsageSummary aggregates recorded usage per model over the filter range, for
-// the admin dashboard, optionally narrowed by f. The LEFT JOIN keeps the key
-// filter (vk.name) usable without grouping by key.
-func (s *Store) UsageSummary(ctx context.Context, f UsageFilter) ([]UsageSummaryRow, error) {
+// UsageTotals is the aggregate over every row matching a filter, independent
+// of the current page, so a paginated summary can still show true totals.
+type UsageTotals struct {
+	Requests         int
+	PromptTokens     int
+	CachedTokens     int
+	CompletionTokens int
+	CostUSD          float64
+}
+
+// usageSummaryFilterCols and usageSummarySortCols map the admin column ids to
+// SQL expressions. Only the model column is filterable; every column sorts.
+var (
+	usageSummaryFilterCols = map[string]string{
+		"model": "ue.gateway_model",
+	}
+	usageSummarySortCols = map[string]string{
+		"model":      "ue.gateway_model",
+		"requests":   "COUNT(*)",
+		"prompt":     "SUM(ue.prompt_tokens)",
+		"cached":     "SUM(ue.cached_tokens)",
+		"completion": "SUM(ue.completion_tokens)",
+		"cost":       "SUM(ue.cost_usd)",
+	}
+)
+
+// UsageSummaryPaged aggregates recorded usage per model over the filter range,
+// for the admin dashboard, optionally narrowed by f. The LEFT JOIN keeps the
+// key filter (vk.name) usable without grouping by key.
+//
+// It returns the requested page of grouped rows, the total number of groups
+// matching the filter, and the true totals over the whole filtered set (not
+// just the current page).
+func (s *Store) UsageSummaryPaged(ctx context.Context, f UsageFilter, p ListParams) ([]UsageSummaryRow, int, UsageTotals, error) {
 	conds, args := f.where("ue.created_at", "vk.name")
+	fconds, fargs, err := buildFilters(p.Filter, usageSummaryFilterCols)
+	if err != nil {
+		return nil, 0, UsageTotals{}, err
+	}
+	conds = append(conds, fconds...)
+	args = append(args, fargs...)
 	where := ""
 	if len(conds) > 0 {
 		where = "WHERE " + strings.Join(conds, " AND ")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+
+	var totals UsageTotals
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(ue.prompt_tokens), 0), COALESCE(SUM(ue.completion_tokens), 0),
+		       COALESCE(SUM(ue.cached_tokens), 0), COALESCE(SUM(ue.cost_usd), 0)
+		FROM usage_events ue
+		LEFT JOIN virtual_keys vk ON vk.id = ue.key_id
+		`+where, args...).Scan(&totals.Requests, &totals.PromptTokens,
+		&totals.CompletionTokens, &totals.CachedTokens, &totals.CostUSD); err != nil {
+		return nil, 0, UsageTotals{}, err
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT 1 FROM usage_events ue
+			LEFT JOIN virtual_keys vk ON vk.id = ue.key_id
+			`+where+`
+			GROUP BY ue.gateway_model
+		)`, args...).Scan(&total); err != nil {
+		return nil, 0, UsageTotals{}, err
+	}
+
+	order, err := buildOrder(p, usageSummarySortCols, "model", "asc", "ue.gateway_model")
+	if err != nil {
+		return nil, 0, UsageTotals{}, err
+	}
+	query := `
 		SELECT ue.gateway_model,
 		       COUNT(*), SUM(ue.prompt_tokens), SUM(ue.completion_tokens),
 		       SUM(ue.cached_tokens),
 		       COALESCE(SUM(ue.cost_usd), 0), COALESCE(SUM(ue.upstream_cost_usd), 0)
 		FROM usage_events ue
 		LEFT JOIN virtual_keys vk ON vk.id = ue.key_id
-		`+where+`
-		GROUP BY ue.gateway_model
-		ORDER BY ue.gateway_model`, args...)
+		` + where + `
+		GROUP BY ue.gateway_model` + order
+	if limit := p.pageLimit(50, 1000); limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, limit, p.Offset)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, 0, UsageTotals{}, err
 	}
 	defer rows.Close()
 	var out []UsageSummaryRow
@@ -177,11 +244,21 @@ func (s *Store) UsageSummary(ctx context.Context, f UsageFilter) ([]UsageSummary
 		if err := rows.Scan(&r.GatewayModel, &r.Requests,
 			&r.PromptTokens, &r.CompletionToken, &r.CachedTokens,
 			&r.CostUSD, &r.UpstreamCostUSD); err != nil {
-			return nil, err
+			return nil, 0, UsageTotals{}, err
 		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, UsageTotals{}, err
+	}
+	return out, total, totals, nil
+}
+
+// UsageSummary returns every grouped row (no paging), for callers that need
+// the full set.
+func (s *Store) UsageSummary(ctx context.Context, f UsageFilter) ([]UsageSummaryRow, error) {
+	rows, _, _, err := s.UsageSummaryPaged(ctx, f, ListParams{Limit: -1})
+	return rows, err
 }
 
 // RecordUsage persists a usage event. Failures are logged by callers; they

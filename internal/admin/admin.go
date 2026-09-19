@@ -107,9 +107,13 @@ func (h *handlers) usage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	sum, err := h.store.UsageSummary(r.Context(), filter)
+	p, ok := parseListParams(w, r)
+	if !ok {
+		return
+	}
+	sum, total, totals, err := h.store.UsageSummaryPaged(r.Context(), filter, p)
 	if err != nil {
-		h.fail(w, err, "usage unavailable")
+		h.listError(w, err, "usage unavailable")
 		return
 	}
 	type usageRow struct {
@@ -121,8 +125,6 @@ func (h *handlers) usage(w http.ResponseWriter, r *http.Request) {
 		CostUSD          float64 `json:"costUSD"`
 	}
 	rows := make([]usageRow, 0, len(sum))
-	var totalReqs int
-	var total float64
 	for _, s := range sum {
 		rows = append(rows, usageRow{
 			GatewayModel: s.GatewayModel,
@@ -130,45 +132,40 @@ func (h *handlers) usage(w http.ResponseWriter, r *http.Request) {
 			CachedTokens: s.CachedTokens, CompletionTokens: s.CompletionToken,
 			CostUSD: s.CostUSD,
 		})
-		totalReqs += s.Requests
-		total += s.CostUSD
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"rows":      rows,
-		"totalReqs": totalReqs,
-		"totalCost": fmtUSD(total),
+		"total":     total,
+		"totalReqs": totals.Requests,
+		"totalCost": fmtUSD(totals.CostUSD),
+		"totals": map[string]any{
+			"requests":         totals.Requests,
+			"promptTokens":     totals.PromptTokens,
+			"cachedTokens":     totals.CachedTokens,
+			"completionTokens": totals.CompletionTokens,
+			"costUSD":          totals.CostUSD,
+		},
 	})
 }
 
-// requests lists requests (one per transcript), newest first, filtered by
-// the optional from/to (RFC3339), key, limit and offset query parameters.
+// requests lists requests (one per transcript), filtered by the optional
+// from/to (RFC3339) and key parameters, paginated by limit/offset, sorted by
+// sort/dir and narrowed by the per-column filter parameter.
 func (h *handlers) requests(w http.ResponseWriter, r *http.Request) {
 	filter, ok := parseFilter(w, r)
 	if !ok {
 		return
 	}
-	limit, offset := 200, 0
-	if v := r.URL.Query().Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 1000 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be 1..1000"})
-			return
-		}
-		limit = n
-	}
-	if v := r.URL.Query().Get("offset"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offset must be >= 0"})
-			return
-		}
-		offset = n
+	p, ok := parseListParams(w, r)
+	if !ok {
+		return
 	}
 	reqs, total, err := h.store.Requests(r.Context(), store.RequestFilter{
-		UsageFilter: filter, Limit: limit, Offset: offset,
+		UsageFilter: filter, Limit: p.Limit, Offset: p.Offset,
+		Sort: p.Sort, Dir: p.Dir, Filter: p.Filter,
 	})
 	if err != nil {
-		h.fail(w, err, "requests unavailable")
+		h.listError(w, err, "requests unavailable")
 		return
 	}
 	type request struct {
@@ -230,6 +227,56 @@ func parseFilter(w http.ResponseWriter, r *http.Request) (store.UsageFilter, boo
 	return f, true
 }
 
+// parseListParams reads the shared limit/offset/sort/dir/filter query
+// parameters used by the listing endpoints. limit=0 means "all rows" (stored
+// as -1); an absent limit leaves the endpoint's default. It writes a 400 and
+// returns false on malformed input.
+func parseListParams(w http.ResponseWriter, r *http.Request) (store.ListParams, bool) {
+	q := r.URL.Query()
+	p := store.ListParams{}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 1000 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be 0..1000"})
+			return p, false
+		}
+		if n == 0 {
+			p.Limit = -1
+		} else {
+			p.Limit = n
+		}
+	}
+	if v := q.Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offset must be >= 0"})
+			return p, false
+		}
+		p.Offset = n
+	}
+	p.Sort = q.Get("sort")
+	p.Dir = q.Get("dir")
+	if v := q.Get("filter"); v != "" {
+		var f map[string]store.FilterSpec
+		if err := json.Unmarshal([]byte(v), &f); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "filter must be a JSON object"})
+			return p, false
+		}
+		p.Filter = f
+	}
+	return p, true
+}
+
+// listError reports a list query failure: an unknown sort/filter column is the
+// client's fault (400), anything else is a server failure (500).
+func (h *handlers) listError(w http.ResponseWriter, err error, msg string) {
+	if errors.Is(err, store.ErrBadListParam) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	h.fail(w, err, msg)
+}
+
 // deletedKeysSentinel is the reserved key-filter value that selects events
 // whose virtual key no longer exists. It is unlikely to collide with a real
 // key name (key names are user-chosen, so this is a documented convention).
@@ -238,9 +285,13 @@ const deletedKeysSentinel = "__deleted__"
 // ---- providers & models ----
 
 func (h *handlers) providers(w http.ResponseWriter, r *http.Request) {
-	ups, err := h.store.ListUpstreams(r.Context())
+	p, ok := parseListParams(w, r)
+	if !ok {
+		return
+	}
+	ups, total, err := h.store.ListUpstreamsPaged(r.Context(), p)
 	if err != nil {
-		h.fail(w, err, "registry unavailable")
+		h.listError(w, err, "registry unavailable")
 		return
 	}
 	type provider struct {
@@ -260,7 +311,7 @@ func (h *handlers) providers(w http.ResponseWriter, r *http.Request) {
 			LastError: u.LastError, LastSyncedAt: u.LastSyncedAt,
 		})
 	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, map[string]any{"providers": out, "total": total})
 }
 
 // providersDisable hides every model of a provider from /v1/models and
@@ -354,9 +405,13 @@ func (h *handlers) providersDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) models(w http.ResponseWriter, r *http.Request) {
-	ms, err := h.store.ListModels(r.Context())
+	p, ok := parseListParams(w, r)
+	if !ok {
+		return
+	}
+	ms, total, err := h.store.ListModelsPaged(r.Context(), p)
 	if err != nil {
-		h.fail(w, err, "models unavailable")
+		h.listError(w, err, "models unavailable")
 		return
 	}
 	type model struct {
@@ -384,7 +439,7 @@ func (h *handlers) models(w http.ResponseWriter, r *http.Request) {
 			ProviderReachable: m.UpstreamReachable,
 		})
 	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, map[string]any{"models": out, "total": total})
 }
 
 // modelsRefresh re-pulls every provider's model catalog and reconciles the
@@ -541,9 +596,13 @@ type profileView struct {
 }
 
 func (h *handlers) profilesList(w http.ResponseWriter, r *http.Request) {
-	ps, err := h.store.ListProfiles(r.Context())
+	p, ok := parseListParams(w, r)
+	if !ok {
+		return
+	}
+	ps, total, err := h.store.ListProfilesPaged(r.Context(), p)
 	if err != nil {
-		h.fail(w, err, "profiles unavailable")
+		h.listError(w, err, "profiles unavailable")
 		return
 	}
 	out := make([]profileView, 0, len(ps))
@@ -558,7 +617,7 @@ func (h *handlers) profilesList(w http.ResponseWriter, r *http.Request) {
 			KeyCount: p.KeyCount, ChildCount: p.ChildCount,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"profiles": out})
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": out, "total": total})
 }
 
 type profileRequest struct {
@@ -678,18 +737,14 @@ type keyView struct {
 }
 
 func (h *handlers) keysList(w http.ResponseWriter, r *http.Request) {
-	keys, err := h.keysFor(r.Context())
-	if err != nil {
-		h.fail(w, err, "keys unavailable")
+	p, ok := parseListParams(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
-}
-
-func (h *handlers) keysFor(ctx context.Context) ([]keyView, error) {
-	vks, err := h.store.ListVirtualKeys(ctx)
+	vks, total, err := h.store.ListVirtualKeysPaged(r.Context(), p)
 	if err != nil {
-		return nil, err
+		h.listError(w, err, "keys unavailable")
+		return
 	}
 	out := make([]keyView, 0, len(vks))
 	for _, vk := range vks {
@@ -700,7 +755,7 @@ func (h *handlers) keysFor(ctx context.Context) ([]keyView, error) {
 			Paused:  vk.Paused,
 		})
 	}
-	return out, nil
+	writeJSON(w, http.StatusOK, map[string]any{"keys": out, "total": total})
 }
 
 type createKeyRequest struct {

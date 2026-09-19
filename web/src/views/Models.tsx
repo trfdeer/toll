@@ -9,10 +9,10 @@ import {
   Stack,
   TextInput,
 } from "@carbon/react";
-import { useCallback, useEffect, useState } from "react";
-import PageState from "../components/PageState";
+import type { TableColumn } from "react-data-table-component";
+import { useCallback, useState } from "react";
 import StatusTag, { type Status } from "../components/StatusTag";
-import StructuredTable from "../components/StructuredTable";
+import Table from "../components/Table";
 import {
   deleteModel,
   disableModel,
@@ -23,6 +23,11 @@ import {
 } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import type { Model, ModelMetadata } from "../lib/types";
+import {
+  serverTableProps,
+  useServerRows,
+  type ServerTableQuery,
+} from "../lib/useServerRows";
 
 // lookup walks a dotted path into the metadata blob, returning undefined if
 // any step is missing or not an object.
@@ -94,8 +99,9 @@ function cost(metadata: ModelMetadata | undefined): string {
     .join(", ");
 }
 
+const STATUS_VALUES = ["active", "disabled", "provider disabled", "unreachable"];
+
 export default function Models() {
-  const [models, setModels] = useState<Model[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
@@ -105,13 +111,14 @@ export default function Models() {
   const [aliasError, setAliasError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const reload = useCallback(() => {
-    getModels()
-      .then(setModels)
-      .catch((e: unknown) => setError(errorMessage(e)));
-  }, []);
-
-  useEffect(reload, [reload]);
+  const fetchModels = useCallback(
+    (q: ServerTableQuery) =>
+      getModels(q).then((r) => ({ rows: r.models, total: r.total })),
+    [],
+  );
+  const table = useServerRows<Model>(fetchModels, {
+    onError: (e) => setError(errorMessage(e)),
+  });
 
   // refresh forces a server-side re-discovery of every provider's catalog,
   // rather than only re-reading the current registry.
@@ -121,7 +128,7 @@ export default function Models() {
     setRefreshing(true);
     try {
       const res = await refreshModels();
-      reload();
+      table.reload();
       const warn = res.warnings?.length ? ` ${res.warnings.join("; ")}` : "";
       setFlash(
         `Re-discovered ${res.models} model(s) from ${res.providers} provider(s).${warn}`,
@@ -137,7 +144,7 @@ export default function Models() {
     setError(null);
     try {
       await deleteModel(id);
-      reload();
+      table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -147,7 +154,7 @@ export default function Models() {
     setError(null);
     try {
       await (m.disabled ? enableModel(m.id) : disableModel(m.id));
-      reload();
+      table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -174,7 +181,7 @@ export default function Models() {
     setAliasError(null);
     try {
       await setModelAlias(editing.id, alias.trim());
-      reload();
+      table.reload();
       setEditing(null);
       setAlias("");
     } catch (err) {
@@ -184,8 +191,124 @@ export default function Models() {
     }
   };
 
-  if (error && models === null) return <PageState error={error} />;
-  if (!models) return <PageState />;
+  const columns: TableColumn<Model>[] = [
+    {
+      id: "gatewayId",
+      name: "ID",
+      selector: (m) => m.gatewayId,
+      sortable: true,
+      filterable: true,
+      width: "160px",
+      grow: 0,
+    },
+    {
+      id: "upstream",
+      name: "Provider",
+      selector: (m) => m.upstream,
+      sortable: true,
+      filterable: true,
+      width: "130px",
+      grow: 0,
+    },
+    {
+      id: "displayName",
+      name: "Name",
+      selector: (m) => m.displayName,
+      sortable: true,
+      filterable: true,
+      width: "140px",
+      grow: 1,
+    },
+    {
+      id: "alias",
+      name: "Alias",
+      selector: (m) => m.alias || "—",
+      sortable: true,
+      filterable: true,
+      width: "105px",
+      grow: 0,
+    },
+    {
+      id: "inputLimit",
+      name: "Input limit",
+      selector: (m) => limit(m.metadata, INPUT_LIMITS),
+      sortable: true,
+      filterable: true,
+      right: true,
+      width: "140px",
+      grow: 0,
+    },
+    {
+      id: "outputLimit",
+      name: "Output limit",
+      selector: (m) => limit(m.metadata, OUTPUT_LIMITS),
+      sortable: true,
+      filterable: true,
+      right: true,
+      width: "150px",
+      grow: 0,
+    },
+    {
+      id: "cost",
+      name: "Cost",
+      selector: (m) => cost(m.metadata),
+      sortable: true,
+      width: "120px",
+      grow: 0,
+    },
+    {
+      id: "status",
+      name: "Status",
+      selector: (m) => modelStatus(m),
+      sortable: true,
+      filterable: true,
+      filterType: "set",
+      filterOptions: { values: STATUS_VALUES },
+      cell: (m) => <StatusTag status={modelStatus(m)} />,
+      width: "120px",
+      grow: 0,
+    },
+    {
+      id: "actions",
+      name: "",
+      right: true,
+      width: "130px",
+      grow: 0,
+      cell: (m) => (
+        <div className="row-actions">
+          {/* Always clickable: enabling a disabled model is allowed and
+              reachability is evaluated separately — the badge shows
+              "unreachable" while its provider is down. */}
+          <IconButton
+            kind="ghost"
+            size="sm"
+            label={`Edit alias for ${m.gatewayId}`}
+            onClick={() => openAlias(m)}
+          >
+            <Edit />
+          </IconButton>
+          <IconButton
+            kind="ghost"
+            size="sm"
+            label={
+              m.disabled ? `Enable ${m.gatewayId}` : `Disable ${m.gatewayId}`
+            }
+            onClick={() => toggle(m)}
+          >
+            {m.disabled ? <Play /> : <Pause />}
+          </IconButton>
+          <IconButton
+            kind="ghost"
+            size="sm"
+            label={`Remove ${m.gatewayId}`}
+            onClick={() => remove(m.id)}
+          >
+            <TrashCan />
+          </IconButton>
+        </div>
+      ),
+    },
+  ];
 
   return (
     <Grid>
@@ -210,20 +333,8 @@ export default function Models() {
             />
           )}
 
-          <StructuredTable
-            headers={[
-              "ID",
-              "Provider",
-              "Name",
-              "Alias",
-              "Input limit",
-              "Output limit",
-              "Cost",
-              "Status",
-              "",
-            ]}
-            className="models-table"
-            actions={
+          <div className="table-block">
+            <div className="table-toolbar">
               <Button
                 renderIcon={Renew}
                 onClick={refresh}
@@ -231,52 +342,15 @@ export default function Models() {
               >
                 {refreshing ? "Refreshing…" : "Refresh"}
               </Button>
-            }
-            rows={models.map((m) => [
-              m.gatewayId,
-              m.upstream,
-              m.displayName,
-              m.alias || "—",
-              limit(m.metadata, INPUT_LIMITS),
-              limit(m.metadata, OUTPUT_LIMITS),
-              cost(m.metadata),
-              <StatusTag status={modelStatus(m)} />,
-              <>
-                {/* Always clickable: enabling a disabled model is allowed and
-                    reachability is evaluated separately — the badge shows
-                    "unreachable" while its provider is down. */}
-                <IconButton
-                  kind="ghost"
-                  size="sm"
-                  label={`Edit alias for ${m.gatewayId}`}
-                  onClick={() => openAlias(m)}
-                >
-                  <Edit />
-                </IconButton>
-                <IconButton
-                  kind="ghost"
-                  size="sm"
-                  label={
-                    m.disabled
-                      ? `Enable ${m.gatewayId}`
-                      : `Disable ${m.gatewayId}`
-                  }
-                  onClick={() => toggle(m)}
-                >
-                  {m.disabled ? <Play /> : <Pause />}
-                </IconButton>
-                <IconButton
-                  kind="ghost"
-                  size="sm"
-                  label={`Remove ${m.gatewayId}`}
-                  onClick={() => remove(m.id)}
-                >
-                  <TrashCan />
-                </IconButton>
-              </>,
-            ])}
-            empty="No models registered yet."
-          />
+            </div>
+            <Table
+              columns={columns}
+              data={table.rows}
+              noDataComponent="No models registered yet."
+              persistTableHead
+              {...serverTableProps(table)}
+            />
+          </div>
         </Stack>
       </Column>
 

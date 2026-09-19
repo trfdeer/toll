@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Profile errors distinguish the reasons a profile edit or delete can fail.
@@ -97,42 +98,94 @@ func (s *Store) CreateProfile(ctx context.Context, name string, provider, model 
 	return id, nil
 }
 
-// ListProfiles returns every profile with its key/child counts, default first.
-func (s *Store) ListProfiles(ctx context.Context) ([]Profile, error) {
-	rows, err := s.db.QueryContext(ctx, `
+// profileFilterCols and profileSortCols map the admin column ids to SQL
+// expressions. Only the name is filterable; keyCount is an aggregate, valid in
+// ORDER BY under GROUP BY. The provider/model/allowed-model columns are
+// resolved in Go and are neither sortable nor filterable server-side.
+var (
+	profileFilterCols = map[string]string{
+		"name": "p.name",
+	}
+	profileSortCols = map[string]string{
+		"id":   "p.id",
+		"name": "p.name",
+		"keys": "COUNT(vk.id)",
+	}
+)
+
+// ListProfilesPaged returns a page of profiles with their key/child counts,
+// default first by default, plus the total before windowing.
+func (s *Store) ListProfilesPaged(ctx context.Context, p ListParams) ([]Profile, int, error) {
+	fconds, fargs, err := buildFilters(p.Filter, profileFilterCols)
+	if err != nil {
+		return nil, 0, err
+	}
+	where := ""
+	if len(fconds) > 0 {
+		where = "WHERE " + strings.Join(fconds, " AND ")
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM profiles p `+where, fargs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	order := " ORDER BY p.is_default DESC, p.name"
+	if p.Sort != "" {
+		o, err := buildOrder(p, profileSortCols, "name", "asc", "p.name")
+		if err != nil {
+			return nil, 0, err
+		}
+		order = o
+	}
+	query := `
 		SELECT p.id, p.name, p.provider_filter, p.model_filter, p.is_default,
 		       COUNT(vk.id)
 		FROM profiles p LEFT JOIN virtual_keys vk ON vk.profile_id = p.id
-		GROUP BY p.id
-		ORDER BY p.is_default DESC, p.name`)
-	if err != nil {
-		return nil, fmt.Errorf("list profiles: %w", err)
+		` + where + `
+		GROUP BY p.id` + order
+	if limit := p.pageLimit(50, 1000); limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		fargs = append(fargs, limit, p.Offset)
 	}
-	defer rows.Close()
+	rows, err := s.db.QueryContext(ctx, query, fargs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list profiles: %w", err)
+	}
 	var out []Profile
 	for rows.Next() {
-		p, err := scanProfile(rows)
+		pr, err := scanProfile(rows)
 		if err != nil {
-			return nil, err
+			rows.Close()
+			return nil, 0, err
 		}
-		out = append(out, p)
+		out = append(out, pr)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		rows.Close()
+		return nil, 0, err
 	}
 	// Close before any further query: the pool holds a single connection.
 	rows.Close()
 	if err := attachParents(ctx, s.db, out); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	counts, err := childCounts(ctx, s.db)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for i := range out {
 		out[i].ChildCount = counts[out[i].ID]
 	}
-	return out, nil
+	return out, total, nil
+}
+
+// ListProfiles returns every profile (no paging), for callers that need the
+// full set.
+func (s *Store) ListProfiles(ctx context.Context) ([]Profile, error) {
+	profiles, _, err := s.ListProfilesPaged(ctx, ListParams{Limit: -1})
+	return profiles, err
 }
 
 // ProfileByName resolves one profile, with its key/child counts and parents.
