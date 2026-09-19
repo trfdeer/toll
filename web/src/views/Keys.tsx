@@ -240,7 +240,7 @@ export default function Keys() {
       name: "",
       right: true,
       width: "180px",
-      cell: (k) => <div className="key-actions">{actionsFor(k)}</div>,
+      cell: (k) => <div className="row-actions">{actionsFor(k)}</div>,
     },
   ];
 
