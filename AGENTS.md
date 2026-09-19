@@ -77,5 +77,5 @@ commits (docs, CI, initial import).
 
 ## Publishing
 
-- Container images are released to **`ghcr.io/trfdeer/toll`** by `.github/workflows/release.yml` (builds `nix build .#image`, loads the docker archive, pushes `:<tag>` + `:latest` on `v*` tags; every push to `main` and every manual run publishes a `snapshot-<sha>` tag only, never `:latest`). The package inherits the repo's visibility until made public on ghcr.
+- Container images are released to **`ghcr.io/trfdeer/toll`** by `.github/workflows/release.yml` (builds `nix build .#image`, loads the docker archive, pushes `:<tag>` + `:latest` on `v*` tags; every push to `main` and every manual run publishes a `snapshot-<sha>` tag and moves the rolling `:dev` tag to it, never `:latest`). The package inherits the repo's visibility until made public on ghcr.
 - The Nix image itself is named plain `toll:<version>`; the registry path is applied in CI, not in `nix/packages.nix`. Images are **linux/amd64 only** (that is a deliberate product decision, not an unfixed gap).

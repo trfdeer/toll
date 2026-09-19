@@ -5,7 +5,7 @@ name: release
 #
 # On a tag push (v*) the tag name is used verbatim and :latest is moved.
 # Every other run (a push to main, manual runs) publishes the commit hash as
-# a snapshot tag only; :latest is never touched.
+# a snapshot tag and moves :dev to it; :latest is never touched.
 
 on:
   push:
@@ -44,6 +44,9 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             docker tag "${loaded}" "${IMAGE}:latest"
             docker push "${IMAGE}:latest"
+          else
+            docker tag "${loaded}" "${IMAGE}:dev"
+            docker push "${IMAGE}:dev"
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
