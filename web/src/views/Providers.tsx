@@ -225,6 +225,7 @@ export default function Providers() {
               data={table.rows}
               noDataComponent="No providers configured."
               persistTableHead
+              storageKey="providers"
               {...serverTableProps(table)}
             />
           </div>

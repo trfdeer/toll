@@ -343,6 +343,7 @@ export default function Profiles() {
               data={table.rows}
               noDataComponent="No profiles yet."
               persistTableHead
+              storageKey="profiles"
               {...serverTableProps(table)}
             />
           </div>

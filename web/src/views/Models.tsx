@@ -348,6 +348,7 @@ export default function Models() {
               data={table.rows}
               noDataComponent="No models registered yet."
               persistTableHead
+              storageKey="models"
               {...serverTableProps(table)}
             />
           </div>

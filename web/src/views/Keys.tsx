@@ -278,6 +278,7 @@ export default function Keys() {
               data={table.rows}
               noDataComponent="No keys yet."
               persistTableHead
+              storageKey="keys"
               {...serverTableProps(table)}
             />
           </div>

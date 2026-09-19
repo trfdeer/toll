@@ -439,6 +439,7 @@ export default function Usage() {
                   columns={summaryColumns}
                   data={summaryTable.rows}
                   noDataComponent="No usage recorded for this filter."
+                  storageKey="usage-summary"
                   {...serverTableProps(summaryTable)}
                 />
               </TabPanel>
@@ -450,6 +451,7 @@ export default function Usage() {
                   noDataComponent="No requests recorded for this filter."
                   highlightOnHover
                   pointerOnHover
+                  storageKey="usage-requests"
                   onRowClicked={(r) => openDetail(r.id)}
                   {...serverTableProps(requestsTable)}
                 />
