@@ -1,0 +1,85 @@
+// Request transcript messages (GET /api/requests, GET /api/requests/{id}).
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+import "toll/admin/v1/common.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+message ListRequestsRequest {
+  UsageFilter filter = 1;
+  ListParams params = 2;
+}
+
+// RequestSummary is one transcript row in the requests table.
+message RequestSummary {
+  int64 id = 1;
+  string conversation_id = 2;
+  // Empty when the virtual key has been deleted; the UI renders the
+  // "(deleted key)" placeholder from the empty value. (Today the SQL
+  // COALESCEs the label server-side; the cutover moves it here. The `key`
+  // column filter matches live key names only — deleted-key rows are
+  // selected via UsageFilter.include_deleted_keys.)
+  string key_name = 3;
+  string gateway_model = 4;
+  // HTTP status the gateway returned to the client.
+  int32 status = 5;
+  int64 prompt_tokens = 6;
+  int64 completion_tokens = 7;
+  int64 cached_tokens = 8;
+  // Absent when pricing was unknown (today's nil cost).
+  optional double cost_usd = 9 [json_name = "costUSD"];
+  google.protobuf.Timestamp created_at = 10;
+  // Absent while the request is still in flight.
+  optional google.protobuf.Duration duration = 11;
+}
+
+message ListRequestsResponse {
+  repeated RequestSummary requests = 1;
+  int64 total = 2;
+}
+
+message GetRequestRequest {
+  int64 id = 1;
+}
+
+// ToolCall is a normalized function call (mirrors admin.toolCall).
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments = 3;
+}
+
+// ChatMessage is one rendered turn of a conversation (mirrors
+// admin.chatMessage; content stays flattened to text server-side).
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+  string reasoning = 3;
+  string name = 4;
+  string tool_call_id = 5;
+  repeated ToolCall tool_calls = 6;
+  string finish_reason = 7;
+}
+
+// RequestDetail is one transcript normalized into a conversation.
+message RequestDetail {
+  int64 id = 1;
+  string conversation_id = 2;
+  string gateway_model = 3;
+  string upstream_model = 4;
+  int32 status = 5;
+  google.protobuf.Timestamp created_at = 6;
+  // Absent while still in flight.
+  optional google.protobuf.Timestamp completed_at = 7;
+  optional google.protobuf.Duration duration = 8;
+  // False when prompt storage is off, so the UI shows a notice instead of an
+  // empty conversation.
+  bool content_stored = 9;
+  repeated ChatMessage messages = 10;
+}

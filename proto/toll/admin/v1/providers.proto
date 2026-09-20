@@ -1,0 +1,70 @@
+// Provider (upstream) management messages.
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+import "toll/admin/v1/common.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+// Provider is one upstream registered with the gateway.
+message Provider {
+  string name = 1;
+  // json_name keeps today's wire spelling (baseURL); proto3's default would
+  // be baseUrl. See admin.proto conventions.
+  string base_url = 2 [json_name = "baseURL"];
+  int32 model_count = 3;
+  bool disabled = 4;
+  bool reachable = 5;
+  string last_error = 6;
+  // Absent until the first sync completes.
+  google.protobuf.Timestamp last_synced_at = 7;
+}
+
+message ListProvidersRequest {
+  // Filter/sort column ids: name, baseURL, modelCount, disabled, reachable,
+  // lastSyncedAt. Default order: registration position (config order), asc.
+  ListParams params = 1;
+}
+
+message ListProvidersResponse {
+  repeated Provider providers = 1;
+  int32 total = 2;
+}
+
+message CreateProviderRequest {
+  string name = 1;
+  string base_url = 2 [json_name = "baseURL"];
+  // Sent over the wire once; stored server-side, never echoed back. Never
+  // log or echo request messages from this service (see admin.proto
+  // conventions).
+  string api_key = 3;
+  // Model discovery refresh interval; absent means the default (300s).
+  google.protobuf.Duration refresh_interval = 4;
+}
+
+message CreateProviderResponse {
+  // The provider as registered, after the best-effort initial catalog sync
+  // (so reachable/last_synced_at/model_count reflect the sync outcome).
+  Provider provider = 1;
+  // Non-empty when the provider was kept but its initial catalog fetch
+  // failed (today's "warning" field).
+  string warning = 2;
+}
+
+// UpdateProvider changes what is editable about a provider today: its
+// disabled toggle. Base URL and key stay immutable (delete and re-create).
+message UpdateProviderRequest {
+  string name = 1;
+  // Absent leaves the toggle alone; this one field replaces the
+  // enable/disable route pair.
+  optional bool disabled = 2;
+}
+
+message DeleteProviderRequest {
+  string name = 1;
+}

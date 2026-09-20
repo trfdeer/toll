@@ -1,0 +1,26 @@
+// Settings and config-export messages.
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+// Settings is the admin-editable runtime settings surface.
+message Settings {
+  // Whether request/response bodies are persisted (content.db).
+  bool store_prompts = 1;
+}
+
+message UpdateSettingsRequest {
+  // Absent leaves the setting unchanged (today's *bool).
+  optional bool store_prompts = 1;
+}
+
+message ExportConfigResponse {
+  // The full toll.yaml document (secrets redacted to api_key_env refs).
+  // Today's endpoint streams it as a Content-Disposition attachment; the
+  // SPA already ignores that header and builds its own Blob download, so
+  // returning the string changes nothing client-side.
+  string yaml = 1;
+}

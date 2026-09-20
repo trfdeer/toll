@@ -29,6 +29,9 @@ Web (`web/` uses **bun** — `bun.lock`, not npm/yarn):
 - `bun run typecheck` (`tsc --noEmit`); `bun run build` runs typecheck then `vite build`.
 - Vite `outDir` is `../internal/admin/web/dist`, i.e. the bundle the Go binary embeds. Run `bun run build` before `go build` to refresh the embedded UI.
 
+Proto (`proto/toll/admin/v1` — the ConnectRPC admin API schema; `buf` via `bunx @bufbuild/buf`):
+- `bunx @bufbuild/buf lint` / `buf build`; `bunx @bufbuild/buf generate` writes Go to `gen/` and TS to `web/src/gen/`. **Generated code is committed** — `go build`, `bun run build` and the Nix packages never run codegen. Regenerate (and commit) whenever a `.proto` changes.
+
 Nix (dendritic flake-parts layout — outputs are auto-imported from `nix/`; add a file there instead of editing `flake.nix`):
 - `nix build .#toll`, `nix build .#web`, `nix build .#image` (image is built by Nix, no Docker daemon: `docker load < result` → local image `toll:<version>`).
 - `nix fmt` formats via nixfmt-tree.
@@ -70,6 +73,7 @@ or operators observe). The scope must come from this list:
 | `api` | `internal/api` — auth + `/v1/models` |
 | `config` | `internal/config` and `examples/toll.yaml` |
 | `web` | `web/` — the admin SPA |
+| `proto` | `proto/`, `gen/`, `web/src/gen/`, `buf.*.yaml` — the ConnectRPC admin API schema and its committed generated code |
 | `nix` | `flake.nix`, `nix/`, CI builds |
 
 Use `cli` for `cmd/toll` and `wire`, `cost`, `keys`, `server` for those packages; omit the

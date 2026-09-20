@@ -1,0 +1,44 @@
+// Usage aggregation messages (GET /api/usage).
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "toll/admin/v1/common.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+message GetUsageRequest {
+  UsageFilter filter = 1;
+  ListParams params = 2;
+}
+
+// Token sums are int64: a busy gateway passes 2^31 tokens (a few thousand
+// USD of spend) well within a reporting window's lifetime.
+
+message UsageRow {
+  string gateway_model = 1;
+  int64 requests = 2;
+  int64 prompt_tokens = 3;
+  int64 cached_tokens = 4;
+  int64 completion_tokens = 5;
+  double cost_usd = 6 [json_name = "costUSD"];
+}
+
+message UsageTotals {
+  int64 requests = 1;
+  int64 prompt_tokens = 2;
+  int64 cached_tokens = 3;
+  int64 completion_tokens = 4;
+  double cost_usd = 5 [json_name = "costUSD"];
+}
+
+message GetUsageResponse {
+  repeated UsageRow rows = 1;
+  // Total number of usage rows (page metadata), not a token sum.
+  int64 total = 2;
+  // Aggregate over the whole filtered set, not just the current page.
+  // (Today's response also carries totalReqs and a pre-formatted
+  // totalCost string; the SPA reads neither, so both are dropped.)
+  UsageTotals totals = 3;
+}

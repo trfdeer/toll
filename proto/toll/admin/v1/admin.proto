@@ -1,0 +1,140 @@
+// The toll admin API: internal/admin's surface as one ConnectRPC service,
+// plus the usage-series/stats surface planned for the charts UI. Each
+// RPC's comment names the HTTP route(s) it replaces. Message definitions
+// live in the per-resource files of this package.
+//
+// Conventions:
+//   - snake_case fields serialize as camelCase JSON by proto3 default. Two
+//     fields keep today's non-default spelling via json_name (costUSD,
+//     baseURL); everything else matches web/src/lib/types.ts as-is.
+//   - Times are google.protobuf.Timestamp (RFC3339 in JSON) and spans are
+//     google.protobuf.Duration ("1.5s" in JSON), replacing today's
+//     timestamp strings and *_ms/_seconds ints.
+//   - int64 fields (ids, token sums, row totals) surface as bigint in
+//     protobuf-es and as JSON strings in proto3 JSON — a deliberate
+//     migration cost over today's `number` typing.
+//   - Creates and updates return the resulting resource; deletes and
+//     no-payload operations return google.protobuf.Empty. (AIP-naming
+//     lint rules would flag some request/response shapes here; that is the
+//     documented scaled-down trade-off, not an oversight to "fix".)
+//   - State toggles are optional fields on the resource's Update, not
+//     verb RPCs: enable/disable, pause/resume and alias set/clear all
+//     collapse into Update{Provider,Model,Key}. Absent means "leave
+//     unchanged". Only genuinely one-way or job-like operations stay as
+//     named methods (RevokeKey, RefreshModels).
+//   - Secrets (Provider.api_key, CreateKey/RotateKey plaintext) ride an
+//     unauthenticated admin surface: never log or echo request/response
+//     messages, and keep /admin bound to a trusted interface as AGENTS.md
+//     requires.
+//   - Errors are Connect codes mapped from the store sentinels:
+//     ErrBadListParam (unknown column/op, bad limit, malformed filter) →
+//     invalid_argument; ErrUpstreamNotFound / ErrModelNotFound /
+//     ErrProfileNotFound / ErrKeyNotFound / ErrTranscriptNotFound →
+//     not_found (note: revoke/pause on unknown keys return 204 silently
+//     today; the store must gain the not-found check); ErrAliasConflict →
+//     already_exists; ErrProfileImmutable / ErrProfileInUse /
+//     ErrProfileInvalid → failed_precondition. No error bodies are
+//     modelled here.
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "google/protobuf/empty.proto";
+
+import "toll/admin/v1/keys.proto";
+import "toll/admin/v1/models.proto";
+import "toll/admin/v1/profiles.proto";
+import "toll/admin/v1/providers.proto";
+import "toll/admin/v1/requests.proto";
+import "toll/admin/v1/settings.proto";
+import "toll/admin/v1/stats.proto";
+import "toll/admin/v1/usage.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+service AdminService {
+  // ---- usage & requests ----
+
+  // GET /api/usage
+  rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+  // GET /api/requests
+  rpc ListRequests(ListRequestsRequest) returns (ListRequestsResponse);
+  // GET /api/requests/{id}
+  rpc GetRequest(GetRequestRequest) returns (RequestDetail);
+
+  // ---- stats (planned charts surface; no route today) ----
+
+  // Time-bucketed usage aggregates with optional group split and
+  // previous-period compare.
+  rpc GetUsageSeries(GetUsageSeriesRequest) returns (GetUsageSeriesResponse);
+  // Server-fed filter dropdown values (distinct models/keys).
+  rpc ListFilterValues(ListFilterValuesRequest) returns (ListFilterValuesResponse);
+
+  // ---- providers (upstreams) ----
+
+  // GET /api/providers
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+  // POST /api/providers
+  rpc CreateProvider(CreateProviderRequest) returns (CreateProviderResponse);
+  // POST /api/providers/{name}/disable + .../enable (via `disabled`)
+  rpc UpdateProvider(UpdateProviderRequest) returns (Provider);
+  // DELETE /api/providers/{name}
+  rpc DeleteProvider(DeleteProviderRequest) returns (google.protobuf.Empty);
+
+  // ---- models ----
+
+  // GET /api/models
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  // POST /api/models/refresh. Synchronous, like today: it fans out one
+  // bounded fetch per provider sequentially. If this ever outgrows client
+  // deadlines, the migration path is a server-streamed
+  // RefreshModels(RefreshModelsRequest) returns (stream RefreshModelsProgress)
+  // — same request message, so that is a v2-only signature change.
+  rpc RefreshModels(RefreshModelsRequest) returns (RefreshModelsResponse);
+  // POST /api/models/{id}/disable + .../enable + PUT .../alias
+  // (via `disabled` / `alias`)
+  rpc UpdateModel(UpdateModelRequest) returns (Model);
+  // DELETE /api/models/{id}
+  rpc DeleteModel(DeleteModelRequest) returns (google.protobuf.Empty);
+
+  // ---- config export ----
+
+  // GET /api/config
+  rpc ExportConfig(google.protobuf.Empty) returns (ExportConfigResponse);
+
+  // ---- settings ----
+
+  // GET /api/settings
+  rpc GetSettings(google.protobuf.Empty) returns (Settings);
+  // PUT /api/settings
+  rpc UpdateSettings(UpdateSettingsRequest) returns (Settings);
+
+  // ---- profiles ----
+
+  // GET /api/profiles
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
+  // POST /api/profiles
+  rpc CreateProfile(CreateProfileRequest) returns (Profile);
+  // PUT /api/profiles/{name}
+  rpc UpdateProfile(UpdateProfileRequest) returns (Profile);
+  // DELETE /api/profiles/{name}
+  rpc DeleteProfile(DeleteProfileRequest) returns (google.protobuf.Empty);
+
+  // ---- virtual keys ----
+
+  // GET /api/keys
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
+  // POST /api/keys (the plaintext secret is returned exactly once)
+  rpc CreateKey(CreateKeyRequest) returns (CreateKeyResponse);
+  // PUT /api/keys/{name} + .../pause + .../resume
+  // (via `new_name` / `profile` / `paused`)
+  rpc UpdateKey(UpdateKeyRequest) returns (VirtualKey);
+  // New (no route today): fresh secret under the same name and profile,
+  // old material dead immediately.
+  rpc RotateKey(RotateKeyRequest) returns (RotateKeyResponse);
+  // POST /api/keys/{name}/revoke (one-way; not an Update field on purpose)
+  rpc RevokeKey(RevokeKeyRequest) returns (google.protobuf.Empty);
+  // DELETE /api/keys/{name}
+  rpc DeleteKey(DeleteKeyRequest) returns (google.protobuf.Empty);
+}

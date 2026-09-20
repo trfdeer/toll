@@ -1,0 +1,128 @@
+// Shared list plumbing: the query surface of every list endpoint (replaces
+// parseListParams in internal/admin and store.ListParams).
+//
+// Conventions for the whole toll.admin.v1 package are documented in
+// admin.proto.
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+// ListParams controls pagination, ordering and per-column filtering of every
+// list endpoint.
+message ListParams {
+  // Absent: the endpoint's default page size (requests: 200; every other
+  // list: 50). 0: every row. n > 0: the page size. Values above 1000 are
+  // rejected with invalid_argument (not clamped), as are negative values.
+  optional int32 limit = 1;
+  int32 offset = 2;
+  // Column id to sort by; each list RPC documents its allowlist and the
+  // server rejects unknown ids with invalid_argument. Empty selects the
+  // endpoint's default order, which may be composite (see ListProfiles).
+  string sort = 3;
+  // Unspecified means the endpoint's default direction.
+  SortDirection dir = 4;
+  // Per-column filter, keyed by column id, ANDed together. An entry whose
+  // conditions are empty is invalid_argument; simply omit the map key to
+  // not filter that column.
+  map<string, ColumnFilter> filter = 5;
+}
+
+// SortDirection is a list ordering.
+enum SortDirection {
+  SORT_DIRECTION_UNSPECIFIED = 0;
+  SORT_DIRECTION_ASC = 1;
+  SORT_DIRECTION_DESC = 2;
+}
+
+// FilterOp is how a condition matches a column's value. Text ops match
+// case-insensitively; numeric ops (GT/GTE/LT/LTE/BETWEEN) compare as REAL,
+// so non-numeric cells never match them.
+enum FilterOp {
+  FILTER_OP_UNSPECIFIED = 0; // treated as IN
+  FILTER_OP_IN = 1;          // equals any of values (OR); "" matches blank/NULL
+  FILTER_OP_CONTAINS = 2;
+  FILTER_OP_NOT_CONTAINS = 3;
+  FILTER_OP_EQUALS = 4;
+  FILTER_OP_NOT_EQUALS = 5;
+  FILTER_OP_STARTS_WITH = 6;
+  FILTER_OP_ENDS_WITH = 7;
+  FILTER_OP_BLANK = 8;
+  FILTER_OP_NOT_BLANK = 9;
+  // Numeric comparisons (the table UI's number/date filter operators;
+  // before/after on timestamps map to LT/GT).
+  FILTER_OP_GT = 10;
+  FILTER_OP_GTE = 11;
+  FILTER_OP_LT = 12;
+  FILTER_OP_LTE = 13;
+  // values[0] and values[1] are the inclusive lower/upper bounds; either
+  // may be empty for unbounded.
+  FILTER_OP_BETWEEN = 14;
+}
+
+// FilterJoin combines a column's multiple conditions.
+enum FilterJoin {
+  FILTER_JOIN_UNSPECIFIED = 0;
+  FILTER_JOIN_AND = 1;
+  FILTER_JOIN_OR = 2;
+}
+
+// ColumnFilter is one column's predicate. Unlike today's flat
+// {op, values} spec, it carries several conditions so the UI's
+// "Contains free AND Contains google" survives the trip to the server.
+//
+// Semantics (all enforced by the server):
+//   - The condition values are ORed within each condition; `join` combines
+//     the conditions. Mixed trees (a AND b OR c) are deliberately not
+//     expressible — this matches the table UI's condition1/AND-OR/
+//     condition2 shape exactly.
+//   - A ColumnFilter with zero conditions is invalid_argument. (Today the
+//     UI's "nothing selected" set filter means match-nothing; send one IN
+//     condition with an empty values list for that.)
+//   - IN with empty values matches no rows; "" as a value matches blank/
+//     NULL cells, mirroring the UI's "(Blanks)" entry.
+//   - Text ops with only blank/whitespace values are invalid_argument.
+//     (Today they are silently dropped, which reads as match-all.)
+//   - More than one condition requires join to be AND or OR. An
+//     unspecified join with 2+ conditions is invalid_argument: proto3 JSON
+//     omits zero-valued enums, so defaulting it would silently flip the
+//     UI's AND into OR.
+message ColumnFilter {
+  message Condition {
+    FilterOp op = 1;
+    repeated string values = 2; // unused by BLANK/NOT_BLANK
+  }
+  repeated Condition conditions = 1;
+  FilterJoin join = 2;
+}
+
+// KeyFilter is a provider/model constraint as stored on profiles
+// (mirrors store.KeyFilter).
+message KeyFilter {
+  enum Mode {
+    MODE_UNSPECIFIED = 0; // treated as NONE
+    MODE_NONE = 1;
+    MODE_INCLUDE = 2;
+    MODE_EXCLUDE = 3;
+  }
+  Mode mode = 1;
+  repeated string values = 2;
+}
+
+// UsageFilter is the from/to/key narrowing shared by usage, requests and
+// the usage-series endpoints.
+message UsageFilter {
+  repeated string keys = 1;
+  // Both bounds are inclusive ([from, to]), matching the store's >= / <=
+  // comparisons; absent means unbounded.
+  google.protobuf.Timestamp from = 2;
+  google.protobuf.Timestamp to = 3;
+  // Include events whose virtual key has been deleted. Replaces today's
+  // reserved key=__deleted__ query-param sentinel (which swallowed any
+  // user-chosen key actually named "__deleted__").
+  bool include_deleted_keys = 4;
+}

@@ -22,7 +22,10 @@
     "noFallthroughCasesInSwitch": true,
     "noImplicitOverride": true,
     "noUncheckedIndexedAccess": true,
-    "erasableSyntaxOnly": true
+    "erasableSyntaxOnly": false
+    // Kept off (not just unset): protobuf-es emits real TypeScript enums in
+    // src/gen, which are non-erasable syntax. Re-enabling this flag breaks
+    // `bun run typecheck` against the generated code.
   },
   "include": ["src", "vite.config.ts"]
 }

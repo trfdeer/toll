@@ -1,0 +1,60 @@
+// Profile messages.
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "toll/admin/v1/common.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+// Profile is a named provider/model filter bundle that keys reference.
+message Profile {
+  string name = 1;
+  KeyFilter provider_filter = 2;
+  KeyFilter model_filter = 3;
+  // Parents of a derived profile; empty for leaves. A profile carries
+  // filters or has parents, never both (the server enforces this XOR).
+  repeated string parents = 4;
+  // Output only: the seeded "All" profile, which is read-only and reserved.
+  bool is_default = 5;
+  // Output only: usage counts backing the delete guard and the UI badges.
+  int32 key_count = 6;
+  int32 child_count = 7;
+}
+
+message ListProfilesRequest {
+  // Filter/sort column ids: name, keyCount, childCount. Default order is
+  // composite: the read-only "All" profile first, then by name asc.
+  ListParams params = 1;
+}
+
+message ListProfilesResponse {
+  repeated Profile profiles = 1;
+  int32 total = 2;
+}
+
+message CreateProfileRequest {
+  string name = 1;
+  KeyFilter provider_filter = 2;
+  KeyFilter model_filter = 3;
+  repeated string parents = 4;
+}
+
+// UpdateProfile edits a profile in place; keys referencing it follow it
+// across renames, as today. Filters and parents are replaced wholesale
+// (absent filters mean mode NONE): the leaf/derived XOR is a constraint on
+// the whole set, so partial updates would be meaningless.
+message UpdateProfileRequest {
+  // The profile's current name (today's path value).
+  string name = 1;
+  // Absent keeps the name; same rename convention as UpdateKey.
+  optional string new_name = 2;
+  KeyFilter provider_filter = 3;
+  KeyFilter model_filter = 4;
+  repeated string parents = 5;
+}
+
+message DeleteProfileRequest {
+  string name = 1;
+}

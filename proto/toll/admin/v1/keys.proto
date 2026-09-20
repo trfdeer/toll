@@ -1,0 +1,80 @@
+// Virtual key messages.
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "toll/admin/v1/common.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+// VirtualKey is a gateway-facing API key. The secret itself never appears
+// here; only CreateKey and RotateKey return it, once each.
+message VirtualKey {
+  string name = 1;
+  // Governing profile's name.
+  string profile = 2;
+  bool revoked = 3;
+  bool paused = 4;
+}
+
+message ListKeysRequest {
+  // Filter/sort column ids: name, profile, revoked, paused.
+  // Default order: name asc.
+  ListParams params = 1;
+}
+
+message ListKeysResponse {
+  repeated VirtualKey keys = 1;
+  int32 total = 2;
+}
+
+message CreateKeyRequest {
+  string name = 1;
+  // Absent or empty selects the seeded "All" profile.
+  optional string profile = 2;
+}
+
+message CreateKeyResponse {
+  // The created key, so the client can insert the row without a refetch.
+  VirtualKey key = 1;
+  // Shown exactly once; only the hash is stored. Never log or echo this
+  // message after delivery (see admin.proto conventions).
+  string plaintext = 2;
+}
+
+// UpdateKey edits a key in place; the key material is unchanged, so clients
+// keep working across every one of these edits. Absent fields are left
+// unchanged — a change from today's PUT, where an omitted profile silently
+// reset the key to "All".
+message UpdateKeyRequest {
+  // The key's current name (today's path value).
+  string name = 1;
+  optional string new_name = 2;
+  // Absent leaves the profile; the empty string resets the key to the
+  // seeded "All" profile.
+  optional string profile = 3;
+  // Replaces the pause/resume route pair. Revocation is deliberately not
+  // settable here: it is one-way (see RevokeKey).
+  optional bool paused = 4;
+}
+
+message RotateKeyRequest {
+  string name = 1;
+}
+
+message RotateKeyResponse {
+  // The key as it stands after rotation (name and profile are unchanged).
+  VirtualKey key = 1;
+  // The new secret, shown exactly once; the old one stops working
+  // immediately.
+  string plaintext = 2;
+}
+
+message RevokeKeyRequest {
+  string name = 1;
+}
+
+message DeleteKeyRequest {
+  string name = 1;
+}

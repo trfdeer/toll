@@ -1,0 +1,81 @@
+// Model registry messages.
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "google/protobuf/struct.proto";
+
+import "toll/admin/v1/common.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+// Model is one registry entry as seen by the admin UI.
+message Model {
+  int64 id = 1;
+  // Discovery upstream name (the key-filter dimension).
+  string upstream = 2;
+  string upstream_model_id = 3;
+  // Resolved gateway-facing ID (alias > alias rule > upstream name/id).
+  string gateway_id = 4;
+  string display_name = 5;
+  // Custom alias, empty when the ID is computed.
+  string alias = 6;
+  // Model metadata as an open object. The well-known member is `pricing`:
+  // per-MTok USD under keys input, output, cache_create, cache_hit
+  // (input+output are required for cost computation; missing rates yield no
+  // cost, never a guess — see internal/cost). NOTE: unlike today's
+  // json.RawMessage passthrough, Struct re-marshals numbers through
+  // float64 (integers > 2^53 lose precision, trailing zeros are not kept).
+  google.protobuf.Struct metadata = 7;
+  bool disabled = 8;
+  // Computed view fields: the owning provider's state.
+  bool provider_disabled = 9;
+  bool provider_reachable = 10;
+}
+
+message ListModelsRequest {
+  // Filter/sort column ids: gatewayId, upstream, upstreamModelId,
+  // displayName, alias, disabled, inputLimit, outputLimit, cost.
+  // Default order: gatewayId asc.
+  ListParams params = 1;
+}
+
+message ListModelsResponse {
+  repeated Model models = 1;
+  int32 total = 2;
+}
+
+// RefreshModelsRequest is empty today; it exists so per-provider scoping
+// can be added without a breaking signature change.
+message RefreshModelsRequest {}
+
+// ProviderWarning is one provider's sync failure.
+message ProviderWarning {
+  string name = 1;
+  string error = 2;
+}
+
+message RefreshModelsResponse {
+  // Providers synced, and the total number of models stored across them
+  // (sum of per-provider counts, as today).
+  int32 providers = 1;
+  int32 models = 2;
+  // Per-provider sync failures; empty on full success. (Structured
+  // replacement for today's "name: reason" strings.)
+  repeated ProviderWarning warnings = 3;
+}
+
+// UpdateModel changes a registry entry's admin-controlled fields.
+message UpdateModelRequest {
+  int64 id = 1;
+  // Absent leaves the toggle alone (replaces enable/disable).
+  optional bool disabled = 2;
+  // Absent leaves the alias alone; the empty string clears it and restores
+  // the computed gateway ID (replaces PUT .../alias).
+  optional string alias = 3;
+}
+
+message DeleteModelRequest {
+  int64 id = 1;
+}

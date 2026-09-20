@@ -1,0 +1,96 @@
+// Usage series / stats messages for the future charts-and-graphs surface.
+//
+// Modeled on the shape a proven gateway admin API uses (aggregate + time
+// buckets + group splits + previous-period compare), but as one typed RPC
+// instead of a family of per-metric endpoints: metric choice is a query
+// (which columns to read), grouping is an enum, and everything the charts
+// need comes back in one response.
+
+syntax = "proto3";
+
+package toll.admin.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+import "toll/admin/v1/common.proto";
+import "toll/admin/v1/usage.proto";
+
+option go_package = "github.com/trfdeer/toll/gen/toll/admin/v1;adminv1";
+
+// SeriesGrouping selects the breakdown dimension of a usage series.
+enum SeriesGrouping {
+  SERIES_GROUPING_UNSPECIFIED = 0; // one ungrouped (total) series
+  SERIES_GROUPING_MODEL = 1;       // by gateway model
+  SERIES_GROUPING_KEY = 2;         // by virtual key (deleted keys grouped
+                                   // under the empty label)
+  SERIES_GROUPING_UPSTREAM = 3;    // by discovery upstream name
+}
+
+message GetUsageSeriesRequest {
+  // Same narrowing as the usage/requests tables, so a chart can share the
+  // page's filter state verbatim.
+  UsageFilter filter = 1;
+  // Bucket width; the server clamps to a sane range (e.g. 1m..30d) and
+  // buckets align to UTC multiples of it.
+  google.protobuf.Duration bucket_size = 2;
+  SeriesGrouping group_by = 3;
+  // Keep only the N series with the highest total cost and roll the rest
+  // into a trailing "Other" series (stacked charts want a bounded series
+  // count). Absent or 0 means all groups.
+  optional int32 top_groups = 4;
+  // Also return the same-shaped series and totals for the immediately
+  // preceding window of equal length, for period-over-period deltas.
+  bool compare_to_previous = 5;
+}
+
+// UsageSeriesPoint is one time bucket of aggregated usage.
+message UsageSeriesPoint {
+  // Bucket start, UTC-aligned to bucket_size.
+  google.protobuf.Timestamp bucket_start = 1;
+  int64 requests = 2;
+  int64 prompt_tokens = 3;
+  int64 completion_tokens = 4;
+  int64 cached_tokens = 5;
+  // Reasoning tokens are recorded per event but absent from the usage
+  // table today; the series exposes them for charting.
+  int64 reasoning_tokens = 6;
+  double cost_usd = 7 [json_name = "costUSD"];
+}
+
+// UsageSeries is one line/stack of the chart.
+message UsageSeries {
+  // Group value (model id, key name, upstream name); empty for the single
+  // ungrouped series, "Other" for the top_groups remainder.
+  string label = 1;
+  // Chronological, dense: empty buckets are included with zero values so
+  // clients plot without gap-filling.
+  repeated UsageSeriesPoint points = 2;
+}
+
+message GetUsageSeriesResponse {
+  repeated UsageSeries series = 1;
+  // Aggregate over the whole filtered window (matches the chart's sum).
+  UsageTotals totals = 2;
+  // Populated only when compare_to_previous was set.
+  repeated UsageSeries previous_series = 3;
+  UsageTotals previous_totals = 4;
+}
+
+// ListFilterValues feeds the tables' filter dropdowns from the server
+// instead of whatever values happen to be on the current page (the shape
+// a proven gateway UI uses for its set filters).
+message ListFilterValuesRequest {
+  // Column id: "model" (gateway models seen in usage/requests) or "key"
+  // (virtual key names, including deleted ones when requested).
+  string column = 1;
+  // Case-insensitive substring narrowing for type-ahead.
+  string query = 2;
+  // Cap on returned values; absent means the server default (100).
+  optional int32 limit = 3;
+}
+
+message ListFilterValuesResponse {
+  // Distinct values, sorted; truncated at limit.
+  repeated string values = 1;
+}
