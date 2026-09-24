@@ -21,20 +21,15 @@ import {
   type Settings,
 } from "../gen/toll/admin/v1/settings_pb";
 import type {
-  CreateProviderRequest,
-  CreateProviderResponse,
   ColumnFilters,
   FilterOp as UiFilterOp,
   ListQuery,
-  ModelsResponse,
   ProfileRequest,
   ProfilesResponse,
-  ProvidersResponse,
   QueryParams,
   RequestDetail,
   RequestQuery,
   RequestsResponse,
-  RefreshModelsResponse,
   UsageListQuery,
   UsageSummary,
 } from "./types";
@@ -116,53 +111,76 @@ export const getRequests = (params: RequestQuery): Promise<RequestsResponse> =>
 export const getRequest = (id: number): Promise<RequestDetail> =>
   request(`/requests/${encodeURIComponent(id)}`);
 
-export const getProviders = (
-  params?: ListQuery,
-): Promise<ProvidersResponse> =>
-  request(`/providers${qs(listParams(params))}`);
+// ---- providers (ConnectRPC) ----
 
-export const addProvider = (
-  provider: CreateProviderRequest,
-): Promise<CreateProviderResponse> =>
-  request("/providers", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(provider),
-  });
+// The providers table's derived "status" column translates into the schema's
+// disabled/reachable boolean columns (an AND across the two, per value).
+function providersParams(q: ListQuery | undefined): ListParams {
+  const { filters, ...rest } = q ?? {};
+  const { status, ...cols } = filters ?? {};
+  if (status) {
+    for (const v of status.values) {
+      if (v === "disabled") {
+        cols.disabled = { op: "in", values: ["true"] };
+      } else if (v === "active") {
+        cols.disabled = { op: "in", values: ["false"] };
+        cols.reachable = { op: "in", values: ["true"] };
+      } else if (v === "unreachable") {
+        cols.disabled = { op: "in", values: ["false"] };
+        cols.reachable = { op: "in", values: ["false"] };
+      }
+    }
+  }
+  return listParamsProto({ ...rest, filters: cols });
+}
 
-export const deleteProvider = (name: string): Promise<void> =>
-  request(`/providers/${encodeURIComponent(name)}`, { method: "DELETE" });
+export const getProviders = async (params?: ListQuery) => {
+  const res = await admin.listProviders({ params: providersParams(params) });
+  return { providers: res.providers, total: res.total };
+};
 
-export const disableProvider = (name: string): Promise<void> =>
-  request(`/providers/${encodeURIComponent(name)}/disable`, { method: "POST" });
+// addProvider registers an upstream and returns it after the best-effort
+// initial catalog sync, with a warning when that fetch failed.
+export const addProvider = (provider: {
+  name: string;
+  baseURL: string;
+  apiKey: string;
+}) => admin.createProvider({ ...provider });
 
-export const enableProvider = (name: string): Promise<void> =>
-  request(`/providers/${encodeURIComponent(name)}/enable`, { method: "POST" });
+// updateProvider toggles a provider; base URL and key stay immutable.
+export const updateProvider = (name: string, disabled: boolean) =>
+  admin.updateProvider({ name, disabled });
 
-export const getModels = (params?: ListQuery): Promise<ModelsResponse> =>
-  request(`/models${qs(listParams(params))}`);
+export const deleteProvider = (name: string) =>
+  admin.deleteProvider({ name });
 
-// refreshModels forces every provider's catalog to be re-pulled server-side.
-export const refreshModels = (): Promise<RefreshModelsResponse> =>
-  request("/models/refresh", { method: "POST" });
+// ---- models (ConnectRPC) ----
 
-export const deleteModel = (id: number): Promise<void> =>
-  request(`/models/${encodeURIComponent(id)}`, { method: "DELETE" });
+export const getModels = async (params?: ListQuery) => {
+  const res = await admin.listModels({ params: listParamsProto(params) });
+  return { models: res.models, total: res.total };
+};
 
-export const disableModel = (id: number): Promise<void> =>
-  request(`/models/${encodeURIComponent(id)}/disable`, { method: "POST" });
+// refreshModels forces every provider's catalog to be re-pulled server-side;
+// per-provider failures come back as structured warnings.
+export const refreshModels = async () => {
+  const res = await admin.refreshModels({});
+  return {
+    providers: res.providers,
+    models: res.models,
+    warnings: res.warnings.map((w) => `${w.name}: ${w.error}`),
+  };
+};
 
-export const enableModel = (id: number): Promise<void> =>
-  request(`/models/${encodeURIComponent(id)}/enable`, { method: "POST" });
+// deleteModel removes one registry entry; ids are the schema's int64 (bigint).
+export const deleteModel = (id: bigint) => admin.deleteModel({ id });
 
-// setModelAlias sets or clears a model's custom gateway ID; an empty alias
-// restores the computed one.
-export const setModelAlias = (id: number, alias: string): Promise<void> =>
-  request(`/models/${encodeURIComponent(id)}/alias`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ alias }),
-  });
+// updateModel toggles a model and/or sets its custom gateway ID (an empty
+// alias restores the computed one); absent fields are left unchanged.
+export const updateModel = (
+  id: bigint,
+  update: { disabled?: boolean; alias?: string },
+) => admin.updateModel({ id, ...update });
 
 // ---- settings (ConnectRPC) ----
 

@@ -509,6 +509,24 @@ func (s *Store) ListModels(ctx context.Context) ([]ModelRow, error) {
 	return rows, err
 }
 
+// ModelByID resolves one registry entry by id, with provider state.
+func (s *Store) ModelByID(ctx context.Context, id int64) (ModelRow, error) {
+	var m ModelRow
+	err := s.db.QueryRowContext(ctx, `
+		SELECT m.id, m.upstream_name, m.upstream_model_id, m.gateway_id, m.display_name, m.metadata,
+		       m.disabled, m.upstream_disabled, m.upstream_reachable, m.alias
+		FROM model_search m WHERE m.id = ?`, id).
+		Scan(&m.ID, &m.UpstreamName, &m.UpstreamModelID, &m.GatewayID, &m.DisplayName, &m.Metadata,
+			&m.Disabled, &m.UpstreamDisabled, &m.UpstreamReachable, &m.Alias)
+	if errors.Is(err, sql.ErrNoRows) {
+		return m, ErrModelNotFound
+	}
+	if err != nil {
+		return m, fmt.Errorf("lookup model %d: %w", id, err)
+	}
+	return m, nil
+}
+
 // UpstreamRow is one upstream with registry counts and sync status, for the
 // admin UI.
 type UpstreamRow struct {

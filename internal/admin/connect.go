@@ -7,12 +7,17 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	adminv1 "github.com/trfdeer/toll/gen/toll/admin/v1"
 	adminv1connect "github.com/trfdeer/toll/gen/toll/admin/v1/adminv1connect"
@@ -179,6 +184,230 @@ func (s *connectService) RevokeKey(ctx context.Context, req *connect.Request[adm
 // DeleteKey removes a key and detaches its usage history.
 func (s *connectService) DeleteKey(ctx context.Context, req *connect.Request[adminv1.DeleteKeyRequest]) (*connect.Response[emptypb.Empty], error) {
 	if err := s.store.DeleteVirtualKey(ctx, req.Msg.GetName()); err != nil {
+		return nil, s.connectError(err, "delete failed")
+	}
+	return connect.NewResponse(&emptypb.Empty{}), nil
+}
+
+// ---- providers & models ----
+
+// providerProto maps an upstream row onto its proto shape.
+func providerProto(u store.UpstreamRow) *adminv1.Provider {
+	var synced *timestamppb.Timestamp
+	if u.LastSyncedAt != "" {
+		if t, err := time.Parse(time.RFC3339, u.LastSyncedAt); err == nil {
+			synced = timestamppb.New(t)
+		}
+	}
+	return &adminv1.Provider{
+		Name:         u.Name,
+		BaseUrl:      u.BaseURL,
+		ModelCount:   int32(u.ModelCount),
+		Disabled:     u.Disabled,
+		Reachable:    u.Reachable,
+		LastError:    u.LastError,
+		LastSyncedAt: synced,
+	}
+}
+
+// upstreamByName reads one upstream row back, for responses that must reflect
+// the state after a mutation.
+func (s *connectService) upstreamByName(ctx context.Context, name string) (store.UpstreamRow, error) {
+	ups, err := s.store.ListUpstreams(ctx)
+	if err != nil {
+		return store.UpstreamRow{}, err
+	}
+	for _, u := range ups {
+		if u.Name == name {
+			return u, nil
+		}
+	}
+	return store.UpstreamRow{}, store.ErrUpstreamNotFound
+}
+
+// modelProto maps a registry row onto its proto shape. The metadata JSON blob
+// re-marshals through google.protobuf.Struct, so integers above 2^53 lose
+// precision (documented in models.proto).
+func modelProto(m store.ModelRow) (*adminv1.Model, error) {
+	meta := &structpb.Struct{}
+	if m.Metadata != "" {
+		var v map[string]any
+		if err := json.Unmarshal([]byte(m.Metadata), &v); err == nil {
+			if s, err := structpb.NewStruct(v); err == nil {
+				meta = s
+			}
+		}
+	}
+	return &adminv1.Model{
+		Id:                m.ID,
+		Upstream:          m.UpstreamName,
+		UpstreamModelId:   m.UpstreamModelID,
+		GatewayId:         m.GatewayID,
+		DisplayName:       m.DisplayName,
+		Alias:             m.Alias,
+		Metadata:          meta,
+		Disabled:          m.Disabled,
+		ProviderDisabled:  m.UpstreamDisabled,
+		ProviderReachable: m.UpstreamReachable,
+	}, nil
+}
+
+// ListProviders returns a page of configured upstreams in registration order.
+func (s *connectService) ListProviders(ctx context.Context, req *connect.Request[adminv1.ListProvidersRequest]) (*connect.Response[adminv1.ListProvidersResponse], error) {
+	p, err := listParamsFromProto(req.Msg.GetParams())
+	if err != nil {
+		return nil, s.connectError(err, "registry unavailable")
+	}
+	ups, total, err := s.store.ListUpstreamsPaged(ctx, p)
+	if err != nil {
+		return nil, s.connectError(err, "registry unavailable")
+	}
+	out := make([]*adminv1.Provider, 0, len(ups))
+	for _, u := range ups {
+		out = append(out, providerProto(u))
+	}
+	return connect.NewResponse(&adminv1.ListProvidersResponse{Providers: out, Total: int32(total)}), nil
+}
+
+// CreateProvider registers an upstream and pulls its model catalog
+// best-effort, so the returned provider already reflects the sync outcome
+// (reachable/last_synced_at/model_count).
+func (s *connectService) CreateProvider(ctx context.Context, req *connect.Request[adminv1.CreateProviderRequest]) (*connect.Response[adminv1.CreateProviderResponse], error) {
+	name := strings.TrimSpace(req.Msg.GetName())
+	baseURL := strings.TrimSpace(req.Msg.GetBaseUrl())
+	if name == "" || baseURL == "" || req.Msg.GetApiKey() == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument,
+			errors.New("name, baseURL and apiKey are required"))
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, connect.NewError(connect.CodeInvalidArgument,
+			errors.New("baseURL must be an http(s) URL"))
+	}
+	refresh := int(req.Msg.GetRefreshInterval().GetSeconds())
+	if refresh <= 0 {
+		refresh = 300
+	}
+	position, err := s.store.NextUpstreamPosition(ctx)
+	if err != nil {
+		return nil, s.connectError(err, "could not add provider")
+	}
+	id, err := s.store.UpsertUpstream(ctx, name, baseURL, req.Msg.GetApiKey(), refresh, position)
+	if err != nil {
+		return nil, s.connectError(err, "could not add provider")
+	}
+
+	_, warning := s.syncProvider(ctx, name, baseURL, req.Msg.GetApiKey(), id)
+	row, err := s.upstreamByName(ctx, name)
+	if err != nil {
+		return nil, s.connectError(err, "could not add provider")
+	}
+	return connect.NewResponse(&adminv1.CreateProviderResponse{
+		Provider: providerProto(row),
+		Warning:  warning,
+	}), nil
+}
+
+// UpdateProvider changes a provider's disabled toggle; the base URL and key
+// stay immutable (delete and re-create).
+func (s *connectService) UpdateProvider(ctx context.Context, req *connect.Request[adminv1.UpdateProviderRequest]) (*connect.Response[adminv1.Provider], error) {
+	if req.Msg.Disabled != nil {
+		if err := s.store.SetUpstreamDisabled(ctx, req.Msg.GetName(), *req.Msg.Disabled); err != nil {
+			return nil, s.connectError(err, "update failed")
+		}
+	}
+	u, err := s.upstreamByName(ctx, req.Msg.GetName())
+	if err != nil {
+		return nil, s.connectError(err, "update failed")
+	}
+	return connect.NewResponse(providerProto(u)), nil
+}
+
+// DeleteProvider removes an upstream and its models.
+func (s *connectService) DeleteProvider(ctx context.Context, req *connect.Request[adminv1.DeleteProviderRequest]) (*connect.Response[emptypb.Empty], error) {
+	if err := s.store.DeleteUpstream(ctx, req.Msg.GetName()); err != nil {
+		return nil, s.connectError(err, "delete failed")
+	}
+	return connect.NewResponse(&emptypb.Empty{}), nil
+}
+
+// ListModels returns a page of registry entries with provider state.
+func (s *connectService) ListModels(ctx context.Context, req *connect.Request[adminv1.ListModelsRequest]) (*connect.Response[adminv1.ListModelsResponse], error) {
+	p, err := listParamsFromProto(req.Msg.GetParams())
+	if err != nil {
+		return nil, s.connectError(err, "models unavailable")
+	}
+	ms, total, err := s.store.ListModelsPaged(ctx, p)
+	if err != nil {
+		return nil, s.connectError(err, "models unavailable")
+	}
+	out := make([]*adminv1.Model, 0, len(ms))
+	for _, m := range ms {
+		pm, err := modelProto(m)
+		if err != nil {
+			return nil, s.connectError(err, "models unavailable")
+		}
+		out = append(out, pm)
+	}
+	return connect.NewResponse(&adminv1.ListModelsResponse{Models: out, Total: int32(total)}), nil
+}
+
+// RefreshModels re-pulls every provider's catalog synchronously, reporting
+// per-provider failures without stopping the others.
+func (s *connectService) RefreshModels(ctx context.Context, _ *connect.Request[adminv1.RefreshModelsRequest]) (*connect.Response[adminv1.RefreshModelsResponse], error) {
+	ups, err := s.store.ListUpstreamsForSync(ctx)
+	if err != nil {
+		return nil, s.connectError(err, "refresh failed")
+	}
+	total := 0
+	warnings := make([]*adminv1.ProviderWarning, 0)
+	s.logger.Info("models refresh: starting", "providers", len(ups))
+	for _, u := range ups {
+		n, warning := s.syncProvider(ctx, u.Name, u.BaseURL, u.APIKey, u.ID)
+		total += n
+		if warning != "" {
+			warnings = append(warnings, &adminv1.ProviderWarning{Name: u.Name, Error: warning})
+		}
+	}
+	s.logger.Info("models refresh: done", "providers", len(ups), "models", total, "warnings", len(warnings))
+	for _, w := range warnings {
+		s.logger.Warn("models refresh: provider warning", "warning", w.Name+": "+w.Error)
+	}
+	return connect.NewResponse(&adminv1.RefreshModelsResponse{
+		Providers: int32(len(ups)),
+		Models:    int32(total),
+		Warnings:  warnings,
+	}), nil
+}
+
+// UpdateModel changes a registry entry's disabled toggle and custom alias;
+// absent fields are left unchanged.
+func (s *connectService) UpdateModel(ctx context.Context, req *connect.Request[adminv1.UpdateModelRequest]) (*connect.Response[adminv1.Model], error) {
+	if req.Msg.Disabled != nil {
+		if err := s.store.SetModelDisabled(ctx, req.Msg.GetId(), *req.Msg.Disabled); err != nil {
+			return nil, s.connectError(err, "update failed")
+		}
+	}
+	if req.Msg.Alias != nil {
+		if err := s.store.SetModelAlias(ctx, req.Msg.GetId(), *req.Msg.Alias); err != nil {
+			return nil, s.connectError(err, "update failed")
+		}
+	}
+	m, err := s.store.ModelByID(ctx, req.Msg.GetId())
+	if err != nil {
+		return nil, s.connectError(err, "update failed")
+	}
+	pm, err := modelProto(m)
+	if err != nil {
+		return nil, s.connectError(err, "update failed")
+	}
+	return connect.NewResponse(pm), nil
+}
+
+// DeleteModel removes one registry entry; the next discovery refresh may
+// re-add a model the upstream still reports.
+func (s *connectService) DeleteModel(ctx context.Context, req *connect.Request[adminv1.DeleteModelRequest]) (*connect.Response[emptypb.Empty], error) {
+	if err := s.store.DeleteModel(ctx, req.Msg.GetId()); err != nil {
 		return nil, s.connectError(err, "delete failed")
 	}
 	return connect.NewResponse(&emptypb.Empty{}), nil

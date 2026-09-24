@@ -3,21 +3,12 @@ import { defineConfig } from 'vite';
 import type { Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import type {
-  CreateProviderResponse,
   KeyFilter,
-  Model,
   Profile,
-  Provider,
   RequestDetail,
   RequestRow,
   UsageRow,
 } from './src/lib/types';
-
-interface CreateProviderBody {
-  name?: string;
-  baseURL?: string;
-  apiKey?: string;
-}
 
 interface ProfileBody {
   name?: string;
@@ -179,49 +170,6 @@ function mockApi(): Plugin {
     return { rows: out.slice(p.offset, end), total };
   };
 
-  const modelStatus = (m: Model): string =>
-    m.disabled ? 'disabled' : m.providerDisabled ? 'provider disabled' : !m.providerReachable ? 'unreachable' : 'active';
-  const providerStatus = (p: Provider): string =>
-    p.disabled ? 'disabled' : p.reachable ? 'active' : 'unreachable';
-
-
-  // Metadata-derived model columns, mirroring the model_search view's
-  // json_extract coalesce chains.
-  const metaLookup = (m: Model, path: string): unknown => {
-    let cur: unknown = m.metadata;
-    for (const part of path.split('.')) {
-      if (cur === null || typeof cur !== 'object') return undefined;
-      cur = (cur as Record<string, unknown>)[part];
-    }
-    return cur;
-  };
-  const metaLimit = (m: Model, paths: string[]): number | string => {
-    for (const path of paths) {
-      const v = metaLookup(m, path);
-      if (typeof v === 'number') return v;
-      if (typeof v === 'string' && v.trim() !== '') return v;
-    }
-    return '';
-  };
-  const INPUT_LIMITS = ['max_input_tokens', 'context_window', 'max_model_len', 'context_length', 'max_context_length'];
-  const OUTPUT_LIMITS = ['max_output_tokens', 'max_completion_tokens', 'max_tokens', 'top_provider.max_completion_tokens'];
-  const inputPrice = (m: Model): number | string => {
-    const v = metaLookup(m, 'pricing.input');
-    return typeof v === 'number' ? v : '';
-  };
-
-  const providers: Provider[] = [
-    {
-      name: 'hyper', baseURL: 'http://zeph:9931/v1', modelCount: 3,
-      disabled: false, reachable: true, lastError: '', lastSyncedAt: '2026-09-15T00:00:00.000Z',
-    },
-  ];
-  const models: Model[] = [
-    { id: 1, upstream: 'hyper', upstreamModelId: 'glm-4.6', gatewayId: 'hyper/glm-4.6', displayName: 'GLM 4.6', alias: '', metadata: { max_model_len: 262144, max_output_tokens: 8192 }, disabled: false, providerDisabled: false, providerReachable: true },
-    { id: 2, upstream: 'hyper', upstreamModelId: 'glm-4.5-air', gatewayId: 'hyper/glm-4.5-air', displayName: 'GLM 4.5 Air', alias: '', metadata: { context_window: 128000 }, disabled: false, providerDisabled: false, providerReachable: true },
-    { id: 3, upstream: 'hyper', upstreamModelId: 'deepseek-v3', gatewayId: 'hyper/deepseek-v3', displayName: 'DeepSeek V3', alias: '', metadata: {}, disabled: true, providerDisabled: false, providerReachable: true },
-  ];
-
   const requestDetails: Record<number, RequestDetail> = {
     1: {
       id: 1, conversationId: 'conv-001', gatewayModel: 'hyper/hyperbolic-70b',
@@ -283,120 +231,6 @@ function mockApi(): Plugin {
           );
         };
 
-        if (method === 'GET' && path === '/providers') {
-          const p = parseList(params);
-          const r = applyList(
-            providers,
-            p,
-            {
-              name: (x) => x.name,
-              baseURL: (x) => x.baseURL,
-              modelCount: (x) => x.modelCount,
-              status: providerStatus,
-            },
-            { name: (x) => x.name, baseURL: (x) => x.baseURL, status: providerStatus },
-            50,
-          );
-          if (r.error) return json(res, 400, { error: r.error });
-          return json(res, 200, { providers: r.rows, total: r.total });
-        }
-        if (method === 'POST' && path === '/providers') {
-          const body = (await readBody(req)) as CreateProviderBody;
-          if (!body.name || !body.baseURL || !body.apiKey) {
-            return json(res, 422, { error: 'name, baseURL and apiKey are required' });
-          }
-          if (providers.some((p) => p.name === body.name)) {
-            return json(res, 422, { error: 'provider already exists' });
-          }
-          providers.push({
-            name: body.name, baseURL: body.baseURL, modelCount: 0,
-            disabled: false, reachable: false, lastError: 'dev mock', lastSyncedAt: '',
-          });
-          const created: CreateProviderResponse = {
-            name: body.name,
-            baseURL: body.baseURL,
-            modelCount: 0,
-            warning: 'provider added, but its models could not be fetched (dev mock)',
-          };
-          return json(res, 200, created);
-        }
-        if (method === 'POST' && seg[0] === 'providers' && (seg[2] === 'disable' || seg[2] === 'enable')) {
-          const p = providers.find((p) => p.name === decodeURIComponent(seg[1] ?? ''));
-          if (!p) return json(res, 404, { error: 'provider not found' });
-          p.disabled = seg[2] === 'disable';
-          return json(res, 204, null);
-        }
-        if (method === 'DELETE' && seg[0] === 'providers' && seg[1]) {
-          const name = decodeURIComponent(seg[1]);
-          const i = providers.findIndex((p) => p.name === name);
-          if (i < 0) return json(res, 404, { error: 'provider not found' });
-          providers.splice(i, 1);
-          for (let j = models.length - 1; j >= 0; j--) {
-            if (models[j]?.upstream === name) models.splice(j, 1);
-          }
-          return json(res, 204, null);
-        }
-        if (method === 'GET' && path === '/models') {
-          const p = parseList(params);
-          const r = applyList(
-            models,
-            p,
-            {
-              gatewayId: (m) => m.gatewayId,
-              upstream: (m) => m.upstream,
-              displayName: (m) => m.displayName,
-              alias: (m) => m.alias,
-              status: modelStatus,
-              inputLimit: (m) => metaLimit(m, INPUT_LIMITS),
-              outputLimit: (m) => metaLimit(m, OUTPUT_LIMITS),
-              cost: (m) => inputPrice(m),
-            },
-            {
-              gatewayId: (m) => m.gatewayId,
-              upstream: (m) => m.upstream,
-              displayName: (m) => m.displayName,
-              alias: (m) => m.alias,
-              status: modelStatus,
-              inputLimit: (m) => metaLimit(m, INPUT_LIMITS),
-              outputLimit: (m) => metaLimit(m, OUTPUT_LIMITS),
-              cost: (m) => inputPrice(m),
-            },
-            50,
-            (a, b) => a.gatewayId.localeCompare(b.gatewayId),
-          );
-          if (r.error) return json(res, 400, { error: r.error });
-          return json(res, 200, { models: r.rows, total: r.total });
-        }
-        if (method === 'POST' && path === '/models/refresh') {
-          return json(res, 200, { providers: providers.length, models: models.length, warnings: [] });
-        }
-        if (method === 'DELETE' && seg[0] === 'models' && seg[1]) {
-          const id = Number(seg[1]);
-          const i = models.findIndex((m) => m.id === id);
-          if (i < 0) return json(res, 404, { error: 'model not found' });
-          models.splice(i, 1);
-          return json(res, 204, null);
-        }
-        if (method === 'POST' && seg[0] === 'models' && (seg[2] === 'disable' || seg[2] === 'enable')) {
-          const id = Number(seg[1]);
-          const m = models.find((m) => m.id === id);
-          if (!m) return json(res, 404, { error: 'model not found' });
-          m.disabled = seg[2] === 'disable';
-          return json(res, 204, null);
-        }
-        if (method === 'PUT' && seg[0] === 'models' && seg[2] === 'alias') {
-          const id = Number(seg[1]);
-          const m = models.find((m) => m.id === id);
-          if (!m) return json(res, 404, { error: 'model not found' });
-          const body = (await readBody(req)) as { alias?: string };
-          const alias = (body.alias ?? '').trim();
-          if (alias && models.some((x) => x.id !== id && x.gatewayId === alias)) {
-            return json(res, 422, { error: 'alias is already another model gateway ID' });
-          }
-          m.alias = alias;
-          m.gatewayId = alias || `${m.upstream}/${m.upstreamModelId}`;
-          return json(res, 204, null);
-        }
         if (method === 'GET' && path === '/usage') {
           const rows: Array<UsageRow & { createdAt: string }> = [
             {

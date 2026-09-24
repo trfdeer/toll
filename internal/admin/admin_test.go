@@ -13,8 +13,11 @@ import (
 	"time"
 
 	"github.com/charmbracelet/log"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"gopkg.in/yaml.v3"
 
+	adminv1 "github.com/trfdeer/toll/gen/toll/admin/v1"
 	"github.com/trfdeer/toll/internal/config"
 	"github.com/trfdeer/toll/internal/store"
 )
@@ -38,46 +41,22 @@ func TestProvidersAndUsage(t *testing.T) {
 		UpstreamModelID: "glm", GatewayID: "hyper/glm", DisplayName: "glm", Metadata: []byte(`{}`),
 	}})
 
+	var ups adminv1.ListProvidersResponse
+	rpcOK(t, h, "ListProviders", `{}`, &ups)
+	if ups.GetTotal() != 1 || len(ups.GetProviders()) != 1 ||
+		ups.GetProviders()[0].GetName() != "hyper" ||
+		ups.GetProviders()[0].GetBaseUrl() != "https://x/v1" ||
+		ups.GetProviders()[0].GetModelCount() != 1 {
+		t.Errorf("unexpected providers: %s", protojson.Format(&ups))
+	}
+
+	var models adminv1.ListModelsResponse
+	rpcOK(t, h, "ListModels", `{}`, &models)
+	if len(models.GetModels()) != 1 || models.GetModels()[0].GetGatewayId() != "hyper/glm" {
+		t.Errorf("unexpected models: %s", protojson.Format(&models))
+	}
+
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/providers", nil))
-	if rec.Code != 200 {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-	}
-	var upsBody struct {
-		Providers []struct {
-			Name       string `json:"name"`
-			BaseURL    string `json:"baseURL"`
-			ModelCount int    `json:"modelCount"`
-		} `json:"providers"`
-		Total int `json:"total"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &upsBody); err != nil {
-		t.Fatal(err)
-	}
-	ups := upsBody.Providers
-	if upsBody.Total != 1 || len(ups) != 1 || ups[0].Name != "hyper" || ups[0].BaseURL != "https://x/v1" || ups[0].ModelCount != 1 {
-		t.Errorf("unexpected providers: %s", rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/models", nil))
-	if rec.Code != 200 {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-	}
-	var modelsBody struct {
-		Models []struct {
-			GatewayID string `json:"gatewayId"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &modelsBody); err != nil {
-		t.Fatal(err)
-	}
-	models := modelsBody.Models
-	if len(models) != 1 || models[0].GatewayID != "hyper/glm" {
-		t.Errorf("unexpected models: %s", rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/usage", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
@@ -586,36 +565,25 @@ func TestModelDisableEnable(t *testing.T) {
 
 	list := func() (id int64, disabled bool) {
 		t.Helper()
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/models", nil))
-		var modelsBody struct {
-			Models []struct {
-				ID       int64 `json:"id"`
-				Disabled bool  `json:"disabled"`
-			} `json:"models"`
+		var modelsBody adminv1.ListModelsResponse
+		rpcOK(t, h, "ListModels", `{}`, &modelsBody)
+		if len(modelsBody.GetModels()) != 1 {
+			t.Fatalf("models = %d, want 1", len(modelsBody.GetModels()))
 		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &modelsBody); err != nil {
-			t.Fatal(err)
-		}
-		models := modelsBody.Models
-		if len(models) != 1 {
-			t.Fatalf("models = %d, want 1", len(models))
-		}
-		return models[0].ID, models[0].Disabled
+		m := modelsBody.GetModels()[0]
+		return m.GetId(), m.GetDisabled()
 	}
-	post := func(suffix string) int {
+	setDisabled := func(id int64, disabled bool) {
 		t.Helper()
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/models/"+strconv.FormatInt(modelID, 10)+suffix, nil))
-		return rec.Code
+		body := `{"id":` + strconv.FormatInt(id, 10) + `,"disabled":` + strconv.FormatBool(disabled) + `}`
+		var m adminv1.Model
+		rpcOK(t, h, "UpdateModel", body, &m)
 	}
 
 	if _, disabled := list(); disabled {
 		t.Fatal("model should start enabled")
 	}
-	if code := post("/disable"); code != http.StatusNoContent {
-		t.Fatalf("disable status = %d", code)
-	}
+	setDisabled(modelID, true)
 	if _, disabled := list(); !disabled {
 		t.Fatal("model should be disabled")
 	}
@@ -636,9 +604,7 @@ func TestModelDisableEnable(t *testing.T) {
 		t.Fatalf("export did not flag disabled model: %s", body)
 	}
 
-	if code := post("/enable"); code != http.StatusNoContent {
-		t.Fatalf("enable status = %d", code)
-	}
+	setDisabled(modelID, false)
 	if _, disabled := list(); disabled {
 		t.Fatal("model should be enabled again")
 	}
@@ -649,12 +615,8 @@ func TestModelDisableEnable(t *testing.T) {
 		t.Errorf("enabled model should omit disabled:\n%s", body)
 	}
 
-	// Unknown id → 404.
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/models/9999/disable", nil))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("unknown id status = %d, want 404", rec.Code)
-	}
+	// Unknown id → not_found.
+	rpcFail(t, h, "UpdateModel", `{"id": 9999, "disabled": true}`, http.StatusNotFound, "not_found")
 }
 
 func TestProvidersCreateAndDelete(t *testing.T) {
@@ -676,79 +638,38 @@ func TestProvidersCreateAndDelete(t *testing.T) {
 	defer up.Close()
 
 	body := `{"name":"hyper","baseURL":"` + up.URL + `/v1","apiKey":"secret"}`
-	req := httptest.NewRequest("POST", "/api/providers", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Fatalf("create status = %d: %s", rec.Code, rec.Body.String())
-	}
-	var created struct {
-		ModelCount int    `json:"modelCount"`
-		Warning    string `json:"warning"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
-		t.Fatal(err)
-	}
-	if created.ModelCount != 2 || created.Warning != "" {
-		t.Errorf("create response = %s", rec.Body.String())
+	var created adminv1.CreateProviderResponse
+	rpcOK(t, h, "CreateProvider", body, &created)
+	if created.GetProvider().GetModelCount() != 2 || created.GetWarning() != "" ||
+		!created.GetProvider().GetReachable() || created.GetProvider().GetLastSyncedAt() == nil {
+		t.Errorf("create response = %s", protojson.Format(&created))
 	}
 
 	// Models carry their upstream linkage and an id for deletion.
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/models", nil))
-	var modelsBody struct {
-		Models []struct {
-			ID            int64  `json:"id"`
-			Upstream      string `json:"upstream"`
-			GatewayID     string `json:"gatewayId"`
-			UpstreamModel string `json:"upstreamModelId"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &modelsBody); err != nil {
-		t.Fatal(err)
-	}
-	models := modelsBody.Models
-	if len(models) != 2 || models[0].Upstream != "hyper" {
-		t.Fatalf("unexpected models: %s", rec.Body.String())
+	var modelsBody adminv1.ListModelsResponse
+	rpcOK(t, h, "ListModels", `{}`, &modelsBody)
+	models := modelsBody.GetModels()
+	if len(models) != 2 || models[0].GetUpstream() != "hyper" {
+		t.Fatalf("unexpected models: %s", protojson.Format(&modelsBody))
 	}
 
 	// Delete one model.
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("DELETE", "/api/models/"+strconv.FormatInt(models[0].ID, 10), nil))
-	if rec.Code != 204 {
-		t.Fatalf("delete model status = %d: %s", rec.Code, rec.Body.String())
-	}
-	// Deleting again → 404.
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("DELETE", "/api/models/"+strconv.FormatInt(models[0].ID, 10), nil))
-	if rec.Code != 404 {
-		t.Fatalf("second delete status = %d, want 404", rec.Code)
-	}
+	delID := strconv.FormatInt(models[0].GetId(), 10)
+	rpcOK(t, h, "DeleteModel", `{"id":`+delID+`}`, new(emptypb.Empty))
+	// Deleting again → not_found.
+	rpcFail(t, h, "DeleteModel", `{"id":`+delID+`}`, http.StatusNotFound, "not_found")
 
 	// Delete the provider (and its remaining model via cascade).
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("DELETE", "/api/providers/hyper", nil))
-	if rec.Code != 204 {
-		t.Fatalf("delete provider status = %d: %s", rec.Code, rec.Body.String())
+	rpcOK(t, h, "DeleteProvider", `{"name":"hyper"}`, new(emptypb.Empty))
+	var providersBody adminv1.ListProvidersResponse
+	rpcOK(t, h, "ListProviders", `{}`, &providersBody)
+	if len(providersBody.GetProviders()) != 0 {
+		t.Errorf("providers remain after delete: %s", protojson.Format(&providersBody))
 	}
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/providers", nil))
-	var providersBody struct {
-		Providers []json.RawMessage `json:"providers"`
-	}
-	json.Unmarshal(rec.Body.Bytes(), &providersBody)
-	if len(providersBody.Providers) != 0 {
-		t.Errorf("providers remain after delete: %s", rec.Body.String())
-	}
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/models", nil))
-	var remainingBody struct {
-		Models []json.RawMessage `json:"models"`
-	}
-	json.Unmarshal(rec.Body.Bytes(), &remainingBody)
-	if len(remainingBody.Models) != 0 {
-		t.Errorf("models remain after provider delete: %s", rec.Body.String())
+	var remainingBody adminv1.ListModelsResponse
+	rpcOK(t, h, "ListModels", `{}`, &remainingBody)
+	if len(remainingBody.GetModels()) != 0 {
+		t.Errorf("models remain after provider delete: %s", protojson.Format(&remainingBody))
 	}
 }
 
@@ -759,13 +680,11 @@ func TestProviderCreateValidation(t *testing.T) {
 		"missing fields": `{"name":"x"}`,
 		"bad url":        `{"name":"x","baseURL":"ftp://x/v1","apiKey":"k"}`,
 	} {
-		req := httptest.NewRequest("POST", "/api/providers", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnprocessableEntity {
-			t.Errorf("%s: status = %d, want 422", name, rec.Code)
+		rec := rpc(t, h, "CreateProvider", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", name, rec.Code)
 		}
+		wantConnectCode(t, rec, "invalid_argument")
 	}
 }
 
@@ -789,10 +708,10 @@ func TestModelsRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/models/refresh", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("refresh status = %d: %s", rec.Code, rec.Body.String())
+	var res adminv1.RefreshModelsResponse
+	rpcOK(t, h, "RefreshModels", `{}`, &res)
+	if res.GetProviders() != 1 || res.GetModels() != 1 || len(res.GetWarnings()) != 0 {
+		t.Fatalf("refresh response = %s", protojson.Format(&res))
 	}
 
 	ms, err := st.ListModels(t.Context())
@@ -810,48 +729,34 @@ func TestProviderDisableEnable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	post := func(path string) int {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("POST", path, nil))
-		return rec.Code
+	setDisabled := func(name string, disabled bool) {
+		t.Helper()
+		body := `{"name":"` + name + `","disabled":` + strconv.FormatBool(disabled) + `}`
+		var p adminv1.Provider
+		rpcOK(t, h, "UpdateProvider", body, &p)
 	}
 
-	if code := post("/api/providers/zeph/disable"); code != http.StatusNoContent {
-		t.Fatalf("disable status = %d, want 204", code)
-	}
+	setDisabled("zeph", true)
 	ups, _ := st.ListUpstreams(t.Context())
 	if len(ups) != 1 || !ups[0].Disabled {
 		t.Fatalf("provider not disabled: %+v", ups)
 	}
 
 	// The providers endpoint surfaces the flag for the UI.
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/providers", nil))
-	var listBody struct {
-		Providers []struct {
-			Name     string `json:"name"`
-			Disabled bool   `json:"disabled"`
-		} `json:"providers"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &listBody); err != nil {
-		t.Fatal(err)
-	}
-	list := listBody.Providers
-	if len(list) != 1 || !list[0].Disabled {
-		t.Errorf("providers response missing disabled: %s", rec.Body.String())
+	var listBody adminv1.ListProvidersResponse
+	rpcOK(t, h, "ListProviders", `{}`, &listBody)
+	list := listBody.GetProviders()
+	if len(list) != 1 || !list[0].GetDisabled() {
+		t.Errorf("providers response missing disabled: %s", protojson.Format(&listBody))
 	}
 
-	if code := post("/api/providers/zeph/enable"); code != http.StatusNoContent {
-		t.Fatalf("enable status = %d, want 204", code)
-	}
+	setDisabled("zeph", false)
 	ups, _ = st.ListUpstreams(t.Context())
 	if len(ups) != 1 || ups[0].Disabled {
 		t.Fatalf("provider not re-enabled: %+v", ups)
 	}
 
-	if code := post("/api/providers/missing/disable"); code != http.StatusNotFound {
-		t.Fatalf("unknown provider status = %d, want 404", code)
-	}
+	rpcFail(t, h, "UpdateProvider", `{"name":"missing","disabled":true}`, http.StatusNotFound, "not_found")
 }
 
 func TestSPAServesIndexAndFiles(t *testing.T) {

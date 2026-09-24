@@ -58,6 +58,16 @@ func wantConnectCode(t *testing.T, rec *httptest.ResponseRecorder, want string) 
 	}
 }
 
+// rpcFail asserts the RPC answers the given HTTP status and Connect code.
+func rpcFail(t *testing.T, h http.Handler, procedure, body string, wantStatus int, wantCode string) {
+	t.Helper()
+	rec := rpc(t, h, procedure, body)
+	if rec.Code != wantStatus {
+		t.Fatalf("%s = %d, want %d: %s", procedure, rec.Code, wantStatus, rec.Body.String())
+	}
+	wantConnectCode(t, rec, wantCode)
+}
+
 func TestConnectKeysLifecycle(t *testing.T) {
 	st, h := setup(t)
 	ctx := t.Context()
@@ -242,9 +252,9 @@ func TestConnectListKeysParams(t *testing.T) {
 func TestConnectUnmigratedRPCs(t *testing.T) {
 	_, h := setup(t)
 
-	rec := rpc(t, h, "ListProviders", `{}`)
+	rec := rpc(t, h, "ListProfiles", `{}`)
 	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("ListProviders = %d, want 501: %s", rec.Code, rec.Body.String())
+		t.Fatalf("ListProfiles = %d, want 501: %s", rec.Code, rec.Body.String())
 	}
 	wantConnectCode(t, rec, "unimplemented")
 

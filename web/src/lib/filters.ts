@@ -1,4 +1,5 @@
-import type { KeyFilter, Model, Profile } from "./types";
+import type { KeyFilter, Profile } from "./types";
+import type { Model } from "../gen/toll/admin/v1/models_pb";
 
 // The neutral filter: no constraint on the dimension.
 export const EMPTY_FILTER: KeyFilter = { mode: "none", values: [] };
@@ -62,7 +63,7 @@ export function profileAllowedModels(
   if (seen.has(profile.name)) return [];
   seen.add(profile.name);
   if (profile.parents.length > 0) {
-    const out = new Map<number, Model>();
+    const out = new Map<bigint, Model>();
     for (const parent of profile.parents) {
       const p = byName.get(parent);
       if (!p) continue;

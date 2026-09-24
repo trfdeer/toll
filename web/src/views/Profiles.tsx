@@ -32,7 +32,8 @@ import {
   profileAllowedModels,
   summarizeFilter,
 } from "../lib/filters";
-import type { KeyFilter, Model, Profile } from "../lib/types";
+import type { KeyFilter, Profile } from "../lib/types";
+import type { Model } from "../gen/toll/admin/v1/models_pb";
 import {
   serverTableProps,
   useServerRows,

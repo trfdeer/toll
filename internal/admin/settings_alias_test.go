@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
-	"strings"
 	"testing"
 
 	adminv1 "github.com/trfdeer/toll/gen/toll/admin/v1"
@@ -121,58 +120,36 @@ func TestModelAliasEndpoint(t *testing.T) {
 		{UpstreamModelID: "other", GatewayID: "hyper/other", DisplayName: "Other", Metadata: []byte(`{}`)},
 	})
 
-	type model struct {
-		ID              int64  `json:"id"`
-		UpstreamModelID string `json:"upstreamModelId"`
-		GatewayID       string `json:"gatewayId"`
-		Alias           string `json:"alias"`
-	}
-	list := func() map[string]model {
+	list := func() map[string]*adminv1.Model {
 		t.Helper()
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/models", nil))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET /api/models = %d: %s", rec.Code, rec.Body.String())
-		}
-		var body struct {
-			Models []model `json:"models"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-			t.Fatal(err)
-		}
-		ms := body.Models
-		out := make(map[string]model, len(ms))
-		for _, m := range ms {
-			out[m.UpstreamModelID] = m
+		var body adminv1.ListModelsResponse
+		rpcOK(t, h, "ListModels", `{}`, &body)
+		out := make(map[string]*adminv1.Model, len(body.GetModels()))
+		for _, m := range body.GetModels() {
+			out[m.GetUpstreamModelId()] = m
 		}
 		return out
 	}
-	put := func(id int64, alias string) int {
+	setAlias := func(id int64, alias string) {
 		t.Helper()
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("PUT", "/api/models/"+strconv.FormatInt(id, 10)+"/alias",
-			strings.NewReader(`{"alias":`+strconv.Quote(alias)+`}`))
-		h.ServeHTTP(rec, req)
-		return rec.Code
+		var m adminv1.Model
+		rpcOK(t, h, "UpdateModel",
+			`{"id":`+strconv.FormatInt(id, 10)+`,"alias":`+strconv.Quote(alias)+`}`, &m)
 	}
 
 	glm := list()["glm"]
-	if code := put(glm.ID, "gpt-4o"); code != http.StatusNoContent {
-		t.Fatalf("set alias status = %d, want 204", code)
-	}
-	if got := list()["glm"]; got.GatewayID != "gpt-4o" || got.Alias != "gpt-4o" {
-		t.Errorf("after set: gatewayId=%q alias=%q", got.GatewayID, got.Alias)
+	setAlias(glm.GetId(), "gpt-4o")
+	if got := list()["glm"]; got.GetGatewayId() != "gpt-4o" || got.GetAlias() != "gpt-4o" {
+		t.Errorf("after set: gatewayId=%q alias=%q", got.GetGatewayId(), got.GetAlias())
 	}
 
 	other := list()["other"]
-	if code := put(other.ID, "gpt-4o"); code != http.StatusUnprocessableEntity {
-		t.Errorf("conflicting alias status = %d, want 422", code)
-	}
+	rpcFail(t, h, "UpdateModel",
+		`{"id":`+strconv.FormatInt(other.GetId(), 10)+`,"alias":"gpt-4o"}`,
+		http.StatusConflict, "already_exists")
 
-	if code := put(glm.ID, ""); code != http.StatusNoContent {
-		t.Fatalf("clear alias status = %d, want 204", code)
-	}
-	if got := list()["glm"]; got.GatewayID != "hyper/glm" || got.Alias != "" {
-		t.Errorf("after clear: gatewayId=%q alias=%q", got.GatewayID, got.Alias)
+	setAlias(glm.GetId(), "")
+	if got := list()["glm"]; got.GetGatewayId() != "hyper/glm" || got.GetAlias() != "" {
+		t.Errorf("after clear: gatewayId=%q alias=%q", got.GetGatewayId(), got.GetAlias())
 	}
 }

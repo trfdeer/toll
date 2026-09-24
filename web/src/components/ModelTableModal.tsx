@@ -2,7 +2,7 @@ import { Modal } from "@carbon/react";
 import type { TableColumn } from "react-data-table-component";
 import { useState } from "react";
 import Table from "./Table";
-import type { Model } from "../lib/types";
+import type { Model } from "../gen/toll/admin/v1/models_pb";
 
 export interface ModelTableModalProps {
   title: string;

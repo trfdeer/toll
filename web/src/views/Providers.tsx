@@ -14,14 +14,13 @@ import { useCallback, useState } from "react";
 import StatusTag, { type Status } from "../components/StatusTag";
 import Table from "../components/Table";
 import {
-  addProvider,
   deleteProvider,
-  disableProvider,
-  enableProvider,
   getProviders,
+  addProvider,
+  updateProvider,
 } from "../lib/api";
 import { errorMessage } from "../lib/errors";
-import type { Provider } from "../lib/types";
+import type { Provider } from "../gen/toll/admin/v1/providers_pb";
 import {
   serverTableProps,
   useServerRows,
@@ -92,7 +91,7 @@ export default function Providers() {
       setFlash(
         res.warning
           ? res.warning
-          : `Added ${res.name} with ${res.modelCount} model(s).`,
+          : `Added ${res.provider?.name} with ${res.provider?.modelCount} model(s).`,
       );
       table.reload();
       setOpen(false);
@@ -114,10 +113,12 @@ export default function Providers() {
     }
   };
 
+  // toggle replaces the enable/disable route pair with an UpdateProvider
+  // patch; the disabled field is always sent.
   const toggle = async (p: Provider) => {
     setError(null);
     try {
-      await (p.disabled ? enableProvider(p.name) : disableProvider(p.name));
+      await updateProvider(p.name, !p.disabled);
       table.reload();
     } catch (err) {
       setError(errorMessage(err));
@@ -135,7 +136,7 @@ export default function Providers() {
     {
       id: "baseURL",
       name: "Base URL",
-      selector: (p) => p.baseURL,
+      selector: (p) => p.baseUrl,
       sortable: true,
       filterable: true,
     },
@@ -150,7 +151,10 @@ export default function Providers() {
       id: "status",
       name: "Status",
       selector: (p) => status(p),
-      sortable: true,
+      // Status is derived from the disabled/reachable columns, which the
+      // schema filters on individually; the API layer translates the set
+      // filter. No single sort column matches the derived status.
+      sortable: false,
       filterable: true,
       filterType: "set",
       filterOptions: { values: STATUS_VALUES },

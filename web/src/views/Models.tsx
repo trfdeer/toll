@@ -15,26 +15,25 @@ import StatusTag, { type Status } from "../components/StatusTag";
 import Table from "../components/Table";
 import {
   deleteModel,
-  disableModel,
-  enableModel,
   getModels,
   refreshModels,
-  setModelAlias,
+  updateModel,
 } from "../lib/api";
 import { errorMessage } from "../lib/errors";
-import type { Model, ModelMetadata } from "../lib/types";
+import type { Model } from "../gen/toll/admin/v1/models_pb";
 import {
   serverTableProps,
   useServerRows,
   type ServerTableQuery,
 } from "../lib/useServerRows";
 
+// Meta loosens the generated metadata object (google.protobuf.Struct) into a
+// plain record for the dotted-path lookups below.
+type Meta = Record<string, unknown> | undefined;
+
 // lookup walks a dotted path into the metadata blob, returning undefined if
 // any step is missing or not an object.
-function lookup(
-  metadata: ModelMetadata | undefined,
-  path: string,
-): unknown {
+function lookup(metadata: Meta, path: string): unknown {
   let cur: unknown = metadata;
   for (const part of path.split(".")) {
     if (cur === null || typeof cur !== "object") return undefined;
@@ -47,10 +46,7 @@ function lookup(
 // works across upstreams that name the same idea differently (vLLM's
 // max_model_len, OpenRouter's context_length, LiteLLM's max_input_tokens, …).
 // Numbers are returned as-is so the column still sorts numerically.
-function limit(
-  metadata: ModelMetadata | undefined,
-  paths: string[],
-): number | string {
+function limit(metadata: Meta, paths: string[]): number | string {
   for (const path of paths) {
     const v = lookup(metadata, path);
     if (typeof v === "number") return v;
@@ -84,11 +80,12 @@ function modelStatus(m: Model): Status {
   return "active";
 }
 
-// cost renders the model's pricing when the upstream provides one.
-function cost(metadata: ModelMetadata | undefined): string {
+// cost renders the model's pricing when the upstream provides one. The
+// well-known pricing member carries per-MTok USD rates.
+function cost(metadata: Meta): string {
   const p = metadata?.pricing;
   if (!p || typeof p !== "object") return "—";
-  const entries = Object.entries(p).filter(
+  const entries = Object.entries(p as Record<string, unknown>).filter(
     ([, v]) => v !== null && v !== "" && v !== 0,
   );
   if (entries.length === 0) return "—";
@@ -98,8 +95,6 @@ function cost(metadata: ModelMetadata | undefined): string {
     )
     .join(", ");
 }
-
-const STATUS_VALUES = ["active", "disabled", "provider disabled", "unreachable"];
 
 export default function Models() {
   const [error, setError] = useState<string | null>(null);
@@ -140,7 +135,7 @@ export default function Models() {
     }
   };
 
-  const remove = async (id: number) => {
+  const remove = async (id: bigint) => {
     setError(null);
     try {
       await deleteModel(id);
@@ -153,7 +148,7 @@ export default function Models() {
   const toggle = async (m: Model) => {
     setError(null);
     try {
-      await (m.disabled ? enableModel(m.id) : disableModel(m.id));
+      await updateModel(m.id, { disabled: !m.disabled });
       table.reload();
     } catch (err) {
       setError(errorMessage(err));
@@ -174,13 +169,13 @@ export default function Models() {
   };
 
   // saveAlias sets or clears the model's custom gateway ID (empty reverts to
-  // the provider-namespaced default).
+  // the provider-namespaced default), riding the UpdateModel patch.
   const saveAlias = async () => {
     if (!editing) return;
     setBusy(true);
     setAliasError(null);
     try {
-      await setModelAlias(editing.id, alias.trim());
+      await updateModel(editing.id, { alias: alias.trim() });
       table.reload();
       setEditing(null);
       setAlias("");
@@ -260,10 +255,10 @@ export default function Models() {
       id: "status",
       name: "Status",
       selector: (m) => modelStatus(m),
-      sortable: true,
-      filterable: true,
-      filterType: "set",
-      filterOptions: { values: STATUS_VALUES },
+      // The derived status has no single schema column (it folds in the
+      // provider's disabled/reachable state), so it is display-only.
+      sortable: false,
+      filterable: false,
       cell: (m) => <StatusTag status={modelStatus(m)} />,
       width: "120px",
       grow: 0,

@@ -1,14 +1,16 @@
 # Admin API → ConnectRPC migration plan
 
 Branch: `feat/admin-connect-migration`.
-Phases 0–3a are done: the schema + committed codegen (0), the mounted
+Phases 0–3b are done: the schema + committed codegen (0), the mounted
 connect handler with the `keys` pilot server-side (1), the SPA flip
-with the keys REST routes and dev mocks deleted (2), and settings +
-config export (3a). The generated TS service descriptors come from
-protoc-gen-es v2 (the connectrpc/es plugin no longer exists in
-connect-es v2). See `proto/README.md` for the deliberate behavior
-changes this plan implements — they are product decisions, not
-transcription choices.
+with the keys REST routes and dev mocks deleted (2), settings + config
+export (3a), and providers + models with the toggle collapse (3b).
+Remaining: 3c (requests/usage + the filter engine), 4 (legacy
+teardown), 5 (new surface), 6 (CI). The generated TS service
+descriptors come from protoc-gen-es v2 (the connectrpc/es plugin no
+longer exists in connect-es v2). See `proto/README.md` for the
+deliberate behavior changes this plan implements — they are product
+decisions, not transcription choices.
 
 Strategy: **strangle, don't flip.** The connect handler and the legacy
 REST mux coexist under `/admin`; each resource cuts over independently
