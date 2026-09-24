@@ -52,8 +52,9 @@ message UsageSeriesPoint {
   int64 prompt_tokens = 3;
   int64 completion_tokens = 4;
   int64 cached_tokens = 5;
-  // Reasoning tokens are recorded per event but absent from the usage
-  // table today; the series exposes them for charting.
+  // Reasoning tokens are recorded per event and the usage table already
+  // carries them; the series exposes them for charting (the summary and
+  // requests surfaces do not).
   int64 reasoning_tokens = 6;
   double cost_usd = 7 [json_name = "costUSD"];
 }

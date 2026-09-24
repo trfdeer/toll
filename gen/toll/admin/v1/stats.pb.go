@@ -179,8 +179,9 @@ type UsageSeriesPoint struct {
 	PromptTokens     int64                  `protobuf:"varint,3,opt,name=prompt_tokens,json=promptTokens,proto3" json:"prompt_tokens,omitempty"`
 	CompletionTokens int64                  `protobuf:"varint,4,opt,name=completion_tokens,json=completionTokens,proto3" json:"completion_tokens,omitempty"`
 	CachedTokens     int64                  `protobuf:"varint,5,opt,name=cached_tokens,json=cachedTokens,proto3" json:"cached_tokens,omitempty"`
-	// Reasoning tokens are recorded per event but absent from the usage
-	// table today; the series exposes them for charting.
+	// Reasoning tokens are recorded per event and the usage table already
+	// carries them; the series exposes them for charting (the summary and
+	// requests surfaces do not).
 	ReasoningTokens int64   `protobuf:"varint,6,opt,name=reasoning_tokens,json=reasoningTokens,proto3" json:"reasoning_tokens,omitempty"`
 	CostUsd         float64 `protobuf:"fixed64,7,opt,name=cost_usd,json=costUSD,proto3" json:"cost_usd,omitempty"`
 	unknownFields   protoimpl.UnknownFields

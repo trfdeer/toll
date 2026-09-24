@@ -1,19 +1,20 @@
 # Admin API → ConnectRPC migration plan
 
 Branch: `feat/admin-connect-migration`.
-Phases 0–5 are done: the schema + committed codegen (0), the mounted
-connect handler with the `keys` pilot server-side (1), the SPA flip
-with the keys REST routes and dev mocks deleted (2), settings + config
-export (3a), providers + models with the toggle collapse (3b),
-requests + usage with the multi-condition filter engine, the
-deleted-keys placeholder and int64 sums (3c), the profiles flip plus
-the full legacy teardown (4) — no REST routes, no server-side fetch
-mock, and `web/src/lib/types.ts` holds only view-local types — and the
-stats surface (5): GetUsageSeries (dense UTC-aligned buckets, group
-breakdowns, top-N "Other" rollup, previous-window compare) backing the
-Usage page's Trend tab (Carbon stacked-area chart), and
-ListFilterValues feeding the key filter dropdown. Remaining: 6 (CI:
-buf lint/build + codegen drift gate). The generated TS service
+All phases are done. 0: the schema + committed codegen. 1: the mounted
+connect handler with the `keys` pilot server-side. 2: the SPA flip with
+the keys REST routes and dev mocks deleted. 3a/3b/3c: settings + config
+export, providers + models with the toggle collapse, and requests +
+usage with the multi-condition filter engine, the deleted-keys
+placeholder and int64 sums. 4: the profiles flip plus the full legacy
+teardown — no REST routes, no server-side fetch mock, and
+`web/src/lib/types.ts` holds only view-local types. 5: the stats
+surface — GetUsageSeries (dense UTC-aligned buckets, group breakdowns,
+top-N "Other" rollup, previous-window compare) backing the Usage
+page's Trend tab (Carbon stacked-area chart), and ListFilterValues
+feeding the key filter dropdown. 6: the CI proto workflow (lint +
+build + generate with a `git diff --exit-code` drift gate); `buf
+breaking` joins once v1 is released. The generated TS service
 descriptors come from protoc-gen-es v2 (the connectrpc/es plugin no
 longer exists in connect-es v2). See `proto/README.md` for the
 deliberate behavior changes this plan implements — they are product

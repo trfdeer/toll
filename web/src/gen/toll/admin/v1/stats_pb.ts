@@ -110,8 +110,9 @@ export type UsageSeriesPoint = Message<"toll.admin.v1.UsageSeriesPoint"> & {
   cachedTokens: bigint;
 
   /**
-   * Reasoning tokens are recorded per event but absent from the usage
-   * table today; the series exposes them for charting.
+   * Reasoning tokens are recorded per event and the usage table already
+   * carries them; the series exposes them for charting (the summary and
+   * requests surfaces do not).
    *
    * @generated from field: int64 reasoning_tokens = 6;
    */

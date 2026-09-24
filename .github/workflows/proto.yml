@@ -1,0 +1,34 @@
+name: proto
+
+# Proto schema checks (proto/MIGRATION.md phase 6). The generated Go and
+# TypeScript under gen/ and web/src/gen is committed — the Go build and the
+# Nix packages never run codegen — so CI regenerates and fails when it has
+# drifted from the schema. buf uses the same bunx entry point as local dev.
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  buf:
+    name: buf lint / build / generate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Lint and build the schema
+        run: |
+          bunx @bufbuild/buf lint
+          bunx @bufbuild/buf build
+      - name: Generate and fail on drift
+        run: |
+          bunx @bufbuild/buf generate
+          git diff --exit-code -- gen web/src/gen
+      # `bunx @bufbuild/buf breaking proto --against .git#branch=main` joins
+      # here once v1 is released: field numbers are forever, but until then
+      # the schema may still move (proto/MIGRATION.md phase 6).
