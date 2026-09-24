@@ -170,6 +170,10 @@ export default function Usage() {
   // names ride the keys list.
   const keys = applied.selectedKeys.filter((k) => k !== DELETED_KEYS);
   const includeDeletedKeys = applied.selectedKeys.includes(DELETED_KEYS);
+  // keysKey is the stable dep form of keys: the filtered array is rebuilt on
+  // every render, and an unstable dep re-runs each query effect every render
+  // — a "maximum update depth" loop the moment Apply actually submits.
+  const keysKey = keys.join("\u0000");
 
   const fetchSummary = (q: ServerTableQuery) =>
     getUsage({ from, to, keys, includeDeletedKeys, ...q }).then((r) => ({
@@ -178,7 +182,7 @@ export default function Usage() {
       meta: r.totals,
     }));
   const summaryTable = useServerRows<SummaryRow, UsageTotals>(fetchSummary, {
-    deps: [from, to, keys],
+    deps: [from, to, keysKey],
     onError: (e) => setError(errorMessage(e)),
   });
 
@@ -188,7 +192,7 @@ export default function Usage() {
       total: r.total,
     }));
   const requestsTable = useServerRows<RequestRow>(fetchRequests, {
-    deps: [from, to, keys],
+    deps: [from, to, keysKey],
     onError: (e) => setError(errorMessage(e)),
   });
 
@@ -281,7 +285,7 @@ export default function Usage() {
     return () => {
       stale = true;
     };
-  }, [from, to, keys, includeDeletedKeys, trendGrouping, trendBucket]);
+  }, [from, to, keysKey, includeDeletedKeys, trendGrouping, trendBucket]);
 
   // Carbon charts take long-format tabular data: one row per series point.
   const trendData = useMemo(() => {
@@ -442,12 +446,18 @@ export default function Usage() {
                     size="sm"
                     labelText="From"
                     placeholder="yyyy-mm-dd"
+                    // Carbon's default input pattern is its m/d/Y locale
+                    // format; with dateFormat="Y-m-d" it never matches, so
+                    // the form is permanently invalid and Apply can never
+                    // submit. Pin the pattern to the actual format.
+                    pattern={String.raw`\d{4}-\d{2}-\d{2}`}
                   />
                   <DatePickerInput
                     id="usage-to"
                     size="sm"
                     labelText="To"
                     placeholder="yyyy-mm-dd"
+                    pattern={String.raw`\d{4}-\d{2}-\d{2}`}
                   />
                 </DatePicker>
                 <TextInput
