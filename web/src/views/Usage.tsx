@@ -18,12 +18,24 @@ import {
   Tabs,
   TextInput,
 } from "@carbon/react";
+import "@carbon/charts-react/styles.css";
+import { ScaleTypes, StackedAreaChart } from "@carbon/charts-react";
 import type { TableColumn } from "react-data-table-component";
 import type { FormEvent } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import RequestDetailPanel from "../components/RequestDetail";
 import Table from "../components/Table";
-import { getKeys, getRequest, getRequests, getUsage } from "../lib/api";
+import {
+  getFilterValues,
+  getRequest,
+  getRequests,
+  getUsage,
+  getUsageSeries,
+  type SeriesGrouping,
+  type SeriesPointView,
+  type SeriesView,
+  type UsageSeriesView,
+} from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { formatDuration } from "../lib/format";
 import type {
@@ -83,6 +95,48 @@ function defaultFilters(): Filters {
   };
 }
 
+// Trend chart controls: the breakdown dimension, the bucket width and the
+// plotted metric. The metric is a pure reshape of the same series payload,
+// so only grouping/bucket changes refetch.
+const GROUPING_OPTIONS: ReadonlyArray<{ value: SeriesGrouping; text: string }> = [
+  { value: "none", text: "Total" },
+  { value: "model", text: "By model" },
+  { value: "key", text: "By key" },
+  { value: "upstream", text: "By provider" },
+];
+const BUCKET_OPTIONS = [
+  { value: "1800", text: "30 minutes" },
+  { value: "3600", text: "1 hour" },
+  { value: "86400", text: "1 day" },
+] as const;
+type TrendMetric = "requests" | "tokens" | "cost";
+const METRIC_OPTIONS: ReadonlyArray<{ value: TrendMetric; text: string }> = [
+  { value: "requests", text: "Requests" },
+  { value: "tokens", text: "Tokens" },
+  { value: "cost", text: "Cost (USD)" },
+];
+
+// trendGroupLabel renders a series label for the chart legend: the ungrouped
+// series has no label, and a deleted key groups under the empty label.
+function trendGroupLabel(label: string, grouping: SeriesGrouping): string {
+  if (label === "") {
+    return grouping === "key" ? "(deleted key)" : "All";
+  }
+  return label;
+}
+
+// trendValue picks the plotted metric out of a bucket.
+function trendValue(p: SeriesPointView, metric: TrendMetric): number {
+  switch (metric) {
+    case "cost":
+      return p.costUSD;
+    case "tokens":
+      return p.promptTokens + p.completionTokens;
+    default:
+      return p.requests;
+  }
+}
+
 // SummaryRow is a usage summary row with a stable table key.
 type SummaryRow = UsageRow & { id: string };
 
@@ -99,6 +153,12 @@ export default function Usage() {
   const [detail, setDetail] = useState<RequestDetailView | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  // Trend chart state: grouping/bucket refetch; the metric is a reshape.
+  const [trendGrouping, setTrendGrouping] = useState<SeriesGrouping>("model");
+  const [trendBucket, setTrendBucket] = useState<"1800" | "3600" | "86400">("3600");
+  const [trendMetric, setTrendMetric] = useState<TrendMetric>("requests");
+  const [trend, setTrend] = useState<UsageSeriesView | null>(null);
+  const [trendLoading, setTrendLoading] = useState(false);
 
   // The applied date range/time and keys are the shared server filters for
   // both tables. Strings and the keys array keep a stable identity until the
@@ -185,15 +245,55 @@ export default function Usage() {
     }
   }, [summaryTable.loading, requestsTable.loading]);
 
-  // Key filter options come from the full key list, not just what a filtered
-  // result happens to contain.
+  // Key filter options come from the server's filter-value endpoint (the
+  // live key names), not just what a filtered result happens to contain.
   useEffect(() => {
-    getKeys({ limit: 0 })
-      .then((k) => setKeyOptions(k.keys.map((x) => x.name)))
+    getFilterValues("key")
+      .then(setKeyOptions)
       .catch((e: unknown) => setError(errorMessage(e)));
   }, []);
 
   const totals = summaryTable.meta;
+
+  // The trend chart shares the page's server filters; grouping and bucket
+  // changes refetch, the metric choice is a pure reshape of the payload.
+  useEffect(() => {
+    let stale = false;
+    setTrendLoading(true);
+    getUsageSeries({
+      from,
+      to,
+      keys,
+      includeDeletedKeys,
+      bucketSeconds: Number(trendBucket),
+      groupBy: trendGrouping,
+      topGroups: 8,
+    })
+      .then((r) => {
+        if (!stale) setTrend(r);
+      })
+      .catch((e: unknown) => {
+        if (!stale) setError(errorMessage(e));
+      })
+      .finally(() => {
+        if (!stale) setTrendLoading(false);
+      });
+    return () => {
+      stale = true;
+    };
+  }, [from, to, keys, includeDeletedKeys, trendGrouping, trendBucket]);
+
+  // Carbon charts take long-format tabular data: one row per series point.
+  const trendData = useMemo(() => {
+    if (!trend) return [];
+    return trend.series.flatMap((g: SeriesView) =>
+      g.points.map((p) => ({
+        date: new Date(p.t),
+        group: trendGroupLabel(g.label, trendGrouping),
+        value: trendValue(p, trendMetric),
+      })),
+    );
+  }, [trend, trendMetric, trendGrouping]);
 
   // The footer shows the true totals over the whole filtered set, which the
   // API computes independently of the current page.
@@ -438,6 +538,7 @@ export default function Usage() {
             <TabList aria-label="Usage">
               <Tab>Summary</Tab>
               <Tab>Requests</Tab>
+              <Tab>Trend</Tab>
             </TabList>
             <TabPanels>
               <TabPanel>
@@ -461,6 +562,76 @@ export default function Usage() {
                   onRowClicked={(r) => openDetail(r.id)}
                   {...serverTableProps(requestsTable)}
                 />
+              </TabPanel>
+
+              <TabPanel>
+                <Stack orientation="horizontal" gap={6}>
+                  <Select
+                    id="trend-grouping"
+                    size="sm"
+                    labelText="Group by"
+                    value={trendGrouping}
+                    onChange={(e: FormEvent<HTMLSelectElement>) =>
+                      setTrendGrouping(
+                        (e.target as HTMLSelectElement).value as SeriesGrouping,
+                      )
+                    }
+                  >
+                    {GROUPING_OPTIONS.map((o) => (
+                      <SelectItem key={o.value} value={o.value} text={o.text} />
+                    ))}
+                  </Select>
+                  <Select
+                    id="trend-bucket"
+                    size="sm"
+                    labelText="Bucket"
+                    value={trendBucket}
+                    onChange={(e: FormEvent<HTMLSelectElement>) =>
+                      setTrendBucket(
+                        (e.target as HTMLSelectElement)
+                          .value as typeof trendBucket,
+                      )
+                    }
+                  >
+                    {BUCKET_OPTIONS.map((o) => (
+                      <SelectItem key={o.value} value={o.value} text={o.text} />
+                    ))}
+                  </Select>
+                  <Select
+                    id="trend-metric"
+                    size="sm"
+                    labelText="Metric"
+                    value={trendMetric}
+                    onChange={(e: FormEvent<HTMLSelectElement>) =>
+                      setTrendMetric(
+                        (e.target as HTMLSelectElement).value as TrendMetric,
+                      )
+                    }
+                  >
+                    {METRIC_OPTIONS.map((o) => (
+                      <SelectItem key={o.value} value={o.value} text={o.text} />
+                    ))}
+                  </Select>
+                  {trendLoading && <InlineLoading description="Loading…" />}
+                </Stack>
+                {trend !== null && trendData.length === 0 ? (
+                  <p>No usage recorded for this filter.</p>
+                ) : (
+                  <StackedAreaChart
+                    data={trendData}
+                    options={{
+                      axes: {
+                        bottom: {
+                          mapsTo: "date",
+                          scaleType: ScaleTypes.TIME,
+                        },
+                        left: { mapsTo: "value" },
+                      },
+                      height: "400px",
+                      legend: { position: "bottom" },
+                    }}
+                  />
+                )}
               </TabPanel>
             </TabPanels>
           </Tabs>

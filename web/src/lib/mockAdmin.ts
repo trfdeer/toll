@@ -29,6 +29,15 @@ import {
   type GetUsageRequest,
 } from "../gen/toll/admin/v1/usage_pb";
 import {
+  GetUsageSeriesResponseSchema,
+  ListFilterValuesResponseSchema,
+  UsageSeriesPointSchema,
+  SeriesGrouping,
+  type GetUsageSeriesRequest,
+  type ListFilterValuesRequest,
+  type UsageSeriesPoint,
+} from "../gen/toll/admin/v1/stats_pb";
+import {
   ListRequestsResponseSchema,
   RequestDetailSchema,
   type GetRequestRequest,
@@ -327,6 +336,8 @@ export function mockAdminRoutes(router: ConnectRouter) {
   router.rpc(AdminService.method.createProfile, createProfileMock);
   router.rpc(AdminService.method.updateProfile, updateProfileMock);
   router.rpc(AdminService.method.deleteProfile, deleteProfileMock);
+  router.rpc(AdminService.method.getUsageSeries, getUsageSeriesMock);
+  router.rpc(AdminService.method.listFilterValues, listFilterValuesMock);
 }
 
 // ---- providers & models ----
@@ -987,6 +998,186 @@ function deleteProfileMock(req: DeleteProfileRequest) {
   }
   profileSeeds.splice(profileSeeds.indexOf(p), 1);
   return create(EmptySchema, {});
+}
+
+// ---- usage series & filter values ----
+
+// SeriesEvent is one chartable usage event, derived from the mock's request
+// seeds (each recorded request is one usage event).
+interface SeriesEvent {
+  model: string;
+  keyName: string;
+  upstream: string;
+  at: Date;
+  prompt: number;
+  completion: number;
+  cached: number;
+  cost: number;
+}
+const seriesEvents: SeriesEvent[] = requestSeeds.map((r) => ({
+  model: r.gatewayModel,
+  keyName: r.keyName,
+  upstream: "hyper",
+  at: r.createdAt,
+  prompt: r.promptTokens,
+  completion: r.completionTokens,
+  cached: r.cachedTokens,
+  cost: r.costUSD ?? 0,
+}));
+
+// usageWindowMock applies the shared filter's key narrowing: absent keys and
+// includeDeletedKeys matches everything; includeDeletedKeys alone matches
+// only deleted-key events (mirroring store.UsageFilter.where).
+function usageWindowMock<T extends { keyName?: string }>(
+  rows: T[],
+  f: UsageFilter | undefined,
+  at: (r: T) => Date,
+): T[] {
+  const from = f?.from ? timestampDate(f.from) : null;
+  const to = f?.to ? timestampDate(f.to) : null;
+  const keys = f?.keys ?? [];
+  return rows.filter((r) => {
+    if (from && at(r) < from) return false;
+    if (to && at(r) > to) return false;
+    const parts: boolean[] = [];
+    if (keys.length > 0) parts.push(keys.includes(r.keyName ?? ""));
+    if (f?.includeDeletedKeys) parts.push((r.keyName ?? "") === "");
+    return parts.length === 0 || parts.some(Boolean);
+  });
+}
+
+function getUsageSeriesMock(req: GetUsageSeriesRequest) {
+  // Clamp the bucket width like the server; absent means one hour.
+  let bucketSecs = Number(req.bucketSize?.seconds ?? 3600n);
+  if (bucketSecs < 60) bucketSecs = 60;
+  if (bucketSecs > 30 * 24 * 3600) bucketSecs = 30 * 24 * 3600;
+
+  const events = usageWindowMock(seriesEvents, req.filter, (e) => e.at);
+  if (events.length === 0) {
+    return create(GetUsageSeriesResponseSchema, {});
+  }
+
+  const label = (e: SeriesEvent): string => {
+    switch (req.groupBy) {
+      case SeriesGrouping.MODEL:
+        return e.model;
+      case SeriesGrouping.KEY:
+        return e.keyName;
+      case SeriesGrouping.UPSTREAM:
+        return e.upstream;
+      default:
+        return "";
+    }
+  };
+
+  // Bucket grid aligned to UTC multiples of the bucket width.
+  const times = events.map((e) => e.at.getTime());
+  const first =
+    Math.floor(Math.min(...times) / (bucketSecs * 1000)) * bucketSecs * 1000;
+  const last =
+    Math.floor(Math.max(...times) / (bucketSecs * 1000)) * bucketSecs * 1000;
+  const bucketCount = Math.round((last - first) / (bucketSecs * 1000)) + 1;
+
+  const groups = new Map<string, UsageSeriesPoint[]>();
+  const totals = {
+    requests: 0,
+    promptTokens: 0,
+    cachedTokens: 0,
+    completionTokens: 0,
+    costUSD: 0,
+  };
+  for (const e of events) {
+    const idx = Math.round(
+      (Math.floor(e.at.getTime() / (bucketSecs * 1000)) * bucketSecs * 1000 - first) /
+        (bucketSecs * 1000),
+    );
+    const lab = label(e);
+    let points = groups.get(lab);
+    if (!points) {
+      points = Array.from({ length: bucketCount }, (_, i) =>
+        create(UsageSeriesPointSchema, {
+          bucketStart: timestampFromDate(new Date(first + i * bucketSecs * 1000)),
+          requests: 0n,
+          promptTokens: 0n,
+          completionTokens: 0n,
+          cachedTokens: 0n,
+          reasoningTokens: 0n,
+          costUsd: 0,
+        }));
+      groups.set(lab, points);
+    }
+    const p = points[idx];
+    if (!p) continue;
+    p.requests += 1n;
+    p.promptTokens += BigInt(e.prompt);
+    p.completionTokens += BigInt(e.completion);
+    p.cachedTokens += BigInt(e.cached);
+    p.costUsd += e.cost;
+    totals.requests += 1;
+    totals.promptTokens += e.prompt;
+    totals.completionTokens += e.completion;
+    totals.cachedTokens += e.cached;
+    totals.costUSD += e.cost;
+  }
+
+  // Rank by total cost, trim to topGroups with an "Other" remainder.
+  let entries = [...groups.entries()].sort((a, b) => {
+    const cost = (ps: UsageSeriesPoint[]) => ps.reduce((n, p) => n + p.costUsd, 0);
+    return cost(b[1]) - cost(a[1]);
+  });
+  const top = req.topGroups ?? 0;
+  if (top > 0 && entries.length > top) {
+    const rest = entries.slice(top);
+    const firstRest = rest[0];
+    const other: UsageSeriesPoint[] = firstRest
+      ? firstRest[1].map((p) => create(UsageSeriesPointSchema, p))
+      : [];
+    for (const [, ps] of rest.slice(1)) {
+      ps.forEach((p, i) => {
+        const o = other[i];
+        if (!o) return;
+        o.requests += p.requests;
+        o.promptTokens += p.promptTokens;
+        o.completionTokens += p.completionTokens;
+        o.cachedTokens += p.cachedTokens;
+        o.costUsd += p.costUsd;
+      });
+    }
+    entries = [...entries.slice(0, top), ["Other", other]];
+  }
+
+  return create(GetUsageSeriesResponseSchema, {
+    series: entries.map(([lab, points]) => ({ label: lab, points })),
+    totals: {
+      requests: BigInt(totals.requests),
+      promptTokens: BigInt(totals.promptTokens),
+      cachedTokens: BigInt(totals.cachedTokens),
+      completionTokens: BigInt(totals.completionTokens),
+      costUsd: totals.costUSD,
+    },
+  });
+}
+
+function listFilterValuesMock(req: ListFilterValuesRequest) {
+  const q = req.query.toLowerCase();
+  const limit = req.limit === undefined || req.limit <= 0 ? 100 : req.limit;
+  let values: string[];
+  switch (req.column) {
+    case "model":
+      values = [...new Set(requestSeeds.map((r) => r.gatewayModel))].sort();
+      break;
+    case "key":
+      values = keys.map((k) => k.name).sort();
+      break;
+    default:
+      throw new ConnectError(
+        `unknown filter column "${req.column}"`,
+        Code.InvalidArgument,
+      );
+  }
+  return create(ListFilterValuesResponseSchema, {
+    values: values.filter((v) => v.toLowerCase().includes(q)).slice(0, limit),
+  });
 }
 
 // ---- settings ----

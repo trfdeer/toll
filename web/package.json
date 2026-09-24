@@ -9,6 +9,8 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2",
+    "@carbon/charts": "^1.27.20",
+    "@carbon/charts-react": "^1.27.20",
     "@carbon/react": "^1.87.0",
     "@connectrpc/connect": "^2",
     "@connectrpc/connect-web": "^2",

@@ -192,6 +192,177 @@ func TestPausedKeyInactive(t *testing.T) {
 	}
 }
 
+// TestUsageSeries covers the dense bucketing, the group breakdown, the
+// top-N "Other" rollup and the previous-window comparison.
+func TestUsageSeries(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := t.Context()
+
+	upID, _ := s.UpsertUpstream(ctx, "hyper", "https://x/v1", "k", 300, 0)
+	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", 1)
+	record := func(model, at string, cost float64) {
+		t.Helper()
+		if err := s.RecordUsage(ctx, UsageEvent{
+			KeyID: keyID, UpstreamID: upID, GatewayModel: model, UpstreamModel: model,
+			CostUSD: &cost,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE usage_events SET created_at = ? WHERE id = (
+				SELECT MAX(id) FROM usage_events)`, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record("m1", "2026-01-02T10:05:00.000Z", 0.5)
+	record("m1", "2026-01-02T10:40:00.000Z", 0.25)
+	record("m2", "2026-01-02T11:20:00.000Z", 2.0)
+	record("m1", "2026-01-02T09:10:00.000Z", 1.0) // only in the previous window
+
+	f := UsageFilter{From: "2026-01-02T10:00:00.000Z", To: "2026-01-02T11:30:00.000Z"}
+	res, err := s.UsageSeries(ctx, f, SeriesOptions{
+		Bucket: 30 * time.Minute, GroupBy: "model",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two groups, ranked by total cost: m2 (2.0) then m1 (0.75).
+	if len(res.Groups) != 2 || res.Groups[0].Label != "m2" || res.Groups[1].Label != "m1" {
+		t.Fatalf("groups = %+v", res.Groups)
+	}
+	// Dense grid: 10:00 through 11:30 at 30m = 4 buckets, zero-filled.
+	m1 := res.Groups[1].Points
+	if len(m1) != 4 {
+		t.Fatalf("m1 points = %d, want 4", len(m1))
+	}
+	if !m1[0].BucketStart.Equal(time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)) {
+		t.Errorf("first bucket = %v, want 10:00 UTC", m1[0].BucketStart)
+	}
+	if m1[0].Requests != 1 || m1[1].Requests != 1 || m1[2].Requests != 0 || m1[3].Requests != 0 {
+		t.Errorf("m1 requests per bucket = %d,%d,%d,%d, want 1,1,0,0",
+			m1[0].Requests, m1[1].Requests, m1[2].Requests, m1[3].Requests)
+	}
+	if res.Totals.Requests != 3 || res.Totals.CostUSD < 2.74 || res.Totals.CostUSD > 2.76 {
+		t.Errorf("totals = %+v, want 3 requests / 2.75", res.Totals)
+	}
+
+	// Top-1 rolls the remainder into a trailing "Other".
+	top, err := s.UsageSeries(ctx, f, SeriesOptions{Bucket: 30 * time.Minute, GroupBy: "model", Top: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(top.Groups) != 2 || top.Groups[0].Label != "m2" || top.Groups[1].Label != "Other" {
+		t.Fatalf("top groups = %+v", top.Groups)
+	}
+	if other := top.Groups[1].Points; other[0].Requests != 1 || other[1].Requests != 1 {
+		t.Errorf("Other requests = %d,%d, want 1,1", other[0].Requests, other[1].Requests)
+	}
+
+	// compare_to_previous shifts the same window back; the 09:10 event shows
+	// up there under the current window's group labels.
+	cmp, err := s.UsageSeries(ctx, f, SeriesOptions{Bucket: 30 * time.Minute, GroupBy: "model", Compare: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cmp.Previous) != 1 || cmp.Previous[0].Label != "m1" {
+		t.Fatalf("previous groups = %+v", cmp.Previous)
+	}
+	prev := cmp.Previous[0].Points
+	// Previous window [08:30, 10:00] → buckets 08:30..10:00 = 4; the 09:10
+	// event lands in the 09:00 bucket.
+	if len(prev) != 4 || prev[1].Requests != 1 || prev[0].Requests != 0 {
+		t.Errorf("previous points = %+v", prev)
+	}
+	if cmp.PreviousTotals.CostUSD < 0.99 || cmp.PreviousTotals.CostUSD > 1.01 {
+		t.Errorf("previous totals cost = %v, want 1.0", cmp.PreviousTotals.CostUSD)
+	}
+
+	// Ungrouped series and data-derived bounds.
+	all, err := s.UsageSeries(ctx, UsageFilter{}, SeriesOptions{Bucket: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all.Groups) != 1 || all.Groups[0].Label != "" {
+		t.Fatalf("ungrouped = %+v", all.Groups)
+	}
+	// Data bounds 09:10..11:20 align to 09:00..11:00 = 3 hourly buckets.
+	if len(all.Groups[0].Points) != 3 || all.Totals.Requests != 4 {
+		t.Errorf("ungrouped points = %d, totals = %+v", len(all.Groups[0].Points), all.Totals)
+	}
+
+	// An empty set yields an empty series, and bad options are client errors.
+	empty, err := s.UsageSeries(ctx, UsageFilter{Keys: []string{"nope"}}, SeriesOptions{Bucket: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Groups) != 0 || empty.Totals.Requests != 0 {
+		t.Errorf("empty series = %+v", empty)
+	}
+	if _, err := s.UsageSeries(ctx, f, SeriesOptions{Bucket: time.Minute, GroupBy: "bogus"}); !errors.Is(err, ErrBadListParam) {
+		t.Errorf("unknown grouping err = %v, want ErrBadListParam", err)
+	}
+	// A window too fine for its span is rejected, not materialized.
+	if _, err := s.UsageSeries(ctx, f, SeriesOptions{Bucket: time.Millisecond}); !errors.Is(err, ErrBadListParam) {
+		t.Errorf("tiny bucket err = %v, want ErrBadListParam", err)
+	}
+}
+
+// TestFilterValues covers the dropdown-feeding queries.
+func TestFilterValues(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := t.Context()
+
+	upID, _ := s.UpsertUpstream(ctx, "hyper", "https://x/v1", "k", 300, 0)
+	keyID, _ := s.CreateVirtualKey(ctx, "app", "hash", 1)
+	for _, model := range []string{"m1", "m2", "m1"} {
+		if err := s.RecordUsage(ctx, UsageEvent{
+			KeyID: keyID, UpstreamID: upID, GatewayModel: model, UpstreamModel: model,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.CreateVirtualKey(ctx, "zeph", "hash2", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	values := func(column, query string) []string {
+		t.Helper()
+		vs, err := s.FilterValues(ctx, column, query, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return vs
+	}
+	if got := values("model", ""); len(got) != 2 || got[0] != "m1" || got[1] != "m2" {
+		t.Errorf("model values = %v, want distinct sorted [m1 m2]", got)
+	}
+	if got := values("model", "2"); len(got) != 1 || got[0] != "m2" {
+		t.Errorf("model type-ahead = %v, want [m2]", got)
+	}
+	if got := values("key", ""); len(got) != 2 || got[0] != "app" || got[1] != "zeph" {
+		t.Errorf("key values = %v, want [app zeph]", got)
+	}
+	if _, err := s.FilterValues(ctx, "bogus", "", 0); !errors.Is(err, ErrBadListParam) {
+		t.Errorf("unknown column err = %v, want ErrBadListParam", err)
+	}
+	// A limit caps the result.
+	vs, err := s.FilterValues(ctx, "key", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vs) != 1 || vs[0] != "app" {
+		t.Errorf("limited values = %v, want [app]", vs)
+	}
+}
+
 func TestUsageAndRequestFilters(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
 	if err != nil {

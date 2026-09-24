@@ -32,6 +32,10 @@ import {
   UpdateProfileRequestSchema,
 } from "../gen/toll/admin/v1/profiles_pb";
 import {
+  SeriesGrouping as SeriesGroupingProto,
+  type UsageSeries,
+} from "../gen/toll/admin/v1/stats_pb";
+import {
   KeyFilterSchema,
   KeyFilter_Mode,
   type KeyFilter as KeyFilterProto,
@@ -46,6 +50,7 @@ import type {
   RequestsResponse,
   RequestDetailView,
   UsageSummary,
+  UsageTotals,
 } from "./types";
 import { admin } from "./connect";
 
@@ -247,6 +252,106 @@ export const updateSettings = (settings: { storePrompts: boolean }): Promise<Set
 export const exportConfig = async (): Promise<string> => {
   const res = await admin.exportConfig({});
   return res.yaml;
+};
+
+// ---- usage series & filter values (ConnectRPC) ----
+
+// SeriesGrouping is the breakdown dimension of the usage chart.
+export type SeriesGrouping = "none" | "model" | "key" | "upstream";
+
+const PROTO_GROUPINGS: Record<SeriesGrouping, SeriesGroupingProto> = {
+  none: SeriesGroupingProto.UNSPECIFIED,
+  model: SeriesGroupingProto.MODEL,
+  key: SeriesGroupingProto.KEY,
+  upstream: SeriesGroupingProto.UPSTREAM,
+};
+
+export interface UsageSeriesQuery extends UsageQuery {
+  /** Bucket width in seconds; the server clamps to 60..2592000. */
+  bucketSeconds: number;
+  groupBy: SeriesGrouping;
+  /** Keep only the N costliest groups, rolling the rest into "Other". */
+  topGroups?: number;
+  compareToPrevious?: boolean;
+}
+
+export interface SeriesPointView {
+  /** ISO bucket start (UTC-aligned). */
+  t: string;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
+  costUSD: number;
+}
+
+export interface SeriesView {
+  label: string;
+  points: SeriesPointView[];
+}
+
+export interface UsageSeriesView {
+  series: SeriesView[];
+  totals: UsageTotals;
+  previous?: SeriesView[];
+  previousTotals?: UsageTotals;
+}
+
+export const getUsageSeries = async (
+  q: UsageSeriesQuery,
+): Promise<UsageSeriesView> => {
+  const res = await admin.getUsageSeries({
+    filter: usageFilterProto(q),
+    bucketSize: { seconds: BigInt(Math.round(q.bucketSeconds)) },
+    groupBy: PROTO_GROUPINGS[q.groupBy] ?? SeriesGroupingProto.UNSPECIFIED,
+    topGroups: q.topGroups,
+    compareToPrevious: q.compareToPrevious ?? false,
+  });
+  const map = (groups: UsageSeries[]) =>
+    groups.map((g) => ({
+      label: g.label,
+      points: g.points.map((p) => ({
+        t: p.bucketStart ? timestampDate(p.bucketStart).toISOString() : "",
+        requests: Number(p.requests),
+        promptTokens: Number(p.promptTokens),
+        completionTokens: Number(p.completionTokens),
+        cachedTokens: Number(p.cachedTokens),
+        reasoningTokens: Number(p.reasoningTokens),
+        costUSD: p.costUsd,
+      })),
+    }));
+  return {
+    series: map(res.series),
+    totals: {
+      requests: Number(res.totals?.requests ?? 0n),
+      promptTokens: Number(res.totals?.promptTokens ?? 0n),
+      cachedTokens: Number(res.totals?.cachedTokens ?? 0n),
+      completionTokens: Number(res.totals?.completionTokens ?? 0n),
+      costUSD: res.totals?.costUsd ?? 0,
+    },
+    previous: res.previousSeries.length > 0 ? map(res.previousSeries) : undefined,
+    previousTotals:
+      res.previousTotals !== undefined
+        ? {
+            requests: Number(res.previousTotals.requests),
+            promptTokens: Number(res.previousTotals.promptTokens),
+            cachedTokens: Number(res.previousTotals.cachedTokens),
+            completionTokens: Number(res.previousTotals.completionTokens),
+            costUSD: res.previousTotals.costUsd,
+          }
+        : undefined,
+  };
+};
+
+// getFilterValues feeds the set-filter dropdowns from the server: "model"
+// lists gateway models seen in usage, "key" the live virtual key names.
+export const getFilterValues = async (
+  column: "model" | "key",
+  query = "",
+): Promise<string[]> => {
+  const res = await admin.listFilterValues({ column, query });
+  return res.values;
 };
 
 // ---- profiles (ConnectRPC) ----

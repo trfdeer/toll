@@ -474,6 +474,106 @@ func validateProfile(name string, provider, model store.KeyFilter, parents []str
 	return nil
 }
 
+// ---- usage series & filter values ----
+
+// GetUsageSeries renders the usage timeline for charts: dense UTC-aligned
+// buckets, an optional group breakdown, an optional top-N trim with an
+// "Other" remainder, and an optional previous-period comparison.
+func (s *connectService) GetUsageSeries(ctx context.Context, req *connect.Request[adminv1.GetUsageSeriesRequest]) (*connect.Response[adminv1.GetUsageSeriesResponse], error) {
+	f := usageFilterFromProto(req.Msg.GetFilter())
+	opts := store.SeriesOptions{Compare: req.Msg.GetCompareToPrevious()}
+
+	// Clamp the bucket width to 1m..30d; absent means one hour.
+	bucket := time.Hour
+	if d := req.Msg.GetBucketSize(); d.IsValid() {
+		bucket = d.AsDuration()
+	}
+	if bucket < time.Minute {
+		bucket = time.Minute
+	}
+	if bucket > 30*24*time.Hour {
+		bucket = 30 * 24 * time.Hour
+	}
+	opts.Bucket = bucket
+
+	switch req.Msg.GetGroupBy() {
+	case adminv1.SeriesGrouping_SERIES_GROUPING_MODEL:
+		opts.GroupBy = "model"
+	case adminv1.SeriesGrouping_SERIES_GROUPING_KEY:
+		opts.GroupBy = "key"
+	case adminv1.SeriesGrouping_SERIES_GROUPING_UPSTREAM:
+		opts.GroupBy = "upstream"
+	default:
+		// UNSPECIFIED: one ungrouped series.
+	}
+	if req.Msg.TopGroups != nil && req.Msg.GetTopGroups() > 0 {
+		opts.Top = int(req.Msg.GetTopGroups())
+	}
+
+	res, err := s.store.UsageSeries(ctx, f, opts)
+	if err != nil {
+		return nil, s.connectError(err, "usage series unavailable")
+	}
+	out := &adminv1.GetUsageSeriesResponse{
+		Series:         seriesProtos(res.Groups),
+		Totals:         usageTotalsProto(res.Totals),
+		PreviousSeries: seriesProtos(res.Previous),
+		PreviousTotals: usageTotalsProto(res.PreviousTotals),
+	}
+	return connect.NewResponse(out), nil
+}
+
+// seriesProtos maps a group set; a nil slice maps to an empty list.
+func seriesProtos(groups []store.UsageSeriesGroup) []*adminv1.UsageSeries {
+	out := make([]*adminv1.UsageSeries, 0, len(groups))
+	for _, g := range groups {
+		points := make([]*adminv1.UsageSeriesPoint, 0, len(g.Points))
+		for _, p := range g.Points {
+			points = append(points, &adminv1.UsageSeriesPoint{
+				BucketStart:      timestamppb.New(p.BucketStart),
+				Requests:         p.Requests,
+				PromptTokens:     p.PromptTokens,
+				CompletionTokens: p.CompletionTokens,
+				CachedTokens:     p.CachedTokens,
+				ReasoningTokens:  p.ReasoningTokens,
+				CostUsd:          p.CostUSD,
+			})
+		}
+		out = append(out, &adminv1.UsageSeries{Label: g.Label, Points: points})
+	}
+	return out
+}
+
+// usageTotalsProto maps the shared totals aggregate.
+func usageTotalsProto(t store.UsageTotals) *adminv1.UsageTotals {
+	return &adminv1.UsageTotals{
+		Requests:         t.Requests,
+		PromptTokens:     t.PromptTokens,
+		CachedTokens:     t.CachedTokens,
+		CompletionTokens: t.CompletionTokens,
+		CostUsd:          t.CostUSD,
+	}
+}
+
+// ListFilterValues feeds the tables' set-filter dropdowns from the server.
+func (s *connectService) ListFilterValues(ctx context.Context, req *connect.Request[adminv1.ListFilterValuesRequest]) (*connect.Response[adminv1.ListFilterValuesResponse], error) {
+	limit := 0 // the store's default
+	if req.Msg.Limit != nil {
+		limit = int(req.Msg.GetLimit())
+		if limit < 0 || limit > 1000 {
+			return nil, badListParam("limit must be 0..1000")
+		}
+	}
+	values, err := s.store.FilterValues(ctx, req.Msg.GetColumn(), req.Msg.GetQuery(), limit)
+	if err != nil {
+		return nil, s.connectError(err, "filter values unavailable")
+	}
+	if values == nil {
+		values = []string{}
+	}
+	return connect.NewResponse(&adminv1.ListFilterValuesResponse{Values: values}), nil
+}
+
 // ---- providers & models ----
 
 // providerProto maps an upstream row onto its proto shape.

@@ -206,7 +206,8 @@ export const GetUsageSeriesResponseSchema: GenMessage<GetUsageSeriesResponse> = 
 export type ListFilterValuesRequest = Message<"toll.admin.v1.ListFilterValuesRequest"> & {
   /**
    * Column id: "model" (gateway models seen in usage/requests) or "key"
-   * (virtual key names, including deleted ones when requested).
+   * (live virtual key names; deleted keys' names are not retained, so
+   * they cannot be offered).
    *
    * @generated from field: string column = 1;
    */

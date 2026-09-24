@@ -121,6 +121,13 @@ type UsageFilter struct {
 
 // where renders the filter as SQL conditions and their arguments.
 func (f UsageFilter) where(tsCol, keyCol string) ([]string, []any) {
+	conds, args := f.whereTime(tsCol)
+	kconds, kargs := f.whereKeys(keyCol)
+	return append(conds, kconds...), append(args, kargs...)
+}
+
+// whereTime renders the inclusive created_at bounds.
+func (f UsageFilter) whereTime(tsCol string) ([]string, []any) {
 	var conds []string
 	var args []any
 	if f.From != "" {
@@ -131,6 +138,14 @@ func (f UsageFilter) where(tsCol, keyCol string) ([]string, []any) {
 		conds = append(conds, tsCol+" <= ?")
 		args = append(args, f.To)
 	}
+	return conds, args
+}
+
+// whereKeys renders the key-name narrowing (live names, plus deleted-key
+// events when IncludeDeleted is set).
+func (f UsageFilter) whereKeys(keyCol string) ([]string, []any) {
+	var conds []string
+	var args []any
 	if len(f.Keys) > 0 || f.IncludeDeleted {
 		var parts []string
 		if len(f.Keys) > 0 {

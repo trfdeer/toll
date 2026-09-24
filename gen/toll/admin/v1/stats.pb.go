@@ -399,7 +399,8 @@ func (x *GetUsageSeriesResponse) GetPreviousTotals() *UsageTotals {
 type ListFilterValuesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Column id: "model" (gateway models seen in usage/requests) or "key"
-	// (virtual key names, including deleted ones when requested).
+	// (live virtual key names; deleted keys' names are not retained, so
+	// they cannot be offered).
 	Column string `protobuf:"bytes,1,opt,name=column,proto3" json:"column,omitempty"`
 	// Case-insensitive substring narrowing for type-ahead.
 	Query string `protobuf:"bytes,2,opt,name=query,proto3" json:"query,omitempty"`

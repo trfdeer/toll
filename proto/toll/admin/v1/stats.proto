@@ -82,7 +82,8 @@ message GetUsageSeriesResponse {
 // a proven gateway UI uses for its set filters).
 message ListFilterValuesRequest {
   // Column id: "model" (gateway models seen in usage/requests) or "key"
-  // (virtual key names, including deleted ones when requested).
+  // (live virtual key names; deleted keys' names are not retained, so
+  // they cannot be offered).
   string column = 1;
   // Case-insensitive substring narrowing for type-ahead.
   string query = 2;

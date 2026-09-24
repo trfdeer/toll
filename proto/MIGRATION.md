@@ -1,20 +1,23 @@
 # Admin API → ConnectRPC migration plan
 
 Branch: `feat/admin-connect-migration`.
-Phases 0–4 are done: the schema + committed codegen (0), the mounted
+Phases 0–5 are done: the schema + committed codegen (0), the mounted
 connect handler with the `keys` pilot server-side (1), the SPA flip
 with the keys REST routes and dev mocks deleted (2), settings + config
 export (3a), providers + models with the toggle collapse (3b),
 requests + usage with the multi-condition filter engine, the
-deleted-keys placeholder and int64 sums (3c), and the profiles flip
-plus the full legacy teardown (4): no REST routes, no server-side
-fetch mock, and `web/src/lib/types.ts` holds only view-local types.
-The only unimplemented RPCs left are phase 5's stats surface
-(GetUsageSeries/ListFilterValues). The generated TS service descriptors
-come from protoc-gen-es v2 (the connectrpc/es plugin no longer exists
-in connect-es v2). See `proto/README.md` for the deliberate behavior
-changes this plan implements — they are product decisions, not
-transcription choices.
+deleted-keys placeholder and int64 sums (3c), the profiles flip plus
+the full legacy teardown (4) — no REST routes, no server-side fetch
+mock, and `web/src/lib/types.ts` holds only view-local types — and the
+stats surface (5): GetUsageSeries (dense UTC-aligned buckets, group
+breakdowns, top-N "Other" rollup, previous-window compare) backing the
+Usage page's Trend tab (Carbon stacked-area chart), and
+ListFilterValues feeding the key filter dropdown. Remaining: 6 (CI:
+buf lint/build + codegen drift gate). The generated TS service
+descriptors come from protoc-gen-es v2 (the connectrpc/es plugin no
+longer exists in connect-es v2). See `proto/README.md` for the
+deliberate behavior changes this plan implements — they are product
+decisions, not transcription choices.
 
 Strategy: **strangle, don't flip.** The connect handler and the legacy
 REST mux coexist under `/admin`; each resource cuts over independently

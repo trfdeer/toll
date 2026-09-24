@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -262,20 +263,9 @@ func TestConnectListKeysParams(t *testing.T) {
 	}
 }
 
-// TestConnectUnmigratedRPCs pins the strangle behavior: RPCs that have not
-// cut over yet answer CodeUnimplemented. After the profiles flip the only
-// unimplemented surface left is phase 5's usage-series work.
-func TestConnectUnmigratedRPCs(t *testing.T) {
-	_, h := setup(t)
-
-	for _, method := range []string{"GetUsageSeries", "ListFilterValues"} {
-		rec := rpc(t, h, method, `{}`)
-		if rec.Code != http.StatusNotImplemented {
-			t.Fatalf("%s = %d, want 501: %s", method, rec.Code, rec.Body.String())
-		}
-		wantConnectCode(t, rec, "unimplemented")
-	}
-}
+// TestConnectUnmigratedRPCs was retired when the last planned RPCs (the
+// phase-5 stats surface) cut over; the connect surface now covers the whole
+// schema. New RPCs should pin their strangle window here when added.
 
 // TestConnectRequestsFilters covers the numeric filter ops (GT/BETWEEN),
 // multi-condition joins over requests columns and the int64 token sums.
@@ -345,6 +335,73 @@ func TestConnectRequestsFilters(t *testing.T) {
 	}
 	if usage.GetTotal() != 2 {
 		t.Errorf("usage total = %d, want 2", usage.GetTotal())
+	}
+}
+
+// TestConnectUsageSeriesAndFilterValues covers the stats surface end to end:
+// bucketed series with grouping, the filter-value dropdown queries and the
+// client-error paths.
+func TestConnectUsageSeriesAndFilterValues(t *testing.T) {
+	st, h := setup(t)
+
+	upID, _ := st.UpsertUpstream(t.Context(), "hyper", "https://x/v1", "k", 300, 0)
+	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", 1)
+	for _, tc := range []struct {
+		model string
+		cost  float64
+	}{
+		{"m1", 0.5},
+		{"m2", 2.0},
+	} {
+		if err := st.RecordUsage(t.Context(), store.UsageEvent{
+			KeyID: keyID, UpstreamID: upID, GatewayModel: tc.model, UpstreamModel: tc.model,
+			CostUSD: &tc.cost,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A one-hour window around now, 30-minute buckets, grouped by model and
+	// trimmed to the costliest group.
+	from := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	to := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	var res adminv1.GetUsageSeriesResponse
+	rpcOK(t, h, "GetUsageSeries", `{
+		"filter": {"from": "`+from+`", "to": "`+to+`"},
+		"bucketSize": "1800s",
+		"groupBy": "SERIES_GROUPING_MODEL",
+		"topGroups": 1
+	}`, &res)
+	// m2 (cost 2.0) keeps its line; m1 rolls into "Other".
+	if len(res.GetSeries()) != 2 || res.GetSeries()[0].GetLabel() != "m2" ||
+		res.GetSeries()[1].GetLabel() != "Other" {
+		t.Fatalf("series = %s", protojson.Format(&res))
+	}
+	var m2Reqs int64
+	for _, p := range res.GetSeries()[0].GetPoints() {
+		m2Reqs += p.GetRequests()
+	}
+	if m2Reqs != 1 {
+		t.Errorf("m2 series requests = %d, want 1", m2Reqs)
+	}
+	if res.GetTotals().GetRequests() != 2 {
+		t.Errorf("totals = %s", protojson.Format(res.GetTotals()))
+	}
+
+	// An unknown filter column is a client error. (An unknown groupBy enum
+	// name can't be pinned here: connect's protojson decoder discards
+	// unknown enum names, so it degrades to the ungrouped series.)
+	rpcFail(t, h, "ListFilterValues", `{"column": "bogus"}`,
+		http.StatusBadRequest, "invalid_argument")
+
+	var fv adminv1.ListFilterValuesResponse
+	rpcOK(t, h, "ListFilterValues", `{"column": "model", "query": "2"}`, &fv)
+	if len(fv.GetValues()) != 1 || fv.GetValues()[0] != "m2" {
+		t.Errorf("model type-ahead = %s", protojson.Format(&fv))
+	}
+	rpcOK(t, h, "ListFilterValues", `{"column": "key"}`, &fv)
+	if len(fv.GetValues()) != 1 || fv.GetValues()[0] != "app" {
+		t.Errorf("key values = %s", protojson.Format(&fv))
 	}
 }
 
