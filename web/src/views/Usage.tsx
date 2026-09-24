@@ -27,7 +27,7 @@ import { getKeys, getRequest, getRequests, getUsage } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { formatDuration } from "../lib/format";
 import type {
-  RequestDetail,
+  RequestDetailView,
   RequestRow,
   UsageRow,
   UsageTotals,
@@ -58,8 +58,9 @@ interface Filters {
   selectedKeys: string[];
 }
 
-// DELETED_KEYS is the reserved key-filter value that selects usage whose key
-// was deleted. It matches the server's sentinel (internal/admin).
+// DELETED_KEYS is the UI's pseudo-entry for usage whose key was deleted; the
+// API layer maps it onto UsageFilter.include_deleted_keys (the old reserved
+// `__deleted__` query sentinel is gone).
 const DELETED_KEYS = "__deleted__";
 
 // keyLabel renders the reserved deleted-keys entry distinctly from real names.
@@ -95,7 +96,7 @@ export default function Usage() {
   // refreshing/updatedAt drive the in-place status line.
   const [refreshing, setRefreshing] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
-  const [detail, setDetail] = useState<RequestDetail | null>(null);
+  const [detail, setDetail] = useState<RequestDetailView | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
 
@@ -105,10 +106,13 @@ export default function Usage() {
   const [fromDay, toDay] = applied.dateRange;
   const from = bound(fromDay, applied.fromTime || "00:00");
   const to = bound(toDay, applied.toTime || "23:59");
-  const keys = applied.selectedKeys;
+  // The "(deleted keys)" pseudo-entry narrows via includeDeletedKeys; real
+  // names ride the keys list.
+  const keys = applied.selectedKeys.filter((k) => k !== DELETED_KEYS);
+  const includeDeletedKeys = applied.selectedKeys.includes(DELETED_KEYS);
 
   const fetchSummary = (q: ServerTableQuery) =>
-    getUsage({ from, to, key: keys, ...q }).then((r) => ({
+    getUsage({ from, to, keys, includeDeletedKeys, ...q }).then((r) => ({
       rows: r.rows.map((row) => ({ ...row, id: row.gatewayModel })),
       total: r.total,
       meta: r.totals,
@@ -119,7 +123,7 @@ export default function Usage() {
   });
 
   const fetchRequests = (q: ServerTableQuery) =>
-    getRequests({ from, to, key: keys, ...q }).then((r) => ({
+    getRequests({ from, to, keys, includeDeletedKeys, ...q }).then((r) => ({
       rows: r.requests,
       total: r.total,
     }));
@@ -255,6 +259,8 @@ export default function Usage() {
       id: "key",
       name: "Key",
       selector: (r) => r.keyName,
+      // Deleted keys render empty server-side; the UI shows the placeholder.
+      cell: (r) => r.keyName || "(deleted key)",
       sortable: true,
       filterable: true,
     },

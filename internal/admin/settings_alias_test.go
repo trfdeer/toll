@@ -1,11 +1,11 @@
 package admin
 
 import (
-	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"testing"
+
+	"google.golang.org/protobuf/encoding/protojson"
 
 	adminv1 "github.com/trfdeer/toll/gen/toll/admin/v1"
 	"github.com/trfdeer/toll/internal/store"
@@ -52,34 +52,36 @@ func TestDeletedKeysUsageEndpoint(t *testing.T) {
 	st.RecordUsage(t.Context(), store.UsageEvent{
 		KeyID: keyID, UpstreamID: upID, GatewayModel: "m", UpstreamModel: "m",
 	})
+	st.EnsureConversation(t.Context(), "conv", keyID)
+	tid, _ := st.CreateTranscript(t.Context(), "conv", "m", "m-upstream", `{"model":"m"}`)
+	st.CompleteTranscript(t.Context(), tid, `{"ok":true}`, 200, store.UsageEvent{KeyID: keyID, UpstreamID: upID})
 	if err := st.DeleteVirtualKey(t.Context(), "app"); err != nil {
 		t.Fatal(err)
 	}
 
-	total := func(query string) int {
+	totalReqs := func(filter string) int64 {
 		t.Helper()
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/usage"+query, nil))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET /api/usage%s = %d: %s", query, rec.Code, rec.Body.String())
-		}
-		var v struct {
-			TotalReqs int `json:"totalReqs"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
-			t.Fatal(err)
-		}
-		return v.TotalReqs
+		var v adminv1.GetUsageResponse
+		rpcOK(t, h, "GetUsage", filter, &v)
+		return v.GetTotals().GetRequests()
 	}
 
-	if n := total(""); n != 1 {
-		t.Errorf("no filter totalReqs = %d, want 1", n)
+	if n := totalReqs(`{}`); n != 1 {
+		t.Errorf("no filter totals.requests = %d, want 1", n)
 	}
-	if n := total("?key=" + deletedKeysSentinel); n != 1 {
-		t.Errorf("deleted sentinel totalReqs = %d, want 1", n)
+	// include_deleted_keys replaces the old __deleted__ sentinel.
+	if n := totalReqs(`{"filter": {"includeDeletedKeys": true}}`); n != 1 {
+		t.Errorf("include_deleted_keys totals.requests = %d, want 1", n)
 	}
-	if n := total("?key=app"); n != 0 {
-		t.Errorf("deleted key by name totalReqs = %d, want 0", n)
+	if n := totalReqs(`{"filter": {"keys": ["app"]}}`); n != 0 {
+		t.Errorf("deleted key by name totals.requests = %d, want 0", n)
+	}
+
+	// Deleted-key request rows carry an empty key_name for the UI placeholder.
+	var reqs adminv1.ListRequestsResponse
+	rpcOK(t, h, "ListRequests", `{"filter": {"includeDeletedKeys": true}}`, &reqs)
+	if len(reqs.GetRequests()) != 1 || reqs.GetRequests()[0].GetKeyName() != "" {
+		t.Errorf("deleted-key request = %s", protojson.Format(&reqs))
 	}
 }
 
@@ -94,20 +96,13 @@ func TestRequestDetailReportsMissingContent(t *testing.T) {
 	id, _ := st.CreateTranscript(t.Context(), "conv", "m", "m-up", `{"messages":[]}`)
 	st.CompleteTranscript(t.Context(), id, `{}`, 200, store.UsageEvent{KeyID: keyID, UpstreamID: 1})
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/requests/"+strconv.FormatInt(id, 10), nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-	}
-	var got requestDetail
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.ContentStored {
+	var got adminv1.RequestDetail
+	rpcOK(t, h, "GetRequest", `{"id": `+strconv.FormatInt(id, 10)+`}`, &got)
+	if got.GetContentStored() {
 		t.Error("contentStored = true, want false when prompt storage is disabled")
 	}
-	if len(got.Messages) != 0 {
-		t.Errorf("messages = %d, want 0", len(got.Messages))
+	if len(got.GetMessages()) != 0 {
+		t.Errorf("messages = %d, want 0", len(got.GetMessages()))
 	}
 }
 

@@ -10,6 +10,11 @@ import (
 // ptrTo returns a pointer to v, for patch payloads with optional fields.
 func ptrTo[T any](v T) *T { return &v }
 
+// oneCond builds a single-condition column filter for the list tests.
+func oneCond(op FilterOp, values ...string) ColumnFilter {
+	return ColumnFilter{Conditions: []ColumnCondition{{Op: op, Values: values}}}
+}
+
 func TestMigrationsRunAndAreIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "toll.db")
 
@@ -205,7 +210,9 @@ func TestUsageAndRequestFilters(t *testing.T) {
 	}
 	s.EnsureConversation(ctx, "conv", keyID)
 	tid, _ := s.CreateTranscript(ctx, "conv", "m", "m-upstream", `{"model":"m"}`)
-	s.CompleteTranscript(ctx, tid, `{"ok":true}`, 200, UsageEvent{KeyID: keyID, UpstreamID: upID})
+	s.CompleteTranscript(ctx, tid, `{"ok":true}`, 200, UsageEvent{
+		KeyID: keyID, UpstreamID: upID, PromptTokens: 1000, CompletionToken: 50,
+	})
 
 	// Key filter.
 	if got, _ := s.UsageSummary(ctx, UsageFilter{Keys: []string{"app"}}); len(got) != 1 {
@@ -256,9 +263,9 @@ func TestUsageAndRequestFilters(t *testing.T) {
 	}
 
 	// Per-column filters (including the numeric columns the admin UI offers).
-	rows, total, err = s.Requests(ctx, RequestFilter{Filter: map[string]FilterSpec{
-		"model":  {Op: FilterIn, Values: []string{"m"}},
-		"status": {Op: FilterEq, Values: []string{"200"}},
+	rows, total, err = s.Requests(ctx, RequestFilter{Filter: map[string]ColumnFilter{
+		"model":  oneCond(FilterIn, "m"),
+		"status": oneCond(FilterEq, "200"),
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -266,14 +273,74 @@ func TestUsageAndRequestFilters(t *testing.T) {
 	if len(rows) != 1 || total != 1 {
 		t.Errorf("requests filtered = %d/%d, want 1/1", len(rows), total)
 	}
-	rows, total, err = s.Requests(ctx, RequestFilter{Filter: map[string]FilterSpec{
-		"model": {Op: FilterContains, Values: []string{"nope"}},
+	rows, total, err = s.Requests(ctx, RequestFilter{Filter: map[string]ColumnFilter{
+		"model": oneCond(FilterContains, "nope"),
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rows) != 0 || total != 0 {
 		t.Errorf("requests filtered out = %d/%d, want 0/0", len(rows), total)
+	}
+
+	// Numeric ops compare as REAL: the transcript carries 1000 prompt tokens.
+	rows, total, err = s.Requests(ctx, RequestFilter{Filter: map[string]ColumnFilter{
+		"prompt": oneCond(FilterGT, "999"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("prompt GT 999 = %d rows, want 1", len(rows))
+	}
+	rows, total, err = s.Requests(ctx, RequestFilter{Filter: map[string]ColumnFilter{
+		"prompt": oneCond(FilterBetween, "0", "100"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("prompt BETWEEN 0..100 = %d rows, want 0", len(rows))
+	}
+
+	// Multi-condition filters: AND and OR on one column.
+	rows, _, err = s.Requests(ctx, RequestFilter{Filter: map[string]ColumnFilter{
+		"prompt": {Conditions: []ColumnCondition{
+			{Op: FilterGTE, Values: []string{"500"}},
+			{Op: FilterLTE, Values: []string{"2000"}},
+		}, Join: "and"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("prompt AND = %d rows, want 1", len(rows))
+	}
+	rows, _, err = s.Requests(ctx, RequestFilter{Filter: map[string]ColumnFilter{
+		"model": {Conditions: []ColumnCondition{
+			{Op: FilterEq, Values: []string{"zzz"}},
+			{Op: FilterEq, Values: []string{"m"}},
+		}, Join: "or"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("model OR = %d rows, want 1", len(rows))
+	}
+
+	// Validation rules: zero conditions, missing join, blank text values and
+	// non-numeric bounds are client errors, not silent match-alls.
+	for _, bad := range []map[string]ColumnFilter{
+		{"model": {}},
+		{"model": {Conditions: []ColumnCondition{{Op: FilterEq, Values: []string{"a"}}, {Op: FilterEq, Values: []string{"b"}}}}},
+		{"model": {Conditions: []ColumnCondition{{Op: FilterContains, Values: []string{"  "}}}}},
+		{"prompt": {Conditions: []ColumnCondition{{Op: FilterGT, Values: []string{"abc"}}}}},
+		{"prompt": {Conditions: []ColumnCondition{{Op: FilterBetween, Values: nil}}}},
+	} {
+		if _, _, err := s.Requests(ctx, RequestFilter{Filter: bad}); !errors.Is(err, ErrBadListParam) {
+			t.Errorf("bad filter %+v err = %v, want ErrBadListParam", bad, err)
+		}
 	}
 
 	// An in-flight transcript (no completed_at) has no duration.
@@ -334,8 +401,8 @@ func TestListPaginationSortFilter(t *testing.T) {
 	}
 
 	// Models: provider membership filter.
-	filtered, ftotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]FilterSpec{
-		"upstream": {Op: FilterIn, Values: []string{"beta"}},
+	filtered, ftotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]ColumnFilter{
+		"upstream": oneCond(FilterIn, "beta"),
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -345,8 +412,8 @@ func TestListPaginationSortFilter(t *testing.T) {
 	}
 
 	// Models: contains filter.
-	contains, ctotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]FilterSpec{
-		"displayName": {Op: FilterContains, Values: []string{"two"}},
+	contains, ctotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]ColumnFilter{
+		"displayName": oneCond(FilterContains, "two"),
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -365,8 +432,8 @@ func TestListPaginationSortFilter(t *testing.T) {
 	if len(byLimit) != 3 || byLimit[0].GatewayID != "alpha/a2" || byLimit[1].GatewayID != "alpha/a1" {
 		t.Errorf("models sort by inputLimit = %+v", byLimit)
 	}
-	limitFilter, lfTotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]FilterSpec{
-		"inputLimit": {Op: FilterIn, Values: []string{"5000"}},
+	limitFilter, lfTotal, err := s.ListModelsPaged(ctx, ListParams{Limit: -1, Filter: map[string]ColumnFilter{
+		"inputLimit": oneCond(FilterIn, "5000"),
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -380,7 +447,7 @@ func TestListPaginationSortFilter(t *testing.T) {
 		t.Errorf("unknown sort err = %v, want ErrBadListParam", err)
 	}
 	if _, _, err := s.ListModelsPaged(ctx, ListParams{
-		Filter: map[string]FilterSpec{"gatewayId": {Op: "bogus"}},
+		Filter: map[string]ColumnFilter{"gatewayId": oneCond("bogus")},
 	}); !errors.Is(err, ErrBadListParam) {
 		t.Errorf("unknown op err = %v, want ErrBadListParam", err)
 	}

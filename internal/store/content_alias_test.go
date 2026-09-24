@@ -173,12 +173,12 @@ func TestUsageDeletedKeyFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	count := func(f UsageFilter) int {
+	count := func(f UsageFilter) int64 {
 		rows, err := s.UsageSummary(ctx, f)
 		if err != nil {
 			t.Fatal(err)
 		}
-		n := 0
+		n := int64(0)
 		for _, r := range rows {
 			n += r.Requests
 		}

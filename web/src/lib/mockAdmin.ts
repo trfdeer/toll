@@ -5,6 +5,7 @@
 // generated method descriptor — the mock cannot drift from the schema.
 import { create } from "@bufbuild/protobuf";
 import {
+  durationFromMs,
   EmptySchema,
   timestampDate,
   timestampFromDate,
@@ -16,7 +17,21 @@ import {
   FilterOp,
   SortDirection,
   type ColumnFilter,
+  type ListParams,
+  type UsageFilter,
 } from "../gen/toll/admin/v1/common_pb";
+import {
+  GetUsageResponseSchema,
+  UsageRowSchema,
+  type GetUsageRequest,
+} from "../gen/toll/admin/v1/usage_pb";
+import {
+  ListRequestsResponseSchema,
+  RequestDetailSchema,
+  type GetRequestRequest,
+  type ListRequestsRequest,
+  type RequestDetail,
+} from "../gen/toll/admin/v1/requests_pb";
 import {
   CreateKeyResponseSchema,
   ListKeysResponseSchema,
@@ -54,7 +69,6 @@ import {
   type Model,
   type UpdateModelRequest,
 } from "../gen/toll/admin/v1/models_pb";
-import type { ListParams } from "../gen/toll/admin/v1/common_pb";
 
 // The same seed data the dev SPA showed before the REST mock was removed.
 const keys: VirtualKey[] = [
@@ -118,6 +132,38 @@ function matchesCell(s: string, f: ColumnFilter): boolean {
         return s === "";
       case FilterOp.NOT_BLANK:
         return s !== "";
+      case FilterOp.GT:
+      case FilterOp.GTE:
+      case FilterOp.LT:
+      case FilterOp.LTE: {
+        const bound = Number(vals[0]);
+        if (Number.isNaN(bound)) {
+          throw new ConnectError("op requires a numeric value", Code.InvalidArgument);
+        }
+        const cell = Number(s);
+        // Non-numeric cells never match the numeric ops.
+        if (Number.isNaN(cell)) return false;
+        switch (c.op) {
+          case FilterOp.GT:
+            return cell > bound;
+          case FilterOp.GTE:
+            return cell >= bound;
+          case FilterOp.LT:
+            return cell < bound;
+          default:
+            return cell <= bound;
+        }
+      }
+      case FilterOp.BETWEEN: {
+        const lower = vals[0] ? Number(vals[0]) : null;
+        const upper = vals[1] ? Number(vals[1]) : null;
+        if (lower === null && upper === null) {
+          throw new ConnectError("op between requires a bound", Code.InvalidArgument);
+        }
+        const cell = Number(s);
+        if (Number.isNaN(cell)) return false;
+        return (lower === null || cell >= lower) && (upper === null || cell <= upper);
+      }
       default:
         throw new ConnectError("op is not supported yet", Code.InvalidArgument);
     }
@@ -262,6 +308,9 @@ export function mockAdminRoutes(router: ConnectRouter) {
   router.rpc(AdminService.method.refreshModels, refreshModels);
   router.rpc(AdminService.method.updateModel, updateModel);
   router.rpc(AdminService.method.deleteModel, deleteModel);
+  router.rpc(AdminService.method.getUsage, getUsage);
+  router.rpc(AdminService.method.listRequests, listRequests);
+  router.rpc(AdminService.method.getRequest, getRequest);
 }
 
 // ---- providers & models ----
@@ -481,6 +530,249 @@ function deleteModel(req: DeleteModelRequest) {
   if (i < 0) throw new ConnectError(`model ${req.id} not found`, Code.NotFound);
   models.splice(i, 1);
   return create(EmptySchema);
+}
+
+// ---- usage & requests ----
+
+// The same seed data the dev REST mock showed before it was removed. One
+// transcript has no key (a deleted key) to exercise the empty-key placeholder.
+interface UsageSeed {
+  gatewayModel: string;
+  requests: number;
+  promptTokens: number;
+  cachedTokens: number;
+  completionTokens: number;
+  costUSD: number;
+  createdAt: Date;
+}
+const usageSeeds: UsageSeed[] = [
+  {
+    gatewayModel: "hyper/hyperbolic-70b",
+    requests: 2,
+    promptTokens: 330,
+    cachedTokens: 118,
+    completionTokens: 115,
+    costUSD: 0.0028,
+    createdAt: new Date("2026-09-14T10:02:00Z"),
+  },
+];
+
+interface RequestSeed {
+  id: bigint;
+  conversationId: string;
+  keyName: string;
+  gatewayModel: string;
+  status: number;
+  promptTokens: number;
+  cachedTokens: number;
+  completionTokens: number;
+  costUSD: number | null;
+  createdAt: Date;
+  durationMs: number | null;
+}
+const requestSeeds: RequestSeed[] = [
+  {
+    id: BigInt(1), conversationId: "conv-001", keyName: "web",
+    gatewayModel: "hyper/hyperbolic-70b", status: 200,
+    promptTokens: 120, cachedTokens: 0, completionTokens: 84,
+    costUSD: 0.0021, createdAt: new Date("2026-09-14T10:02:00Z"), durationMs: 2100,
+  },
+  {
+    id: BigInt(2), conversationId: "conv-001", keyName: "web",
+    gatewayModel: "hyper/hyperbolic-70b", status: 200,
+    promptTokens: 210, cachedTokens: 118, completionTokens: 31,
+    costUSD: 0.0007, createdAt: new Date("2026-09-14T10:03:00Z"), durationMs: 730,
+  },
+  {
+    id: BigInt(3), conversationId: "conv-002", keyName: "",
+    gatewayModel: "hyper/hyperbolic-70b", status: 429,
+    promptTokens: 90, cachedTokens: 0, completionTokens: 0,
+    costUSD: null, createdAt: new Date("2026-09-14T11:47:00Z"), durationMs: 45,
+  },
+];
+
+// usageRows are the seed rows keyed to the mock's provider, flattened per the
+// summary shape (one row per model).
+const usageRowCache = usageSeeds;
+
+// applyUsage narrows rows by the shared filter: [from, to] is closed; the
+// keys list matches live key names only, includeDeletedKeys adds the
+// deleted-key rows (keyName empty in the seed).
+function usageWindow<T extends { createdAt: Date; keyName?: string }>(
+  rows: T[],
+  f: UsageFilter | undefined,
+): T[] {
+  const from = f?.from ? timestampDate(f.from) : null;
+  const to = f?.to ? timestampDate(f.to) : null;
+  const keys = f?.keys ?? [];
+  return rows.filter(
+    (r) =>
+      (!from || r.createdAt >= from) &&
+      (!to || r.createdAt <= to) &&
+      (keys.length === 0 || r.keyName === undefined || keys.includes(r.keyName)),
+  );
+}
+
+function getUsage(req: GetUsageRequest) {
+  const kept = usageWindow(usageRowCache, req.filter);
+  // Group by model, then apply the summary column filters and sort.
+  const grouped = new Map<string, UsageSeed>();
+  for (const r of kept) {
+    const g = grouped.get(r.gatewayModel) ?? {
+      gatewayModel: r.gatewayModel,
+      requests: 0,
+      promptTokens: 0,
+      cachedTokens: 0,
+      completionTokens: 0,
+      costUSD: 0,
+      createdAt: r.createdAt,
+    };
+    g.requests += r.requests;
+    g.promptTokens += r.promptTokens;
+    g.cachedTokens += r.cachedTokens;
+    g.completionTokens += r.completionTokens;
+    g.costUSD += r.costUSD;
+    grouped.set(r.gatewayModel, g);
+  }
+  let rows = [...grouped.values()];
+  for (const [col, f] of Object.entries(req.params?.filter ?? {})) {
+    if (col !== "model") {
+      throw new ConnectError(`unknown filter column "${col}"`, Code.InvalidArgument);
+    }
+    rows = rows.filter((r) => matchesCell(r.gatewayModel, f));
+  }
+  rows = listWindow(rows, req.params, req.params?.sort ?? "", {
+    model: (r) => r.gatewayModel,
+    requests: (r) => r.requests,
+    prompt: (r) => r.promptTokens,
+    cached: (r) => r.cachedTokens,
+    completion: (r) => r.completionTokens,
+    cost: (r) => r.costUSD,
+  }, "model");
+
+  const totals = {
+    requests: kept.reduce((n, r) => n + r.requests, 0),
+    promptTokens: kept.reduce((n, r) => n + r.promptTokens, 0),
+    cachedTokens: kept.reduce((n, r) => n + r.cachedTokens, 0),
+    completionTokens: kept.reduce((n, r) => n + r.completionTokens, 0),
+    costUSD: kept.reduce((n, r) => n + r.costUSD, 0),
+  };
+  return create(GetUsageResponseSchema, {
+    rows: page(rows, req.params).map((r) =>
+      create(UsageRowSchema, {
+        gatewayModel: r.gatewayModel,
+        requests: BigInt(r.requests),
+        promptTokens: BigInt(r.promptTokens),
+        cachedTokens: BigInt(r.cachedTokens),
+        completionTokens: BigInt(r.completionTokens),
+        costUsd: r.costUSD,
+      })),
+    total: BigInt(rows.length),
+    totals: {
+      requests: BigInt(totals.requests),
+      promptTokens: BigInt(totals.promptTokens),
+      cachedTokens: BigInt(totals.cachedTokens),
+      completionTokens: BigInt(totals.completionTokens),
+      costUsd: totals.costUSD,
+    },
+  });
+}
+
+// requestCell renders a requests-table column for the filter ops.
+function requestCell(r: RequestSeed, col: string): string {
+  switch (col) {
+    case "key":
+      return r.keyName;
+    case "model":
+      return r.gatewayModel;
+    case "status":
+      return String(r.status);
+    case "prompt":
+      return String(r.promptTokens);
+    case "cached":
+      return String(r.cachedTokens);
+    case "completion":
+      return String(r.completionTokens);
+    case "cost":
+      return r.costUSD === null ? "" : String(r.costUSD);
+    default:
+      throw new ConnectError(`unknown filter column "${col}"`, Code.InvalidArgument);
+  }
+}
+
+const requestSorts: Record<string, (r: RequestSeed) => string | number> = {
+  id: (r) => Number(r.id),
+  time: (r) => r.createdAt.getTime(),
+  key: (r) => r.keyName,
+  model: (r) => r.gatewayModel,
+  status: (r) => r.status,
+  prompt: (r) => r.promptTokens,
+  cached: (r) => r.cachedTokens,
+  completion: (r) => r.completionTokens,
+  cost: (r) => r.costUSD ?? -1,
+  duration: (r) => r.durationMs ?? -1,
+};
+
+function listRequests(req: ListRequestsRequest) {
+  let rows = usageWindow(requestSeeds, req.filter).slice();
+  // Default order: newest first (the store's tiebreak direction).
+  rows.sort((a, b) => Number(b.id) - Number(a.id));
+  for (const [col, f] of Object.entries(req.params?.filter ?? {})) {
+    rows = rows.filter((r) => matchesCell(requestCell(r, col), f));
+  }
+  rows = listWindow(rows, req.params, req.params?.sort ?? "", requestSorts, "id");
+  const total = BigInt(rows.length);
+  return create(ListRequestsResponseSchema, {
+    requests: page(rows, req.params).map((r) => ({
+      id: r.id,
+      conversationId: r.conversationId,
+      keyName: r.keyName,
+      gatewayModel: r.gatewayModel,
+      status: r.status,
+      promptTokens: BigInt(r.promptTokens),
+      cachedTokens: BigInt(r.cachedTokens),
+      completionTokens: BigInt(r.completionTokens),
+      costUsd: r.costUSD === null ? undefined : r.costUSD,
+      createdAt: timestampFromDate(r.createdAt),
+      duration: r.durationMs === null
+        ? undefined
+        : durationFromMs(r.durationMs),
+    })),
+    total,
+  });
+}
+
+// The conversation detail of transcript 1, for the dev request panel.
+const requestDetailSeeds: Record<number, RequestDetail> = {
+  1: create(RequestDetailSchema, {
+    id: BigInt(1),
+    conversationId: "conv-001",
+    gatewayModel: "hyper/hyperbolic-70b",
+    upstreamModel: "glm-4.6",
+    status: 200,
+    createdAt: timestampFromDate(new Date("2026-09-14T10:02:00Z")),
+    completedAt: timestampFromDate(new Date("2026-09-14T10:02:02.100Z")),
+    duration: durationFromMs(2100),
+    contentStored: true,
+    messages: [
+      { role: "system", content: "You are a concise assistant." },
+      { role: "user", content: "What is an LLM gateway?" },
+      {
+        role: "assistant",
+        reasoning: "Keep it short.",
+        content: "An LLM gateway is a central layer that proxies requests to one or more model providers.",
+        finishReason: "stop",
+      },
+    ],
+  }),
+};
+
+function getRequest(req: GetRequestRequest) {
+  const detail = requestDetailSeeds[Number(req.id)];
+  if (!detail) {
+    throw new ConnectError(`request ${req.id} not found`, Code.NotFound);
+  }
+  return detail;
 }
 
 // ---- settings ----

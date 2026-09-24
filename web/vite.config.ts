@@ -5,9 +5,6 @@ import react from '@vitejs/plugin-react';
 import type {
   KeyFilter,
   Profile,
-  RequestDetail,
-  RequestRow,
-  UsageRow,
 } from './src/lib/types';
 
 interface ProfileBody {
@@ -170,42 +167,6 @@ function mockApi(): Plugin {
     return { rows: out.slice(p.offset, end), total };
   };
 
-  const requestDetails: Record<number, RequestDetail> = {
-    1: {
-      id: 1, conversationId: 'conv-001', gatewayModel: 'hyper/hyperbolic-70b',
-      upstreamModel: 'glm-4.6', status: 200, createdAt: '2026-09-14T10:02:00.000Z',
-      completedAt: '2026-09-14T10:02:02.100Z', durationMs: 2100, contentStored: true,
-      messages: [
-        { role: 'system', content: 'You are a concise assistant.' },
-        { role: 'user', content: 'What is an LLM gateway?' },
-        { role: 'assistant', reasoning: 'The user wants a one-line definition; keep it short.', content: 'An LLM gateway is a central layer that proxies requests to one or more model providers.', finishReason: 'stop' },
-      ],
-    },
-    2: {
-      id: 2, conversationId: 'conv-001', gatewayModel: 'hyper/hyperbolic-70b',
-      upstreamModel: 'glm-4.6', status: 200, createdAt: '2026-09-14T10:03:00.000Z',
-      completedAt: '2026-09-14T10:03:00.730Z', durationMs: 730, contentStored: true,
-      messages: [
-        { role: 'user', content: 'Summarize the previous answer in three words.' },
-        { role: 'assistant', content: 'Central model proxy.' },
-      ],
-    },
-    3: {
-      id: 3, conversationId: 'conv-002', gatewayModel: 'hyper/hyperbolic-70b',
-      upstreamModel: 'glm-4.6', status: 429, createdAt: '2026-09-14T11:47:00.000Z',
-      completedAt: '2026-09-14T11:47:00.045Z', durationMs: 45, contentStored: false,
-      messages: [
-        { role: 'system', content: 'You can call tools when useful.' },
-        { role: 'user', content: 'What is the weather in Berlin?' },
-        { role: 'assistant', content: '', finishReason: 'tool_calls', toolCalls: [
-          { id: 'call_1', name: 'get_weather', arguments: '{"city":"Berlin","units":"celsius"}' },
-        ] },
-        { role: 'tool', name: 'get_weather', toolCallId: 'call_1', content: '{"temp": 18, "sky": "cloudy"}' },
-        { role: 'assistant', content: '', reasoning: 'I have the result; summarize it.', finishReason: 'length' },
-      ],
-    },
-  };
-
   return {
     name: 'mock-admin-api',
     configureServer(server) {
@@ -215,68 +176,6 @@ function mockApi(): Plugin {
         const params = new URLSearchParams(query ?? '');
         const seg = path.split('/').filter(Boolean); // e.g. ["keys","web","revoke"]
 
-        // applyFilter mirrors the server's from/to/key constraints so the dev
-        // mock responds to the same query params as the real API.
-        const applyFilter = <T extends { createdAt: string; keyName?: string }>(rows: T[]): T[] => {
-          const from = params.get('from');
-          const to = params.get('to');
-          // The reserved deleted-keys sentinel is ignored by the dev mock.
-          const keyNames = params.getAll('key').filter((k) => k !== '__deleted__');
-          return rows.filter(
-            (r) =>
-              (!from || r.createdAt >= from) &&
-              (!to || r.createdAt <= to) &&
-              (keyNames.length === 0 ||
-                (r.keyName !== undefined && keyNames.includes(r.keyName)))
-          );
-        };
-
-        if (method === 'GET' && path === '/usage') {
-          const rows: Array<UsageRow & { createdAt: string }> = [
-            {
-              gatewayModel: 'hyper/hyperbolic-70b',
-              requests: 2, promptTokens: 330, cachedTokens: 118, completionTokens: 115, costUSD: 0.0028,
-              createdAt: '2026-09-14T10:02:00.000Z',
-            },
-          ];
-          const kept = applyFilter(rows);
-          const p = parseList(params);
-          const sortAcc = {
-            model: (x: UsageRow) => x.gatewayModel,
-            requests: (x: UsageRow) => x.requests,
-            prompt: (x: UsageRow) => x.promptTokens,
-            cached: (x: UsageRow) => x.cachedTokens,
-            completion: (x: UsageRow) => x.completionTokens,
-            cost: (x: UsageRow) => x.costUSD,
-          };
-          // Totals are over the whole filtered set, not just the page.
-          const all = applyList(
-            kept,
-            { ...p, limit: 0, offset: 0 },
-            sortAcc,
-            { model: (x) => x.gatewayModel },
-            50,
-            (a, b) => a.gatewayModel.localeCompare(b.gatewayModel),
-          );
-          if (all.error) return json(res, 400, { error: all.error });
-          const filtered = all.rows;
-          const limit = p.limit === undefined ? 50 : p.limit;
-          const start = p.offset;
-          const end = limit > 0 ? start + limit : undefined;
-          return json(res, 200, {
-            rows: filtered.slice(start, end),
-            total: filtered.length,
-            totalReqs: filtered.reduce((n, r) => n + r.requests, 0),
-            totalCost: filtered.reduce((n, r) => n + r.costUSD, 0).toFixed(4) + ' USD',
-            totals: {
-              requests: filtered.reduce((n, r) => n + r.requests, 0),
-              promptTokens: filtered.reduce((n, r) => n + r.promptTokens, 0),
-              cachedTokens: filtered.reduce((n, r) => n + r.cachedTokens, 0),
-              completionTokens: filtered.reduce((n, r) => n + r.completionTokens, 0),
-              costUSD: filtered.reduce((n, r) => n + r.costUSD, 0),
-            },
-          });
-        }
         if (method === 'GET' && path === '/profiles') {
           const p = parseList(params);
           const withCounts = profiles.map((x) => ({
@@ -352,62 +251,6 @@ function mockApi(): Plugin {
           }
           profiles.splice(i, 1);
           return json(res, 204, null);
-        }
-        if (method === 'GET' && path === '/requests') {
-          const all: RequestRow[] = [
-            {
-              id: 1, conversationId: 'conv-001', keyName: 'web', gatewayModel: 'hyper/hyperbolic-70b',
-              status: 200, promptTokens: 120, cachedTokens: 0, completionTokens: 84,
-              costUSD: 0.0021, createdAt: '2026-09-14T10:02:00.000Z', durationMs: 2100,
-            },
-            {
-              id: 2, conversationId: 'conv-001', keyName: 'web', gatewayModel: 'hyper/hyperbolic-70b',
-              status: 200, promptTokens: 210, cachedTokens: 118, completionTokens: 31,
-              costUSD: 0.0007, createdAt: '2026-09-14T10:03:00.000Z', durationMs: 730,
-            },
-            {
-              id: 3, conversationId: 'conv-002', keyName: 'batch', gatewayModel: 'hyper/hyperbolic-70b',
-              status: 429, promptTokens: 90, cachedTokens: 0, completionTokens: 0,
-              costUSD: null, createdAt: '2026-09-14T11:47:00.000Z', durationMs: 45,
-            },
-          ].sort((a, b) => b.id - a.id);
-          const kept = applyFilter(all);
-          const p = parseList(params);
-          const r = applyList(
-            kept,
-            p,
-            {
-              time: (x: RequestRow) => x.createdAt,
-              key: (x: RequestRow) => x.keyName,
-              model: (x: RequestRow) => x.gatewayModel,
-              status: (x: RequestRow) => x.status,
-              prompt: (x: RequestRow) => x.promptTokens,
-              cached: (x: RequestRow) => x.cachedTokens,
-              completion: (x: RequestRow) => x.completionTokens,
-              cost: (x: RequestRow) => x.costUSD ?? -1,
-              duration: (x: RequestRow) => x.durationMs ?? -1,
-              id: (x: RequestRow) => x.id,
-            },
-            {
-              key: (x: RequestRow) => x.keyName,
-              model: (x: RequestRow) => x.gatewayModel,
-              status: (x: RequestRow) => x.status,
-              prompt: (x: RequestRow) => x.promptTokens,
-              cached: (x: RequestRow) => x.cachedTokens,
-              completion: (x: RequestRow) => x.completionTokens,
-              cost: (x: RequestRow) => x.costUSD,
-            },
-            200,
-            (a, b) => b.id - a.id,
-          );
-          if (r.error) return json(res, 400, { error: r.error });
-          return json(res, 200, { requests: r.rows, total: r.total });
-        }
-        if (method === 'GET' && seg[0] === 'requests' && seg[1]) {
-          const id = Number(seg[1]);
-          const detail = requestDetails[id];
-          if (!detail) return json(res, 404, { error: 'request not found' });
-          return json(res, 200, detail);
         }
         next();
       });

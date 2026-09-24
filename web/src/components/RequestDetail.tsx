@@ -5,7 +5,10 @@ import {
   InlineNotification,
   Tag,
 } from "@carbon/react";
-import type { ChatMessage, RequestDetail as RequestDetailData } from "../lib/types";
+import type {
+  ChatMessage,
+  RequestDetailView as RequestDetailData,
+} from "../lib/types";
 import { formatDuration } from "../lib/format";
 
 // tagType maps an HTTP status onto a Carbon tag colour.

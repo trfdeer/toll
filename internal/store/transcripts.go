@@ -240,9 +240,9 @@ type RequestRow struct {
 	KeyName         string
 	GatewayModel    string
 	Status          int
-	PromptTokens    int
-	CompletionToken int
-	CachedTokens    int
+	PromptTokens    int64
+	CompletionToken int64
+	CachedTokens    int64
 	CostUSD         *float64
 	CreatedAt       string
 	// DurationMS is the wall-clock time from the transcript being created to
@@ -259,18 +259,16 @@ type RequestFilter struct {
 	Offset int
 	Sort   string
 	Dir    string
-	Filter map[string]FilterSpec
+	Filter map[string]ColumnFilter
 }
 
-// requestKeyExpr matches the label the admin UI shows for requests of deleted
-// keys, so the per-column key filter and sort agree with what is displayed.
-const requestKeyExpr = "COALESCE(vk.name, '(deleted key)')"
-
 // requestFilterCols and requestSortCols map the admin column ids to SQL
-// expressions for the requests table.
+// expressions for the requests table. The key column matches live key names
+// only: deleted-key rows are selected via UsageFilter.IncludeDeleted, and
+// their key_name renders empty for the UI to placeholder.
 var (
 	requestFilterCols = map[string]string{
-		"key":        requestKeyExpr,
+		"key":        "vk.name",
 		"model":      "t.gateway_model",
 		"status":     "COALESCE(t.status, 0)",
 		"prompt":     "COALESCE(t.prompt_tokens, 0)",
@@ -281,7 +279,7 @@ var (
 	requestSortCols = map[string]string{
 		"id":         "t.id",
 		"time":       "t.created_at",
-		"key":        requestKeyExpr,
+		"key":        "vk.name",
 		"model":      "t.gateway_model",
 		"status":     "COALESCE(t.status, 0)",
 		"prompt":     "COALESCE(t.prompt_tokens, 0)",
@@ -295,7 +293,7 @@ var (
 // Requests returns requests matching f along with the total number of matches
 // before windowing. It sorts by the requested column (newest first by default)
 // and applies the per-column filters.
-func (s *Store) Requests(ctx context.Context, f RequestFilter) ([]RequestRow, int, error) {
+func (s *Store) Requests(ctx context.Context, f RequestFilter) ([]RequestRow, int64, error) {
 	conds, args := f.where("t.created_at", "vk.name")
 	fconds, fargs, err := buildFilters(f.Filter, requestFilterCols)
 	if err != nil {
@@ -308,7 +306,7 @@ func (s *Store) Requests(ctx context.Context, f RequestFilter) ([]RequestRow, in
 		where = "WHERE " + strings.Join(conds, " AND ")
 	}
 
-	var total int
+	var total int64
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM transcripts t
@@ -323,7 +321,7 @@ func (s *Store) Requests(ctx context.Context, f RequestFilter) ([]RequestRow, in
 		return nil, 0, err
 	}
 	query := `
-		SELECT t.id, t.conversation_id, COALESCE(vk.name, '(deleted key)'),
+		SELECT t.id, t.conversation_id, COALESCE(vk.name, ''),
 		       t.gateway_model, COALESCE(t.status, 0),
 		       COALESCE(t.prompt_tokens,0), COALESCE(t.completion_tokens,0), COALESCE(t.cached_tokens,0),
 		       t.cost_usd, t.created_at,

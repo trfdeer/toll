@@ -1,12 +1,19 @@
 import { create } from "@bufbuild/protobuf";
 import {
+  timestampDate,
+  timestampFromDate,
+} from "@bufbuild/protobuf/wkt";
+import {
   ColumnFilterSchema,
   ColumnFilter_ConditionSchema,
+  FilterJoin,
   FilterOp,
   ListParamsSchema,
   SortDirection,
+  UsageFilterSchema,
   type ColumnFilter,
   type ListParams,
+  type UsageFilter,
 } from "../gen/toll/admin/v1/common_pb";
 import {
   DeleteKeyRequestSchema,
@@ -27,10 +34,8 @@ import type {
   ProfileRequest,
   ProfilesResponse,
   QueryParams,
-  RequestDetail,
-  RequestQuery,
   RequestsResponse,
-  UsageListQuery,
+  RequestDetailView,
   UsageSummary,
 } from "./types";
 import { admin } from "./connect";
@@ -102,14 +107,117 @@ function listParams(q: ListQuery | undefined): QueryParams {
   };
 }
 
-export const getUsage = (params: UsageListQuery): Promise<UsageSummary> =>
-  request(`/usage${qs(listParams(params))}`);
+// ---- usage & requests (ConnectRPC) ----
 
-export const getRequests = (params: RequestQuery): Promise<RequestsResponse> =>
-  request(`/requests${qs(listParams(params))}`);
+// usageQuery is the shared from/to/key narrowing. The UI's "(deleted keys)"
+// pseudo-entry maps onto includeDeletedKeys; real key names ride keys.
+export interface UsageQuery {
+  from?: string | null;
+  to?: string | null;
+  keys?: readonly string[];
+  includeDeletedKeys?: boolean;
+}
 
-export const getRequest = (id: number): Promise<RequestDetail> =>
-  request(`/requests/${encodeURIComponent(id)}`);
+// usageFilterProto encodes the shared narrowing. Bounds are inclusive and
+// ride as proto Timestamps; absent means unbounded.
+function usageFilterProto(q: UsageQuery): UsageFilter {
+  return create(UsageFilterSchema, {
+    keys: q.keys ? [...q.keys] : [],
+    includeDeletedKeys: q.includeDeletedKeys ?? false,
+    from: q.from ? timestampFromDate(new Date(q.from)) : undefined,
+    to: q.to ? timestampFromDate(new Date(q.to)) : undefined,
+  });
+}
+
+export const getUsage = async (
+  params: UsageQuery & ListQuery,
+): Promise<UsageSummary> => {
+  const res = await admin.getUsage({
+    filter: usageFilterProto(params),
+    params: listParamsProto(params),
+  });
+  return {
+    // int64 token sums arrive as bigint; the view layer works in numbers
+    // (exact to 2^53, far past any token count).
+    rows: res.rows.map((r) => ({
+      gatewayModel: r.gatewayModel,
+      requests: Number(r.requests),
+      promptTokens: Number(r.promptTokens),
+      cachedTokens: Number(r.cachedTokens),
+      completionTokens: Number(r.completionTokens),
+      costUSD: r.costUsd,
+    })),
+    total: Number(res.total),
+    totals: {
+      requests: Number(res.totals?.requests ?? 0n),
+      promptTokens: Number(res.totals?.promptTokens ?? 0n),
+      cachedTokens: Number(res.totals?.cachedTokens ?? 0n),
+      completionTokens: Number(res.totals?.completionTokens ?? 0n),
+      costUSD: res.totals?.costUsd ?? 0,
+    },
+  };
+};
+
+export const getRequests = async (
+  params: UsageQuery & ListQuery,
+): Promise<RequestsResponse> => {
+  const res = await admin.listRequests({
+    filter: usageFilterProto(params),
+    params: listParamsProto(params),
+  });
+  return {
+    requests: res.requests.map((t) => ({
+      id: Number(t.id),
+      conversationId: t.conversationId,
+      // A deleted key renders an empty name; the UI shows the placeholder.
+      keyName: t.keyName,
+      gatewayModel: t.gatewayModel,
+      status: t.status,
+      promptTokens: Number(t.promptTokens),
+      cachedTokens: Number(t.cachedTokens),
+      completionTokens: Number(t.completionTokens),
+      costUSD: t.costUsd === undefined ? null : t.costUsd,
+      createdAt: t.createdAt ? timestampDate(t.createdAt).toISOString() : "",
+      durationMs: t.duration
+        ? Number(t.duration.seconds) * 1000 + t.duration.nanos / 1e6
+        : null,
+    })),
+    total: Number(res.total),
+  };
+};
+
+// getRequest returns one transcript normalized into a conversation.
+export const getRequest = async (id: number): Promise<RequestDetailView> => {
+  const res = await admin.getRequest({ id: BigInt(id) });
+  return {
+    id: Number(res.id),
+    conversationId: res.conversationId,
+    gatewayModel: res.gatewayModel,
+    upstreamModel: res.upstreamModel,
+    status: res.status,
+    createdAt: res.createdAt ? timestampDate(res.createdAt).toISOString() : "",
+    completedAt: res.completedAt
+      ? timestampDate(res.completedAt).toISOString()
+      : "",
+    durationMs: res.duration
+      ? Number(res.duration.seconds) * 1000 + res.duration.nanos / 1e6
+      : null,
+    contentStored: res.contentStored,
+    messages: res.messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      reasoning: m.reasoning || undefined,
+      name: m.name || undefined,
+      toolCallId: m.toolCallId || undefined,
+      toolCalls: m.toolCalls.map((tc) => ({
+        id: tc.id || undefined,
+        name: tc.name,
+        arguments: tc.arguments || undefined,
+      })),
+      finishReason: m.finishReason || undefined,
+    })),
+  };
+};
 
 // ---- providers (ConnectRPC) ----
 
@@ -119,15 +227,17 @@ function providersParams(q: ListQuery | undefined): ListParams {
   const { filters, ...rest } = q ?? {};
   const { status, ...cols } = filters ?? {};
   if (status) {
-    for (const v of status.values) {
+    // The set filter arrives as one "in" condition; its values drive the
+    // disabled/reachable boolean columns.
+    for (const v of status.conditions.flatMap((c) => c.values)) {
       if (v === "disabled") {
-        cols.disabled = { op: "in", values: ["true"] };
+        cols.disabled = { conditions: [{ op: "in", values: ["true"] }] };
       } else if (v === "active") {
-        cols.disabled = { op: "in", values: ["false"] };
-        cols.reachable = { op: "in", values: ["true"] };
+        cols.disabled = { conditions: [{ op: "in", values: ["false"] }] };
+        cols.reachable = { conditions: [{ op: "in", values: ["true"] }] };
       } else if (v === "unreachable") {
-        cols.disabled = { op: "in", values: ["false"] };
-        cols.reachable = { op: "in", values: ["false"] };
+        cols.disabled = { conditions: [{ op: "in", values: ["false"] }] };
+        cols.reachable = { conditions: [{ op: "in", values: ["false"] }] };
       }
     }
   }
@@ -225,7 +335,8 @@ export const deleteProfile = (name: string): Promise<void> =>
 // ---- ConnectRPC list params ----
 
 // PROTO_OPS maps the UI's filter operator ids onto the proto enum. "in" is
-// the default set-membership op.
+// the default set-membership op; before/after already mapped onto gt/lt in
+// the UI layer.
 const PROTO_OPS: Record<UiFilterOp, FilterOp> = {
   in: FilterOp.IN,
   contains: FilterOp.CONTAINS,
@@ -236,24 +347,34 @@ const PROTO_OPS: Record<UiFilterOp, FilterOp> = {
   endsWith: FilterOp.ENDS_WITH,
   blank: FilterOp.BLANK,
   notBlank: FilterOp.NOT_BLANK,
+  gt: FilterOp.GT,
+  gte: FilterOp.GTE,
+  lt: FilterOp.LT,
+  lte: FilterOp.LTE,
+  between: FilterOp.BETWEEN,
 };
 
-// filtersProto encodes the UI's per-column filters as proto ColumnFilters.
-// Today's UI sends one condition per column; the schema's multi-condition
-// filters arrive with the migration's filter-engine phase. An empty "in"
-// set means match-nothing, exactly like the server's semantics.
+// filtersProto encodes the UI's per-column filters as proto ColumnFilters,
+// conditions and join intact. An empty "in" set means match-nothing, exactly
+// like the server's semantics.
 function filtersProto(
   filters: ColumnFilters | undefined,
 ): { [key: string]: ColumnFilter } {
   const out: { [key: string]: ColumnFilter } = {};
   for (const [col, spec] of Object.entries(filters ?? {})) {
     out[col] = create(ColumnFilterSchema, {
-      conditions: [
+      conditions: spec.conditions.map((c) =>
         create(ColumnFilter_ConditionSchema, {
-          op: PROTO_OPS[spec.op] ?? FilterOp.IN,
-          values: spec.values,
+          op: PROTO_OPS[c.op] ?? FilterOp.IN,
+          values: c.values,
         }),
-      ],
+      ),
+      join:
+        spec.join === "and"
+          ? FilterJoin.AND
+          : spec.join === "or"
+            ? FilterJoin.OR
+            : FilterJoin.UNSPECIFIED,
     });
   }
   return out;
@@ -290,15 +411,17 @@ function keysParams(q: ListQuery | undefined): ListParams {
   const { filters, ...rest } = q ?? {};
   const { status, ...cols } = filters ?? {};
   if (status) {
-    for (const v of status.values) {
+    // The set filter arrives as one "in" condition; its values drive the
+    // revoked/paused boolean columns.
+    for (const v of status.conditions.flatMap((c) => c.values)) {
       if (v === "revoked") {
-        cols.revoked = { op: "in", values: ["true"] };
+        cols.revoked = { conditions: [{ op: "in", values: ["true"] }] };
       } else if (v === "paused") {
-        cols.paused = { op: "in", values: ["true"] };
-        cols.revoked = { op: "in", values: ["false"] };
+        cols.paused = { conditions: [{ op: "in", values: ["true"] }] };
+        cols.revoked = { conditions: [{ op: "in", values: ["false"] }] };
       } else if (v === "active") {
-        cols.paused = { op: "in", values: ["false"] };
-        cols.revoked = { op: "in", values: ["false"] };
+        cols.paused = { conditions: [{ op: "in", values: ["false"] }] };
+        cols.revoked = { conditions: [{ op: "in", values: ["false"] }] };
       }
     }
   }

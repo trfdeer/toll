@@ -98,10 +98,10 @@ func (s *Store) UsageEvents(ctx context.Context) ([]UsageEvent, error) {
 // and callers that need the per-key split use the requests list.
 type UsageSummaryRow struct {
 	GatewayModel    string
-	Requests        int
-	PromptTokens    int
-	CompletionToken int
-	CachedTokens    int
+	Requests        int64
+	PromptTokens    int64
+	CompletionToken int64
+	CachedTokens    int64
 	CostUSD         float64
 	UpstreamCostUSD float64
 }
@@ -151,10 +151,10 @@ func (f UsageFilter) where(tsCol, keyCol string) ([]string, []any) {
 // UsageTotals is the aggregate over every row matching a filter, independent
 // of the current page, so a paginated summary can still show true totals.
 type UsageTotals struct {
-	Requests         int
-	PromptTokens     int
-	CachedTokens     int
-	CompletionTokens int
+	Requests         int64
+	PromptTokens     int64
+	CachedTokens     int64
+	CompletionTokens int64
 	CostUSD          float64
 }
 
@@ -181,7 +181,7 @@ var (
 // It returns the requested page of grouped rows, the total number of groups
 // matching the filter, and the true totals over the whole filtered set (not
 // just the current page).
-func (s *Store) UsageSummaryPaged(ctx context.Context, f UsageFilter, p ListParams) ([]UsageSummaryRow, int, UsageTotals, error) {
+func (s *Store) UsageSummaryPaged(ctx context.Context, f UsageFilter, p ListParams) ([]UsageSummaryRow, int64, UsageTotals, error) {
 	conds, args := f.where("ue.created_at", "vk.name")
 	fconds, fargs, err := buildFilters(p.Filter, usageSummaryFilterCols)
 	if err != nil {
@@ -205,7 +205,7 @@ func (s *Store) UsageSummaryPaged(ctx context.Context, f UsageFilter, p ListPara
 		return nil, 0, UsageTotals{}, err
 	}
 
-	var total int
+	var total int64
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM (
 			SELECT 1 FROM usage_events ue

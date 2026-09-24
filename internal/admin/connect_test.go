@@ -222,6 +222,23 @@ func TestConnectListKeysParams(t *testing.T) {
 		t.Errorf("paused filter = %s", protojson.Format(&list))
 	}
 
+	// Multi-condition filters: the UI's condition1 AND/OR condition2 shape
+	// survives the trip (the dropped-condition2 bug is fixed).
+	rpcOK(t, h, "ListKeys", `{"params": {"filter": {"name": {"conditions": [{"op": "FILTER_OP_STARTS_WITH", "values": ["a"]}, {"op": "FILTER_OP_STARTS_WITH", "values": ["g"]}], "join": "FILTER_JOIN_AND"}}}}`, &list)
+	if len(list.GetKeys()) != 0 {
+		t.Errorf("AND conditions matched: %s", protojson.Format(&list))
+	}
+	rpcOK(t, h, "ListKeys", `{"params": {"filter": {"name": {"conditions": [{"op": "FILTER_OP_STARTS_WITH", "values": ["a"]}, {"op": "FILTER_OP_STARTS_WITH", "values": ["g"]}], "join": "FILTER_JOIN_OR"}}}}`, &list)
+	if len(list.GetKeys()) != 2 {
+		t.Errorf("OR conditions = %s", protojson.Format(&list))
+	}
+
+	// Numeric ops compare as REAL: beta has 0 requests… (keys carry no
+	// numeric columns; the requests tests cover GT/BETWEEN.)
+
+	// Numeric and multi-condition ops on the requests surface are covered by
+	// TestConnectRequestsFilters; the keys table has no numeric columns.
+
 	// Malformed parameters fail loudly (proto/README.md item 8).
 	for _, tc := range []struct {
 		name   string
@@ -231,7 +248,6 @@ func TestConnectListKeysParams(t *testing.T) {
 		{"negative limit", `{"params": {"limit": -1}}`},
 		{"negative offset", `{"params": {"offset": -1}}`},
 		{"zero conditions", `{"params": {"filter": {"name": {"conditions": []}}}}`},
-		{"multi-condition", `{"params": {"filter": {"name": {"conditions": [{"op": "CONTAINS", "values": ["a"]}, {"op": "CONTAINS", "values": ["b"]}], "join": "FILTER_JOIN_AND"}}}}`},
 		{"unknown column", `{"params": {"filter": {"nope": {"conditions": [{"values": ["x"]}]}}}}`},
 		{"unknown sort column", `{"params": {"sort": "nope"}}`},
 		{"blank text-op value", `{"params": {"filter": {"name": {"conditions": [{"op": "FILTER_OP_CONTAINS", "values": ["  "]}]}}}}`},
@@ -263,6 +279,77 @@ func TestConnectUnmigratedRPCs(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/providers", nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("legacy GET /api/providers = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestConnectRequestsFilters covers the numeric filter ops (GT/BETWEEN),
+// multi-condition joins over requests columns and the int64 token sums.
+func TestConnectRequestsFilters(t *testing.T) {
+	st, h := setup(t)
+
+	upID, _ := st.UpsertUpstream(t.Context(), "hyper", "https://x/v1", "k", 300, 0)
+	keyID, _ := st.CreateVirtualKey(t.Context(), "app", "hash", 1)
+	record := func(model string, prompt, cached, completion int64) {
+		t.Helper()
+		st.EnsureConversation(t.Context(), "conv-"+model, keyID)
+		id, err := st.CreateTranscript(t.Context(), "conv-"+model, model, model, `{"model":"`+model+`"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.CompleteTranscript(t.Context(), id, `{"ok":true}`, 200, store.UsageEvent{
+			KeyID: keyID, UpstreamID: upID, GatewayModel: model, UpstreamModel: model,
+			PromptTokens: int(prompt), CachedTokens: int(cached), CompletionToken: int(completion),
+		})
+		if err := st.RecordUsage(t.Context(), store.UsageEvent{
+			KeyID: keyID, UpstreamID: upID, GatewayModel: model, UpstreamModel: model,
+			PromptTokens: int(prompt), CachedTokens: int(cached), CompletionToken: int(completion),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record("small", 10, 0, 5)
+	record("large", 5000, 100, 900)
+
+	total := func(filter string) int {
+		t.Helper()
+		var res adminv1.ListRequestsResponse
+		rpcOK(t, h, "ListRequests", filter, &res)
+		return len(res.GetRequests())
+	}
+
+	// Numeric ops compare as REAL.
+	if n := total(`{"params": {"filter": {"prompt": {"conditions": [{"op": "FILTER_OP_GT", "values": ["999"]}]}}}}`); n != 1 {
+		t.Errorf("prompt GT 999 rows = %d, want 1", n)
+	}
+	if n := total(`{"params": {"filter": {"prompt": {"conditions": [{"op": "FILTER_OP_BETWEEN", "values": ["10", "100"]}]}}}}`); n != 1 {
+		t.Errorf("prompt BETWEEN 10..100 rows = %d, want 1", n)
+	}
+	if n := total(`{"params": {"filter": {"prompt": {"conditions": [{"op": "FILTER_OP_BETWEEN", "values": ["", "20"]}]}}}}`); n != 1 {
+		t.Errorf("prompt BETWEEN unbounded..20 rows = %d, want 1", n)
+	}
+	rpcFail(t, h, "ListRequests", `{"params": {"filter": {"prompt": {"conditions": [{"op": "FILTER_OP_GT", "values": ["abc"]}]}}}}`, http.StatusBadRequest, "invalid_argument")
+	// A numeric op never matches a blank cell.
+	if n := total(`{"params": {"filter": {"cost": {"conditions": [{"op": "FILTER_OP_GT", "values": ["-1"]}]}}}}`); n != 0 {
+		t.Errorf("cost GT -1 rows = %d, want 0", n)
+	}
+
+	// Two conditions on one column, ANDed.
+	if n := total(`{"params": {"filter": {"prompt": {"conditions": [{"op": "FILTER_OP_GTE", "values": ["1"]}, {"op": "FILTER_OP_LTE", "values": ["20"]}], "join": "FILTER_JOIN_AND"}}}}`); n != 1 {
+		t.Errorf("prompt AND rows = %d, want 1", n)
+	}
+	// Two columns, ANDed across the filter map.
+	if n := total(`{"params": {"filter": {"model": {"conditions": [{"op": "FILTER_OP_STARTS_WITH", "values": ["large"]}]}, "status": {"conditions": [{"op": "FILTER_OP_EQUALS", "values": ["200"]}]}}}}`); n != 1 {
+		t.Errorf("model AND status rows = %d, want 1", n)
+	}
+
+	// Token sums are int64.
+	var usage adminv1.GetUsageResponse
+	rpcOK(t, h, "GetUsage", `{}`, &usage)
+	if got, want := usage.GetTotals().GetPromptTokens(), int64(5010); got != want {
+		t.Errorf("totals.promptTokens = %d, want %d", got, want)
+	}
+	if usage.GetTotal() != 2 {
+		t.Errorf("usage total = %d, want 2", usage.GetTotal())
 	}
 }
 

@@ -70,9 +70,8 @@ export interface UsageSummary {
   rows: UsageRow[];
   /** Number of grouped rows matching the filter (for pagination). */
   total: number;
-  totalReqs: number;
-  totalCost: string;
-  /** Aggregate over the whole filtered set, not just the current page. */
+  /** Aggregate over the whole filtered set, not just the current page.
+   * (The old totalReqs/totalCost duplicates are gone — proto/README item 9.) */
   totals: UsageTotals;
 }
 
@@ -114,7 +113,8 @@ export interface ChatMessage {
   finishReason?: string;
 }
 
-export interface RequestDetail {
+// RequestDetailView is one transcript normalized into a conversation.
+export interface RequestDetailView {
   id: number;
   conversationId: string;
   gatewayModel: string;
@@ -140,27 +140,23 @@ export type QueryValue =
 
 export type QueryParams = Record<string, QueryValue>;
 
-// UsageQuery is the shared from/to/key filter accepted by the usage and
-// requests endpoints. Declared as a type alias (not an interface) so it is
-// assignable to QueryParams' index signature.
-export type UsageQuery = {
-  /** Inclusive lower bound as an RFC3339 timestamp. */
+// UsageQuery is the shared from/to/key narrowing accepted by the usage and
+// requests calls. The UI's "(deleted keys)" pseudo-entry maps onto
+// includeDeletedKeys; real key names ride keys.
+export interface UsageQuery {
+  /** Inclusive lower bound as an RFC3339 timestamp; null is unbounded. */
   from?: string | null;
-  /** Inclusive upper bound as an RFC3339 timestamp. */
+  /** Inclusive upper bound as an RFC3339 timestamp; null is unbounded. */
   to?: string | null;
-  /** Restrict to these virtual key names (repeated as separate params). */
-  key?: readonly string[] | null;
-};
-
-export type RequestQuery = UsageQuery & ListQuery;
-
-/** /usage accepts the usage constraints plus list params. */
-export type UsageListQuery = UsageQuery & ListQuery;
+  keys?: readonly string[];
+  includeDeletedKeys?: boolean;
+}
 
 // ---- list parameters ----
 
 // FilterOp is how a server-side column filter matches values. The text ops
-// mirror the library's filter operators; "in" is a set membership.
+// mirror the library's filter operators; "in" is a set membership; the
+// numeric ops compare as REAL (before/after on dates map onto lt/gt).
 export type FilterOp =
   | "in"
   | "contains"
@@ -170,17 +166,29 @@ export type FilterOp =
   | "startsWith"
   | "endsWith"
   | "blank"
-  | "notBlank";
+  | "notBlank"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "between";
 
-// FilterSpec is one column's filter sent to the API. Values holds the selected
-// set for "in" (an empty string matches blanks) or the terms for "contains".
-export interface FilterSpec {
+// FilterCondition is one condition: the values are ORed. BLANK/NOT_BLANK
+// carry none; BETWEEN reads [lower, upper], either blank for unbounded.
+export interface FilterCondition {
   op: FilterOp;
   values: string[];
 }
 
-// ColumnFilters maps a column id to its filter.
-export type ColumnFilters = Record<string, FilterSpec>;
+// ColumnFilter is one column's predicate. The conditions combine per join;
+// a single condition ignores it.
+export interface ColumnFilterSpec {
+  conditions: FilterCondition[];
+  join?: "and" | "or";
+}
+
+// ColumnFilters maps a column id to its filter; columns AND together.
+export type ColumnFilters = Record<string, ColumnFilterSpec>;
 
 // ListQuery is the pagination, sorting and filtering shared by every admin
 // list endpoint. `filters` is encoded to the API's JSON `filter` parameter.

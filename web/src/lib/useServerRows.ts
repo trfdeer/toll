@@ -1,6 +1,11 @@
 import type { FilterState } from "react-data-table-component";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ColumnFilters, FilterOp, ListQuery } from "./types";
+import type {
+  ColumnFilters,
+  FilterCondition,
+  FilterOp,
+  ListQuery,
+} from "./types";
 
 /** The query a view's fetcher receives. */
 export interface ServerTableQuery extends ListQuery {
@@ -28,7 +33,9 @@ export interface ServerRows<T, M = undefined> {
   reload: () => void;
 }
 
-// mapOp maps the library's text-filter operator ids onto the API ops.
+// mapOp maps the library's filter operator ids onto the API ops. The date
+// bounds before/after map onto the numeric comparisons (ISO strings sort
+// chronologically, but the numeric columns are REAL comparisons).
 function mapOp(operator: string | undefined): FilterOp {
   switch (operator) {
     case "equals":
@@ -47,33 +54,66 @@ function mapOp(operator: string | undefined): FilterOp {
       return "notBlank";
     case "notContains":
       return "notContains";
+    case "gt":
+    case "after":
+      return "gt";
+    case "gte":
+      return "gte";
+    case "lt":
+    case "before":
+      return "lt";
+    case "lte":
+      return "lte";
+    case "between":
+      return "between";
     default:
       return "contains";
   }
 }
 
+// conditionOf converts one library filter condition; null drops it (blank
+// values would be an invalid server filter, so they are not sent).
+function conditionOf(c: FilterState["condition2"]): FilterCondition | null {
+  if (!c) return null;
+  const op = mapOp(c.operator);
+  if (op === "blank" || op === "notBlank") {
+    return { op, values: [] };
+  }
+  if (op === "between") {
+    const values = [c.value ?? "", c.value2 ?? ""];
+    if (values.every((v) => v === "")) return null;
+    return { op, values };
+  }
+  if (c.value === undefined || c.value === "") return null;
+  return { op, values: [String(c.value)] };
+}
+
 // translateFilters converts the library's per-column filter state into the
-// API's ColumnFilters. A set filter (filterType "set") carries values and
-// becomes an "in" membership; a text filter uses its operator and first
-// condition's value.
+// API's multi-condition ColumnFilters: a set filter (filterType "set")
+// carries values and becomes one "in" condition; a text/number filter maps
+// its condition1 (and condition2, per the AND/OR toggle) so the UI's
+// "contains a AND contains b" survives the trip to the server — today's
+// dropped-condition2 bug is fixed here.
 function translateFilters(
   values: Record<string, FilterState>,
 ): ColumnFilters {
   const out: ColumnFilters = {};
   for (const [id, f] of Object.entries(values)) {
     if (f.values) {
-      out[id] = { op: "in", values: f.values };
+      out[id] = { conditions: [{ op: "in", values: f.values }] };
       continue;
     }
-    const c = f.condition1;
-    if (!c) continue;
-    const op = mapOp(c.operator);
-    if (op === "blank" || op === "notBlank") {
-      out[id] = { op, values: [] };
-      continue;
+    const c1 = conditionOf(f.condition1);
+    if (!c1) continue;
+    const c2 = conditionOf(f.condition2);
+    if (c2) {
+      out[id] = {
+        conditions: [c1, c2],
+        join: f.logic === "OR" ? "or" : "and",
+      };
+    } else {
+      out[id] = { conditions: [c1] };
     }
-    if (c.value === undefined || c.value === "") continue;
-    out[id] = { op, values: [String(c.value)] };
   }
   return out;
 }

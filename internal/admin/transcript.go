@@ -2,9 +2,6 @@ package admin
 
 import (
 	"encoding/json"
-	"errors"
-	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -22,71 +19,16 @@ type toolCall struct {
 
 // chatMessage is one rendered turn in a request's conversation. content is
 // flattened to text (multimodal parts become their text, images a placeholder)
-// so the UI can render chat bubbles without knowing every upstream shape.
+// so the UI can render chat bubbles without knowing every upstream shape. The
+// connect surface maps these onto the proto messages.
 type chatMessage struct {
-	Role         string     `json:"role"`
-	Content      string     `json:"content"`
-	Reasoning    string     `json:"reasoning,omitempty"`
-	Name         string     `json:"name,omitempty"`
-	ToolCallID   string     `json:"toolCallId,omitempty"`
-	ToolCalls    []toolCall `json:"toolCalls,omitempty"`
-	FinishReason string     `json:"finishReason,omitempty"`
-}
-
-// requestDetail is GET /admin/api/requests/{id}: a stored transcript
-// normalized into a conversation plus its metadata.
-type requestDetail struct {
-	ID             int64  `json:"id"`
-	ConversationID string `json:"conversationId"`
-	GatewayModel   string `json:"gatewayModel"`
-	UpstreamModel  string `json:"upstreamModel"`
-	Status         int    `json:"status"`
-	CreatedAt      string `json:"createdAt"`
-	CompletedAt    string `json:"completedAt"`
-	DurationMS     *int64 `json:"durationMs"`
-	// ContentStored is false when prompt storage is disabled, so the UI can
-	// say so instead of showing an empty conversation.
-	ContentStored bool          `json:"contentStored"`
-	Messages      []chatMessage `json:"messages"`
-}
-
-// requestDetail serves one transcript as a chat conversation. Both the
-// request and response blobs are parsed defensively: an unrecognized shape
-// yields an empty conversation rather than an error.
-func (h *handlers) requestDetail(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be an integer"})
-		return
-	}
-	t, err := h.store.Transcript(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, store.ErrTranscriptNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "request not found"})
-			return
-		}
-		h.fail(w, err, "request unavailable")
-		return
-	}
-	// Bodies count as stored when they exist, even if prompt storage has since
-	// been disabled; the flag only drives the "storage disabled" notice.
-	contentStored := h.store.PromptsEnabled() || t.RequestJSON != "" || t.ResponseJSON != ""
-	writeJSON(w, http.StatusOK, buildRequestDetail(t, contentStored))
-}
-
-func buildRequestDetail(t store.TranscriptRow, contentStored bool) requestDetail {
-	return requestDetail{
-		ID:             t.ID,
-		ConversationID: t.ConversationID,
-		GatewayModel:   t.GatewayModel,
-		UpstreamModel:  t.UpstreamModel,
-		Status:         t.Status,
-		CreatedAt:      t.CreatedAt,
-		CompletedAt:    t.CompletedAt,
-		DurationMS:     transcriptDuration(t),
-		ContentStored:  contentStored,
-		Messages:       transcriptMessages(t),
-	}
+	Role         string
+	Content      string
+	Reasoning    string
+	Name         string
+	ToolCallID   string
+	ToolCalls    []toolCall
+	FinishReason string
 }
 
 // transcriptDuration is completed_at - created_at in milliseconds, or nil

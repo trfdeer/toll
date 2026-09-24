@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -54,7 +55,8 @@ func (h *handlers) connectError(err error, fallback string) error {
 	case errors.Is(err, store.ErrUpstreamNotFound),
 		errors.Is(err, store.ErrModelNotFound),
 		errors.Is(err, store.ErrProfileNotFound),
-		errors.Is(err, store.ErrKeyNotFound):
+		errors.Is(err, store.ErrKeyNotFound),
+		errors.Is(err, store.ErrTranscriptNotFound):
 		return connect.NewError(connect.CodeNotFound, errors.New(err.Error()))
 	case errors.Is(err, store.ErrAliasConflict),
 		errors.Is(err, store.ErrKeyNameExists):
@@ -187,6 +189,148 @@ func (s *connectService) DeleteKey(ctx context.Context, req *connect.Request[adm
 		return nil, s.connectError(err, "delete failed")
 	}
 	return connect.NewResponse(&emptypb.Empty{}), nil
+}
+
+// ---- usage & requests ----
+
+// GetUsage aggregates recorded usage per model over the filter range, with
+// true totals over the whole filtered set (not just the page).
+func (s *connectService) GetUsage(ctx context.Context, req *connect.Request[adminv1.GetUsageRequest]) (*connect.Response[adminv1.GetUsageResponse], error) {
+	filter := usageFilterFromProto(req.Msg.GetFilter())
+	p, err := listParamsFromProto(req.Msg.GetParams())
+	if err != nil {
+		return nil, s.connectError(err, "usage unavailable")
+	}
+	sum, total, totals, err := s.store.UsageSummaryPaged(ctx, filter, p)
+	if err != nil {
+		return nil, s.connectError(err, "usage unavailable")
+	}
+	rows := make([]*adminv1.UsageRow, 0, len(sum))
+	for _, r := range sum {
+		rows = append(rows, &adminv1.UsageRow{
+			GatewayModel:     r.GatewayModel,
+			Requests:         r.Requests,
+			PromptTokens:     r.PromptTokens,
+			CachedTokens:     r.CachedTokens,
+			CompletionTokens: r.CompletionToken,
+			CostUsd:          r.CostUSD,
+		})
+	}
+	return connect.NewResponse(&adminv1.GetUsageResponse{
+		Rows:  rows,
+		Total: total,
+		Totals: &adminv1.UsageTotals{
+			Requests:         totals.Requests,
+			PromptTokens:     totals.PromptTokens,
+			CachedTokens:     totals.CachedTokens,
+			CompletionTokens: totals.CompletionTokens,
+			CostUsd:          totals.CostUSD,
+		},
+	}), nil
+}
+
+// ListRequests returns a page of transcripts (one per gateway request).
+func (s *connectService) ListRequests(ctx context.Context, req *connect.Request[adminv1.ListRequestsRequest]) (*connect.Response[adminv1.ListRequestsResponse], error) {
+	p, err := listParamsFromProto(req.Msg.GetParams())
+	if err != nil {
+		return nil, s.connectError(err, "requests unavailable")
+	}
+	reqs, total, err := s.store.Requests(ctx, store.RequestFilter{
+		UsageFilter: usageFilterFromProto(req.Msg.GetFilter()),
+		Limit:       p.Limit,
+		Offset:      p.Offset,
+		Sort:        p.Sort,
+		Dir:         p.Dir,
+		Filter:      p.Filter,
+	})
+	if err != nil {
+		return nil, s.connectError(err, "requests unavailable")
+	}
+	out := make([]*adminv1.RequestSummary, 0, len(reqs))
+	for _, t := range reqs {
+		out = append(out, requestSummaryProto(t))
+	}
+	return connect.NewResponse(&adminv1.ListRequestsResponse{Requests: out, Total: total}), nil
+}
+
+// requestSummaryProto maps a transcript row. A deleted key renders an empty
+// key_name; the UI shows the placeholder (proto/README.md item 2).
+func requestSummaryProto(t store.RequestRow) *adminv1.RequestSummary {
+	out := &adminv1.RequestSummary{
+		Id:               t.ID,
+		ConversationId:   t.ConversationID,
+		KeyName:          t.KeyName,
+		GatewayModel:     t.GatewayModel,
+		Status:           int32(t.Status),
+		PromptTokens:     t.PromptTokens,
+		CompletionTokens: t.CompletionToken,
+		CachedTokens:     t.CachedTokens,
+		CreatedAt:        timestampFromStore(t.CreatedAt),
+	}
+	if t.CostUSD != nil {
+		out.CostUsd = t.CostUSD
+	}
+	if t.DurationMS != nil {
+		out.Duration = durationpb.New(time.Duration(*t.DurationMS) * time.Millisecond)
+	}
+	return out
+}
+
+// GetRequest returns one transcript normalized into a conversation.
+func (s *connectService) GetRequest(ctx context.Context, req *connect.Request[adminv1.GetRequestRequest]) (*connect.Response[adminv1.RequestDetail], error) {
+	t, err := s.store.Transcript(ctx, req.Msg.GetId())
+	if err != nil {
+		return nil, s.connectError(err, "request unavailable")
+	}
+	// Bodies count as stored when they exist, even if prompt storage has
+	// since been disabled; the flag only drives the "storage disabled" notice.
+	contentStored := s.store.PromptsEnabled() || t.RequestJSON != "" || t.ResponseJSON != ""
+
+	detail := &adminv1.RequestDetail{
+		Id:             t.ID,
+		ConversationId: t.ConversationID,
+		GatewayModel:   t.GatewayModel,
+		UpstreamModel:  t.UpstreamModel,
+		Status:         int32(t.Status),
+		CreatedAt:      timestampFromStore(t.CreatedAt),
+		ContentStored:  contentStored,
+	}
+	if t.CompletedAt != "" {
+		detail.CompletedAt = timestampFromStore(t.CompletedAt)
+	}
+	if ms := transcriptDuration(t); ms != nil {
+		detail.Duration = durationpb.New(time.Duration(*ms) * time.Millisecond)
+	}
+	for _, m := range transcriptMessages(t) {
+		pm := &adminv1.ChatMessage{
+			Role:         m.Role,
+			Content:      m.Content,
+			Reasoning:    m.Reasoning,
+			Name:         m.Name,
+			ToolCallId:   m.ToolCallID,
+			FinishReason: m.FinishReason,
+		}
+		for _, tc := range m.ToolCalls {
+			pm.ToolCalls = append(pm.ToolCalls, &adminv1.ToolCall{
+				Id: tc.ID, Name: tc.Name, Arguments: tc.Arguments,
+			})
+		}
+		detail.Messages = append(detail.Messages, pm)
+	}
+	return connect.NewResponse(detail), nil
+}
+
+// timestampFromStore parses the store's canonical UTC timestamp form; an
+// unparseable or empty value yields nil.
+func timestampFromStore(s string) *timestamppb.Timestamp {
+	if s == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return nil
+	}
+	return timestamppb.New(t)
 }
 
 // ---- providers & models ----

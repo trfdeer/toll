@@ -19,7 +19,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/log"
 
@@ -42,9 +41,6 @@ func Handler(st *store.Store, logger *log.Logger) http.Handler {
 	// matches canonical procedure paths, so the /api mount prefix is stripped.
 	_, connectHandler := adminv1connect.NewAdminServiceHandler(&connectService{handlers: h})
 	mux.Handle("POST /api/"+adminv1connect.AdminServiceName+"/", http.StripPrefix("/api", connectHandler))
-	mux.HandleFunc("GET /api/usage", h.usage)
-	mux.HandleFunc("GET /api/requests", h.requests)
-	mux.HandleFunc("GET /api/requests/{id}", h.requestDetail)
 	mux.HandleFunc("GET /api/profiles", h.profilesList)
 	mux.HandleFunc("POST /api/profiles", h.profilesCreate)
 	mux.HandleFunc("PUT /api/profiles/{name}", h.profilesUpdate)
@@ -84,132 +80,7 @@ func (h *handlers) fail(w http.ResponseWriter, err error, msg string) {
 	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})
 }
 
-// ---- usage ----
-
-func (h *handlers) usage(w http.ResponseWriter, r *http.Request) {
-	filter, ok := parseFilter(w, r)
-	if !ok {
-		return
-	}
-	p, ok := parseListParams(w, r)
-	if !ok {
-		return
-	}
-	sum, total, totals, err := h.store.UsageSummaryPaged(r.Context(), filter, p)
-	if err != nil {
-		h.listError(w, err, "usage unavailable")
-		return
-	}
-	type usageRow struct {
-		GatewayModel     string  `json:"gatewayModel"`
-		Requests         int     `json:"requests"`
-		PromptTokens     int     `json:"promptTokens"`
-		CachedTokens     int     `json:"cachedTokens"`
-		CompletionTokens int     `json:"completionTokens"`
-		CostUSD          float64 `json:"costUSD"`
-	}
-	rows := make([]usageRow, 0, len(sum))
-	for _, s := range sum {
-		rows = append(rows, usageRow{
-			GatewayModel: s.GatewayModel,
-			Requests:     s.Requests, PromptTokens: s.PromptTokens,
-			CachedTokens: s.CachedTokens, CompletionTokens: s.CompletionToken,
-			CostUSD: s.CostUSD,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"rows":      rows,
-		"total":     total,
-		"totalReqs": totals.Requests,
-		"totalCost": fmtUSD(totals.CostUSD),
-		"totals": map[string]any{
-			"requests":         totals.Requests,
-			"promptTokens":     totals.PromptTokens,
-			"cachedTokens":     totals.CachedTokens,
-			"completionTokens": totals.CompletionTokens,
-			"costUSD":          totals.CostUSD,
-		},
-	})
-}
-
-// requests lists requests (one per transcript), filtered by the optional
-// from/to (RFC3339) and key parameters, paginated by limit/offset, sorted by
-// sort/dir and narrowed by the per-column filter parameter.
-func (h *handlers) requests(w http.ResponseWriter, r *http.Request) {
-	filter, ok := parseFilter(w, r)
-	if !ok {
-		return
-	}
-	p, ok := parseListParams(w, r)
-	if !ok {
-		return
-	}
-	reqs, total, err := h.store.Requests(r.Context(), store.RequestFilter{
-		UsageFilter: filter, Limit: p.Limit, Offset: p.Offset,
-		Sort: p.Sort, Dir: p.Dir, Filter: p.Filter,
-	})
-	if err != nil {
-		h.listError(w, err, "requests unavailable")
-		return
-	}
-	type request struct {
-		ID               int64    `json:"id"`
-		ConversationID   string   `json:"conversationId"`
-		KeyName          string   `json:"keyName"`
-		GatewayModel     string   `json:"gatewayModel"`
-		Status           int      `json:"status"`
-		PromptTokens     int      `json:"promptTokens"`
-		CompletionTokens int      `json:"completionTokens"`
-		CachedTokens     int      `json:"cachedTokens"`
-		CostUSD          *float64 `json:"costUSD"`
-		CreatedAt        string   `json:"createdAt"`
-		DurationMS       *int64   `json:"durationMs"`
-	}
-	out := make([]request, 0, len(reqs))
-	for _, t := range reqs {
-		out = append(out, request{
-			ID: t.ID, ConversationID: t.ConversationID, KeyName: t.KeyName,
-			GatewayModel: t.GatewayModel, Status: t.Status,
-			PromptTokens: t.PromptTokens, CompletionTokens: t.CompletionToken,
-			CachedTokens: t.CachedTokens, CostUSD: t.CostUSD, CreatedAt: t.CreatedAt,
-			DurationMS: t.DurationMS,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"requests": out, "total": total})
-}
-
-// parseFilter reads the optional from/to (RFC3339) and key query parameters
-// shared by the usage and request endpoints. The reserved key value
-// deletedKeysSentinel selects events whose key has been deleted. It writes a
-// 400 on bad input.
-func parseFilter(w http.ResponseWriter, r *http.Request) (store.UsageFilter, bool) {
-	q := r.URL.Query()
-	f := store.UsageFilter{}
-	for _, k := range q["key"] {
-		if k == deletedKeysSentinel {
-			f.IncludeDeleted = true
-			continue
-		}
-		f.Keys = append(f.Keys, k)
-	}
-	for _, p := range []struct {
-		name string
-		dst  *string
-	}{{"from", &f.From}, {"to", &f.To}} {
-		v := q.Get(p.name)
-		if v == "" {
-			continue
-		}
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest,
-				map[string]string{"error": p.name + " must be an RFC3339 timestamp"})
-			return f, false
-		}
-		*p.dst = store.FormatTime(t)
-	}
-	return f, true
-}
+// ---- list params (profiles is the last REST list endpoint) ----
 
 // parseListParams reads the shared limit/offset/sort/dir/filter query
 // parameters used by the listing endpoints. limit=0 means "all rows" (stored
@@ -241,14 +112,27 @@ func parseListParams(w http.ResponseWriter, r *http.Request) (store.ListParams, 
 	p.Sort = q.Get("sort")
 	p.Dir = q.Get("dir")
 	if v := q.Get("filter"); v != "" {
-		var f map[string]store.FilterSpec
+		var f map[string]restFilterSpec
 		if err := json.Unmarshal([]byte(v), &f); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "filter must be a JSON object"})
 			return p, false
 		}
-		p.Filter = f
+		p.Filter = make(map[string]store.ColumnFilter, len(f))
+		for col, spec := range f {
+			p.Filter[col] = store.ColumnFilter{Conditions: []store.ColumnCondition{{
+				Op:     store.FilterOp(spec.Op),
+				Values: spec.Values,
+			}}}
+		}
 	}
 	return p, true
+}
+
+// restFilterSpec is the flat per-column filter the not-yet-migrated REST
+// endpoints accept (profiles today): one op with ORed values.
+type restFilterSpec struct {
+	Op     string   `json:"op"`
+	Values []string `json:"values"`
 }
 
 // listError reports a list query failure: an unknown sort/filter column is the
@@ -260,11 +144,6 @@ func (h *handlers) listError(w http.ResponseWriter, err error, msg string) {
 	}
 	h.fail(w, err, msg)
 }
-
-// deletedKeysSentinel is the reserved key-filter value that selects events
-// whose virtual key no longer exists. It is unlikely to collide with a real
-// key name (key names are user-chosen, so this is a documented convention).
-const deletedKeysSentinel = "__deleted__"
 
 // ---- profiles ----
 
@@ -444,9 +323,4 @@ func (h *handlers) spa(w http.ResponseWriter, r *http.Request) {
 		name = "index.html"
 	}
 	http.ServeFileFS(w, r, sub, name)
-}
-
-func fmtUSD(v float64) string {
-	b, _ := json.Marshal(v)
-	return string(b) + " USD"
 }

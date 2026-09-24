@@ -56,34 +56,17 @@ func TestProvidersAndUsage(t *testing.T) {
 		t.Errorf("unexpected models: %s", protojson.Format(&models))
 	}
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/usage", nil))
-	if rec.Code != 200 {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-	}
-	var usage struct {
-		Rows      []json.RawMessage `json:"rows"`
-		TotalReqs int               `json:"totalReqs"`
-		TotalCost string            `json:"totalCost"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &usage); err != nil {
-		t.Fatal(err)
-	}
-	if usage.TotalReqs != 0 || !strings.Contains(usage.TotalCost, "USD") {
-		t.Errorf("unexpected usage: %s", rec.Body.String())
+	var usage adminv1.GetUsageResponse
+	rpcOK(t, h, "GetUsage", `{}`, &usage)
+	if usage.GetTotals().GetRequests() != 0 {
+		t.Errorf("unexpected usage: %s", protojson.Format(&usage))
 	}
 
 	// Requests list (empty).
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/requests", nil))
-	var reqs struct {
-		Requests []json.RawMessage `json:"requests"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &reqs); err != nil {
-		t.Fatal(err)
-	}
-	if len(reqs.Requests) != 0 {
-		t.Errorf("unexpected requests: %s", rec.Body.String())
+	var reqs adminv1.ListRequestsResponse
+	rpcOK(t, h, "ListRequests", `{}`, &reqs)
+	if len(reqs.GetRequests()) != 0 {
+		t.Errorf("unexpected requests: %s", protojson.Format(&reqs))
 	}
 }
 
@@ -100,60 +83,34 @@ func TestUsageAndRequestFilters(t *testing.T) {
 	tid, _ := st.CreateTranscript(t.Context(), "conv", "m", "m-upstream", `{"model":"m"}`)
 	st.CompleteTranscript(t.Context(), tid, `{"ok":true}`, 200, store.UsageEvent{KeyID: keyID, UpstreamID: upID})
 
-	get := func(path string) *httptest.ResponseRecorder {
-		t.Helper()
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
-		return rec
+	// Requests narrowed by key: the completed one carries its duration.
+	var reqs adminv1.ListRequestsResponse
+	rpcOK(t, h, "ListRequests", `{"filter": {"keys": ["app"]}}`, &reqs)
+	if len(reqs.GetRequests()) != 1 || reqs.GetTotal() != 1 {
+		t.Errorf("key=app requests = %s", protojson.Format(&reqs))
+	}
+	if len(reqs.GetRequests()) == 1 && reqs.GetRequests()[0].GetDuration() == nil {
+		t.Error("completed request is missing duration")
+	}
+	rpcOK(t, h, "ListRequests", `{"filter": {"keys": ["nope"]}}`, &reqs)
+	if len(reqs.GetRequests()) != 0 {
+		t.Errorf("key=nope requests = %s", protojson.Format(&reqs))
 	}
 
-	var reqs struct {
-		Requests []struct {
-			DurationMS *int64 `json:"durationMs"`
-		} `json:"requests"`
-		Total int `json:"total"`
-	}
-	if err := json.Unmarshal(get("/api/requests?key=app").Body.Bytes(), &reqs); err != nil {
-		t.Fatal(err)
-	}
-	if len(reqs.Requests) != 1 || reqs.Total != 1 {
-		t.Errorf("key=app requests = %d/%d, want 1/1", len(reqs.Requests), reqs.Total)
-	}
-	if len(reqs.Requests) == 1 && reqs.Requests[0].DurationMS == nil {
-		t.Error("completed request is missing durationMs")
-	}
-	if err := json.Unmarshal(get("/api/requests?key=nope").Body.Bytes(), &reqs); err != nil {
-		t.Fatal(err)
-	}
-	if len(reqs.Requests) != 0 {
-		t.Errorf("key=nope requests = %d, want 0", len(reqs.Requests))
-	}
-
-	// A lower bound in the future excludes everything.
+	// A lower bound in the future excludes everything (closed interval).
 	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	if err := json.Unmarshal(get("/api/requests?from="+future).Body.Bytes(), &reqs); err != nil {
-		t.Fatal(err)
+	rpcOK(t, h, "ListRequests", `{"filter": {"from": "`+future+`"}}`, &reqs)
+	if len(reqs.GetRequests()) != 0 {
+		t.Errorf("future from requests = %s", protojson.Format(&reqs))
 	}
-	if len(reqs.Requests) != 0 {
-		t.Errorf("future from requests = %d, want 0", len(reqs.Requests))
-	}
-
-	var usage struct {
-		TotalReqs int `json:"totalReqs"`
-	}
-	if err := json.Unmarshal(get("/api/usage?from="+future).Body.Bytes(), &usage); err != nil {
-		t.Fatal(err)
-	}
-	if usage.TotalReqs != 0 {
-		t.Errorf("future from usage totalReqs = %d, want 0", usage.TotalReqs)
+	var usage adminv1.GetUsageResponse
+	rpcOK(t, h, "GetUsage", `{"filter": {"from": "`+future+`"}}`, &usage)
+	if usage.GetTotals().GetRequests() != 0 {
+		t.Errorf("future from usage totals = %s", protojson.Format(&usage))
 	}
 
-	if rec := get("/api/requests?from=not-a-time"); rec.Code != http.StatusBadRequest {
-		t.Errorf("bad from status = %d, want 400", rec.Code)
-	}
-	if rec := get("/api/requests?limit=1001"); rec.Code != http.StatusBadRequest {
-		t.Errorf("bad limit status = %d, want 400", rec.Code)
-	}
+	// Malformed parameters fail loudly.
+	rpcFail(t, h, "ListRequests", `{"params": {"limit": 1001}}`, http.StatusBadRequest, "invalid_argument")
 }
 
 func TestRequestDetailBuildsConversation(t *testing.T) {
@@ -166,17 +123,10 @@ func TestRequestDetailBuildsConversation(t *testing.T) {
 	respBody := `{"choices":[{"message":{"role":"assistant","content":"hello!"}}]}`
 	st.CompleteTranscript(t.Context(), id, respBody, 200, store.UsageEvent{KeyID: keyID, UpstreamID: 1})
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/requests/"+strconv.FormatInt(id, 10), nil))
-	if rec.Code != 200 {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-	}
-	var got requestDetail
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
-	if len(got.Messages) != 3 {
-		t.Fatalf("messages = %d, want 3: %s", len(got.Messages), rec.Body.String())
+	var got adminv1.RequestDetail
+	rpcOK(t, h, "GetRequest", `{"id": `+strconv.FormatInt(id, 10)+`}`, &got)
+	if len(got.GetMessages()) != 3 {
+		t.Fatalf("messages = %d, want 3: %s", len(got.GetMessages()), protojson.Format(&got))
 	}
 	want := []struct{ role, content string }{
 		{"system", "be nice"},
@@ -184,25 +134,16 @@ func TestRequestDetailBuildsConversation(t *testing.T) {
 		{"assistant", "hello!"},
 	}
 	for i, w := range want {
-		if got.Messages[i].Role != w.role || got.Messages[i].Content != w.content {
-			t.Errorf("message %d = %+v, want %s/%q", i, got.Messages[i], w.role, w.content)
+		if got.GetMessages()[i].GetRole() != w.role || got.GetMessages()[i].GetContent() != w.content {
+			t.Errorf("message %d = %s, want %s/%q", i, protojson.Format(got.GetMessages()[i]), w.role, w.content)
 		}
 	}
-	if got.DurationMS == nil {
-		t.Error("durationMs is nil for a completed request")
+	if got.GetDuration() == nil {
+		t.Error("duration is nil for a completed request")
 	}
 
-	// Unknown id and non-integer id.
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/requests/9999", nil))
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("unknown id status = %d, want 404", rec.Code)
-	}
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/requests/nope", nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("bad id status = %d, want 400", rec.Code)
-	}
+	// Unknown id → not_found.
+	rpcFail(t, h, "GetRequest", `{"id": 9999}`, http.StatusNotFound, "not_found")
 }
 
 func TestProfilesCRUD(t *testing.T) {
