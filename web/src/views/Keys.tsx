@@ -1,6 +1,7 @@
-import { Add, Close, Edit, Pause, Play, TrashCan } from "@carbon/icons-react";
+import { Add, Close, Edit, Pause, Play, Renew, TrashCan } from "@carbon/icons-react";
 import {
   Button,
+  Checkbox,
   Column,
   Grid,
   IconButton,
@@ -20,34 +21,41 @@ import {
   deleteKey,
   getKeys,
   getProfiles,
-  pauseKey,
-  resumeKey,
   revokeKey,
+  rotateKey,
   updateKey,
 } from "../lib/api";
 import { errorMessage } from "../lib/errors";
-import type { Profile, VirtualKey } from "../lib/types";
+import type { Profile } from "../lib/types";
 import {
   serverTableProps,
   useServerRows,
   type ServerTableQuery,
 } from "../lib/useServerRows";
+import type { VirtualKey } from "../gen/toll/admin/v1/keys_pb";
 
 // KeyRow adds the stable table key; keys are addressed by name.
 type KeyRow = VirtualKey & { id: string };
 
 const STATUS_VALUES = ["active", "paused", "revoked"];
 
+// A one-time secret banner: create and rotate both reveal a plaintext once.
+interface Flash {
+  title: string;
+  plaintext: string;
+}
+
 export default function Keys() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
-  const [flash, setFlash] = useState<string | null>(null);
+  const [flash, setFlash] = useState<Flash | null>(null);
   const [open, setOpen] = useState(false);
   // editing is the key being edited, or null when the modal creates one.
   const [editing, setEditing] = useState<VirtualKey | null>(null);
   const [name, setName] = useState("");
   const [profile, setProfile] = useState("All");
+  const [pausedDraft, setPausedDraft] = useState(false);
   const [busy, setBusy] = useState(false);
 
   // The profile dropdown needs the full list, not one page.
@@ -74,6 +82,7 @@ export default function Keys() {
   const resetForm = () => {
     setName("");
     setProfile("All");
+    setPausedDraft(false);
   };
 
   const openCreate = () => {
@@ -87,6 +96,7 @@ export default function Keys() {
     setEditing(k);
     setName(k.name);
     setProfile(k.profile || "All");
+    setPausedDraft(k.paused);
     setFormError(null);
     setOpen(true);
   };
@@ -103,14 +113,20 @@ export default function Keys() {
     setFormError(null);
     try {
       if (editing) {
-        await updateKey(editing.name, { name: name.trim(), profile });
+        // PATCH semantics: only the fields that changed ride along; the
+        // profile is always sent (an empty selection would reset to All).
+        await updateKey(editing.name, {
+          newName: name.trim() !== editing.name ? name.trim() : undefined,
+          profile,
+          paused: pausedDraft,
+        });
         table.reload();
         setOpen(false);
         setEditing(null);
         resetForm();
       } else {
         const res = await createKey(name.trim(), profile);
-        setFlash(res.plaintext);
+        setFlash({ title: "Key created", plaintext: res.plaintext });
         table.reload();
         setOpen(false);
         resetForm();
@@ -132,20 +148,23 @@ export default function Keys() {
     }
   };
 
-  const pause = async (keyName: string) => {
+  // setPaused replaces the pause/resume route pair with a UpdateKey patch.
+  const setPaused = async (keyName: string, paused: boolean) => {
     setError(null);
     try {
-      await pauseKey(keyName);
+      await updateKey(keyName, { paused });
       table.reload();
     } catch (err) {
       setError(errorMessage(err));
     }
   };
 
-  const resume = async (keyName: string) => {
+  // rotate replaces a key's secret under the same name and profile.
+  const rotate = async (keyName: string) => {
     setError(null);
     try {
-      await resumeKey(keyName);
+      const res = await rotateKey(keyName);
+      setFlash({ title: "Key rotated", plaintext: res.plaintext });
       table.reload();
     } catch (err) {
       setError(errorMessage(err));
@@ -184,9 +203,18 @@ export default function Keys() {
           size="sm"
           label={paused ? "Resume" : "Pause"}
           disabled={revoked}
-          onClick={() => (paused ? resume(k.name) : pause(k.name))}
+          onClick={() => setPaused(k.name, !paused)}
         >
           {paused ? <Play /> : <Pause />}
+        </IconButton>
+        <IconButton
+          kind="ghost"
+          size="sm"
+          label="Rotate secret"
+          disabled={revoked}
+          onClick={() => rotate(k.name)}
+        >
+          <Renew />
         </IconButton>
         <IconButton
           kind="ghost"
@@ -229,7 +257,9 @@ export default function Keys() {
       id: "status",
       name: "Status",
       selector: (k) => status(k),
-      sortable: true,
+      // Status is derived from the revoked/paused columns, which the schema
+      // filters on individually; the API layer translates the set filter.
+      sortable: false,
       filterable: true,
       filterType: "set",
       filterOptions: { values: STATUS_VALUES },
@@ -239,7 +269,7 @@ export default function Keys() {
       id: "actions",
       name: "",
       right: true,
-      width: "180px",
+      width: "220px",
       cell: (k) => <div className="row-actions">{actionsFor(k)}</div>,
     },
   ];
@@ -252,8 +282,8 @@ export default function Keys() {
             <InlineNotification
               kind="success"
               lowContrast
-              title="Key created"
-              subtitle={`Copy it now, it will not be shown again: ${flash}`}
+              title={flash.title}
+              subtitle={`Copy it now, it will not be shown again: ${flash.plaintext}`}
               onCloseButtonClick={() => setFlash(null)}
             />
           )}
@@ -320,6 +350,14 @@ export default function Keys() {
               />
             ))}
           </Select>
+          {editing && (
+            <Checkbox
+              id="key-paused"
+              labelText="Paused"
+              checked={pausedDraft}
+              onChange={(_, { checked }) => setPausedDraft(checked)}
+            />
+          )}
           <p>
             The profile defines which providers and models this key may use. It
             can be shared by multiple keys and is managed on the Profiles page.

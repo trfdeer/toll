@@ -11,7 +11,6 @@
 package admin
 
 import (
-	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -26,7 +25,6 @@ import (
 	"github.com/charmbracelet/log"
 
 	adminv1connect "github.com/trfdeer/toll/gen/toll/admin/v1/adminv1connect"
-	"github.com/trfdeer/toll/internal/keys"
 	"github.com/trfdeer/toll/internal/store"
 )
 
@@ -66,13 +64,6 @@ func Handler(st *store.Store, logger *log.Logger) http.Handler {
 	mux.HandleFunc("POST /api/profiles", h.profilesCreate)
 	mux.HandleFunc("PUT /api/profiles/{name}", h.profilesUpdate)
 	mux.HandleFunc("DELETE /api/profiles/{name}", h.profilesDelete)
-	mux.HandleFunc("GET /api/keys", h.keysList)
-	mux.HandleFunc("POST /api/keys", h.keysCreate)
-	mux.HandleFunc("PUT /api/keys/{name}", h.keysUpdate)
-	mux.HandleFunc("POST /api/keys/{name}/revoke", h.keysRevoke)
-	mux.HandleFunc("POST /api/keys/{name}/pause", h.keysPause)
-	mux.HandleFunc("POST /api/keys/{name}/resume", h.keysResume)
-	mux.HandleFunc("DELETE /api/keys/{name}", h.keysDelete)
 	mux.HandleFunc("GET /{$}", h.spa)
 	mux.HandleFunc("GET /{rest...}", h.spa)
 
@@ -635,6 +626,22 @@ type profileRequest struct {
 	Parents        []string        `json:"parents"`
 }
 
+// validateFilter rejects an unknown mode or an include/exclude filter with no
+// values (which would allow nothing and is almost certainly a mistake).
+func validateFilter(f store.KeyFilter) error {
+	switch f.Mode {
+	case "", "none":
+		return nil
+	case "include", "exclude":
+		if len(f.Values) == 0 {
+			return errors.New("mode " + f.Mode + " requires at least one value")
+		}
+		return nil
+	default:
+		return errors.New("mode must be none, include or exclude")
+	}
+}
+
 // validateProfileRequest checks the name, both filters and the leaf/derived
 // XOR: a profile either carries filters or references parents, never both. It
 // trims parent names in place so the store sees the same values that were
@@ -733,181 +740,6 @@ func (h *handlers) writeProfileError(w http.ResponseWriter, err error, fallback 
 	default:
 		h.fail(w, err, fallback)
 	}
-}
-
-// ---- virtual keys ----
-
-type keyView struct {
-	Name    string `json:"name"`
-	Profile string `json:"profile"`
-	Revoked bool   `json:"revoked"`
-	Paused  bool   `json:"paused"`
-}
-
-func (h *handlers) keysList(w http.ResponseWriter, r *http.Request) {
-	p, ok := parseListParams(w, r)
-	if !ok {
-		return
-	}
-	vks, total, err := h.store.ListVirtualKeysPaged(r.Context(), p)
-	if err != nil {
-		h.listError(w, err, "keys unavailable")
-		return
-	}
-	out := make([]keyView, 0, len(vks))
-	for _, vk := range vks {
-		out = append(out, keyView{
-			Name:    vk.Name,
-			Profile: vk.ProfileName,
-			Revoked: vk.Revoked,
-			Paused:  vk.Paused,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": out, "total": total})
-}
-
-type createKeyRequest struct {
-	Name    string `json:"name"`
-	Profile string `json:"profile"`
-}
-
-// resolveProfile maps an optional profile name to the seeded "All" profile
-// when the request omits one.
-func (h *handlers) resolveProfile(ctx context.Context, name string) (store.Profile, error) {
-	if strings.TrimSpace(name) == "" {
-		name = store.DefaultProfileName
-	}
-	return h.store.ProfileByName(ctx, name)
-}
-
-func (h *handlers) keysCreate(w http.ResponseWriter, r *http.Request) {
-	req, ok := readJSON[createKeyRequest](w, r)
-	if !ok {
-		return
-	}
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "name is required"})
-		return
-	}
-	prof, err := h.resolveProfile(r.Context(), req.Profile)
-	if err != nil {
-		if errors.Is(err, store.ErrProfileNotFound) {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "profile not found"})
-			return
-		}
-		h.fail(w, err, "could not create key")
-		return
-	}
-
-	plaintext, hash, err := keys.Generate()
-	if err != nil {
-		h.fail(w, err, "key generation failed")
-		return
-	}
-	if _, err := h.store.CreateVirtualKey(r.Context(), name, hash, prof.ID); err != nil {
-		// Likely a duplicate name.
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "could not create key: " + err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"plaintext": plaintext})
-}
-
-// keysUpdate edits an existing key's name and/or profile in place. The key
-// material is unchanged, so clients keep working across the edit.
-func (h *handlers) keysUpdate(w http.ResponseWriter, r *http.Request) {
-	current := r.PathValue("name")
-	req, ok := readJSON[createKeyRequest](w, r)
-	if !ok {
-		return
-	}
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "name is required"})
-		return
-	}
-	prof, err := h.resolveProfile(r.Context(), req.Profile)
-	if err != nil {
-		if errors.Is(err, store.ErrProfileNotFound) {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "profile not found"})
-			return
-		}
-		h.fail(w, err, "could not update key")
-		return
-	}
-	if err := h.store.UpdateVirtualKey(r.Context(), current, store.VirtualKeyUpdate{
-		Name:      &name,
-		ProfileID: &prof.ID,
-	}); err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found"})
-			return
-		}
-		// Most likely a rename onto an existing name.
-		writeJSON(w, http.StatusUnprocessableEntity,
-			map[string]string{"error": "could not update key: " + err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusNoContent, nil)
-}
-
-// validateFilter rejects an unknown mode or an include/exclude filter with no
-// values (which would allow nothing and is almost certainly a mistake).
-func validateFilter(f store.KeyFilter) error {
-	switch f.Mode {
-	case "", "none":
-		return nil
-	case "include", "exclude":
-		if len(f.Values) == 0 {
-			return errors.New("mode " + f.Mode + " requires at least one value")
-		}
-		return nil
-	default:
-		return errors.New("mode must be none, include or exclude")
-	}
-}
-
-func (h *handlers) keysRevoke(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	// The store now reports unknown keys (the connect surface maps them to
-	// not_found); the legacy route keeps its old silent no-op until it is
-	// deleted in phase 2.
-	if err := h.store.RevokeVirtualKey(r.Context(), name); err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-		h.fail(w, err, "revoke failed")
-		return
-	}
-	writeJSON(w, http.StatusNoContent, nil)
-}
-
-func (h *handlers) keysPause(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if err := h.store.PauseVirtualKey(r.Context(), name); err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-		h.fail(w, err, "pause failed")
-		return
-	}
-	writeJSON(w, http.StatusNoContent, nil)
-}
-
-func (h *handlers) keysResume(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if err := h.store.ResumeVirtualKey(r.Context(), name); err != nil {
-		h.fail(w, err, "resume failed")
-		return
-	}
-	writeJSON(w, http.StatusNoContent, nil)
-}
-
-func (h *handlers) keysDelete(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if err := h.store.DeleteVirtualKey(r.Context(), name); err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found"})
-			return
-		}
-		h.fail(w, err, "delete failed")
-		return
-	}
-	writeJSON(w, http.StatusNoContent, nil)
 }
 
 // ---- SPA ----

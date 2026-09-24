@@ -89,6 +89,13 @@ func TestConnectKeysLifecycle(t *testing.T) {
 	}
 	wantConnectCode(t, rec, "already_exists")
 
+	// Unknown profile.
+	rec = rpc(t, h, "CreateKey", `{"name": "bad", "profile": "nope"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown profile = %d, want 404", rec.Code)
+	}
+	wantConnectCode(t, rec, "not_found")
+
 	// A second key to test rename conflicts against.
 	rpcOK(t, h, "CreateKey", `{"name": "other"}`, new(adminv1.CreateKeyResponse))
 

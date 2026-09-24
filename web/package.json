@@ -11,6 +11,7 @@
     "@bufbuild/protobuf": "^2",
     "@carbon/react": "^1.87.0",
     "@connectrpc/connect": "^2",
+    "@connectrpc/connect-web": "^2",
     "react": "^19.1.0",
     "react-data-table-component": "^8.10.0",
     "react-dom": "^19.1.0",

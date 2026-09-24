@@ -1,10 +1,11 @@
 # Admin API → ConnectRPC migration plan
 
 Branch: `feat/admin-connect-migration`.
-Phase 0 (schema + committed codegen) and phase 1 (connect server skeleton +
-`keys` pilot) are done: `proto/toll/admin/v1`, `gen/`, `web/src/gen/`,
-`buf.*.yaml`, the mounted handler in `internal/admin/connect.go` and the
-store changes it needed. See `proto/README.md` for the
+Phases 0–2 are done: the schema + committed codegen (0), the mounted
+connect handler with the `keys` pilot server-side (1), and the SPA flip
+with the keys REST routes and dev mocks deleted (2). The generated TS
+service descriptors come from protoc-gen-es v2 (the connectrpc/es plugin
+no longer exists in connect-es v2). See `proto/README.md` for the
 deliberate behavior changes this plan implements — they are product
 decisions, not transcription choices.
 

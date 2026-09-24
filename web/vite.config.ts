@@ -11,18 +11,12 @@ import type {
   RequestDetail,
   RequestRow,
   UsageRow,
-  VirtualKey,
 } from './src/lib/types';
 
 interface CreateProviderBody {
   name?: string;
   baseURL?: string;
   apiKey?: string;
-}
-
-interface CreateKeyBody {
-  name?: string;
-  profile?: string;
 }
 
 interface ProfileBody {
@@ -34,18 +28,22 @@ interface ProfileBody {
 
 // In-memory mock of the toll admin API so the UI can be developed without a
 // running toll. The real API lives in internal/admin (Go) and speaks the same
-// shapes under /admin/api/*.
+// shapes under /admin/api/*. Migrated resources (virtual keys) are not mocked
+// here anymore: their ConnectRPC client runs against an in-memory transport
+// (web/src/lib/mockKeys.ts), so only the REST surfaces below remain.
 function mockApi(): Plugin {
   const none: KeyFilter = { mode: 'none', values: [] };
   const profiles: Profile[] = [
-    { name: 'All', providerFilter: none, modelFilter: none, parents: [], isDefault: true, keyCount: 0, childCount: 0 },
+    // keyCount is static here: the keys themselves live in the SPA's
+    // in-memory ConnectRPC mock, which this server-side process cannot see.
+    { name: 'All', providerFilter: none, modelFilter: none, parents: [], isDefault: true, keyCount: 1, childCount: 1 },
     {
       name: 'hyper-chat',
       providerFilter: { mode: 'include', values: ['hyper'] },
       modelFilter: { mode: 'exclude', values: ['hyper/deepseek-v3'] },
       parents: [],
       isDefault: false,
-      keyCount: 0,
+      keyCount: 1,
       childCount: 1,
     },
     {
@@ -57,10 +55,6 @@ function mockApi(): Plugin {
       keyCount: 0,
       childCount: 0,
     },
-  ];
-  const keys: VirtualKey[] = [
-    { name: 'web', profile: 'All', paused: false, revoked: false },
-    { name: 'batch', profile: 'hyper-chat', paused: false, revoked: true },
   ];
   
 
@@ -189,8 +183,7 @@ function mockApi(): Plugin {
     m.disabled ? 'disabled' : m.providerDisabled ? 'provider disabled' : !m.providerReachable ? 'unreachable' : 'active';
   const providerStatus = (p: Provider): string =>
     p.disabled ? 'disabled' : p.reachable ? 'active' : 'unreachable';
-  const keyStatus = (k: VirtualKey): string =>
-    k.revoked ? 'revoked' : k.paused ? 'paused' : 'active';
+
 
   // Metadata-derived model columns, mirroring the model_search view's
   // json_extract coalesce chains.
@@ -470,24 +463,11 @@ function mockApi(): Plugin {
             },
           });
         }
-        if (method === 'GET' && path === '/keys') {
-          const p = parseList(params);
-          const r = applyList(
-            keys,
-            p,
-            { name: (k) => k.name, profile: (k) => k.profile, status: keyStatus },
-            { name: (k) => k.name, profile: (k) => k.profile, status: keyStatus },
-            50,
-          );
-          if (r.error) return json(res, 400, { error: r.error });
-          return json(res, 200, { keys: r.rows, total: r.total });
-        }
         if (method === 'GET' && path === '/profiles') {
           const p = parseList(params);
           const withCounts = profiles.map((x) => ({
             ...x,
-            // Live counts: key references plus inheritance children.
-            keyCount: keys.filter((k) => k.profile === x.name).length,
+            // Live child counts; keyCount is static (see the seed comment).
             childCount: profiles.filter((y) => y.parents.includes(x.name)).length,
           }));
           const r = applyList(
@@ -536,9 +516,8 @@ function mockApi(): Plugin {
           if (body.providerFilter) p.providerFilter = body.providerFilter;
           if (body.modelFilter) p.modelFilter = body.modelFilter;
           p.parents = body.parents ?? [];
-          // Keys and derived profiles reference profiles by name, so keep them
-          // pointing at the renamed profile.
-          for (const k of keys) if (k.profile === oldName) k.profile = p.name;
+          // Derived profiles reference parents by name, so keep them pointing
+          // at the renamed profile. (Keys are in the SPA's in-memory mock.)
           for (const x of profiles) {
             x.parents = x.parents.map((parent) => (parent === oldName ? p.name : parent));
           }
@@ -551,62 +530,13 @@ function mockApi(): Plugin {
           if (profiles[i]?.isDefault) {
             return json(res, 422, { error: 'the All profile is read-only' });
           }
-          const inUse = keys.filter((k) => k.profile === name).length;
-          if (inUse > 0) {
-            return json(res, 422, { error: `profile is in use by ${inUse} virtual key(s)` });
-          }
+          // The virtual keys themselves live in the SPA's in-memory mock, so
+          // the "profile is in use by a key" check is only approximate in dev.
           const children = profiles.filter((x) => x.parents.includes(name)).length;
           if (children > 0) {
             return json(res, 422, { error: `profile is in use as a parent by ${children} profile(s)` });
           }
           profiles.splice(i, 1);
-          return json(res, 204, null);
-        }
-        if (method === 'POST' && path === '/keys') {
-          const body = (await readBody(req)) as CreateKeyBody;
-          if (!body.name) return json(res, 422, { error: 'name is required' });
-          if (keys.some((k) => k.name === body.name)) {
-            return json(res, 422, { error: 'key already exists' });
-          }
-          keys.push({
-            name: body.name,
-            profile: body.profile ?? 'All',
-            paused: false,
-            revoked: false,
-          });
-          return json(res, 200, { plaintext: 'gk-mock-' + Math.random().toString(36).slice(2, 12) });
-        }
-        if (method === 'PUT' && seg[0] === 'keys' && seg[1]) {
-          const current = decodeURIComponent(seg[1]);
-          const k = keys.find((k) => k.name === current);
-          if (!k) return json(res, 404, { error: 'key not found' });
-          const body = (await readBody(req)) as CreateKeyBody;
-          if (!body.name) return json(res, 422, { error: 'name is required' });
-          if (body.name !== current && keys.some((x) => x.name === body.name)) {
-            return json(res, 422, { error: 'key already exists' });
-          }
-          k.name = body.name;
-          if (body.profile) k.profile = body.profile;
-          return json(res, 204, null);
-        }
-        if (method === 'POST' && seg[0] === 'keys' && seg[2] === 'revoke') {
-          const k = keys.find((k) => k.name === decodeURIComponent(seg[1] ?? ''));
-          if (k) k.revoked = true;
-          return json(res, 204, null);
-        }
-        if (method === 'POST' && seg[0] === 'keys' && seg[2] === 'pause') {
-          const k = keys.find((k) => k.name === decodeURIComponent(seg[1] ?? ''));
-          if (k) k.paused = true;
-          return json(res, 204, null);
-        }
-        if (method === 'POST' && seg[0] === 'keys' && seg[2] === 'resume') {
-          const k = keys.find((k) => k.name === decodeURIComponent(seg[1] ?? ''));
-          if (k) k.paused = false;
-          return json(res, 204, null);
-        }
-        if (method === 'DELETE' && seg[0] === 'keys' && seg[1]) {
-          const i = keys.findIndex((k) => k.name === decodeURIComponent(seg[1] ?? ''));
-          if (i >= 0) keys.splice(i, 1);
           return json(res, 204, null);
         }
         if (method === 'GET' && path === '/requests') {

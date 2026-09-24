@@ -19,6 +19,15 @@ import (
 	"github.com/trfdeer/toll/internal/store"
 )
 
+// resolveProfile maps an optional profile name to the seeded "All" profile
+// when the request omits one.
+func (h *handlers) resolveProfile(ctx context.Context, name string) (store.Profile, error) {
+	if strings.TrimSpace(name) == "" {
+		name = store.DefaultProfileName
+	}
+	return h.store.ProfileByName(ctx, name)
+}
+
 // connectService implements toll.admin.v1.AdminService.
 type connectService struct {
 	adminv1connect.UnimplementedAdminServiceHandler

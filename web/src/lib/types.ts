@@ -1,9 +1,10 @@
 // Shared types for the toll admin API. These mirror the JSON shapes produced
 // by internal/admin/admin.go; keep them in sync when the Go handlers change.
+// Migrated resources (virtual keys) use the generated types in gen/ instead.
 
-// ---- virtual keys ----
+// ---- profiles ----
 
-// FilterMode constrains a virtual key along one dimension.
+// FilterMode constrains a profile along one dimension.
 export type FilterMode = "none" | "include" | "exclude";
 
 // KeyFilter is a provider or model constraint. "none" allows everything,
@@ -11,29 +12,6 @@ export type FilterMode = "none" | "include" | "exclude";
 export interface KeyFilter {
   mode: FilterMode;
   values: string[];
-}
-
-export interface VirtualKey {
-  name: string;
-  /** Name of the profile whose filters govern this key's model access. */
-  profile: string;
-  revoked: boolean;
-  paused: boolean;
-}
-
-export interface KeysResponse {
-  keys: VirtualKey[];
-  total: number;
-}
-
-export interface CreateKeyResponse {
-  plaintext: string;
-}
-
-/** Fields editable on an existing key (name and its profile). */
-export interface UpdateKeyRequest {
-  name: string;
-  profile: string;
 }
 
 // ---- profiles ----

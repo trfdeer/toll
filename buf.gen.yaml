@@ -9,12 +9,10 @@ plugins:
   - remote: buf.build/connectrpc/go
     out: gen
     opt: paths=source_relative
-  # TypeScript for the SPA (connect-es): message code plus the generated
-  # service/client definitions. Committed under web/src/gen.
+  # TypeScript for the SPA (connect-es v2): message and service code from the
+  # Protobuf-ES v2 plugin, committed under web/src/gen. protoc-gen-connect-es
+  # no longer exists in v2 — service descriptors come from this plugin too.
   - remote: buf.build/bufbuild/es
-    out: web/src/gen
-    opt: target=ts
-  - remote: buf.build/connectrpc/es
     out: web/src/gen
     opt: target=ts
 inputs:
