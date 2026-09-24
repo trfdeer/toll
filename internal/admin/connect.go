@@ -8,6 +8,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -181,4 +182,33 @@ func (s *connectService) DeleteKey(ctx context.Context, req *connect.Request[adm
 		return nil, s.connectError(err, "delete failed")
 	}
 	return connect.NewResponse(&emptypb.Empty{}), nil
+}
+
+// ExportConfig returns the current registry state as a toll.yaml document,
+// secrets redacted to api_key_env references. The SPA builds its own download
+// Blob; the endpoint no longer streams a Content-Disposition attachment
+// (proto/README.md item 10).
+func (s *connectService) ExportConfig(ctx context.Context, _ *connect.Request[emptypb.Empty]) (*connect.Response[adminv1.ExportConfigResponse], error) {
+	data, err := exportConfig(ctx, s.store)
+	if err != nil {
+		return nil, s.connectError(err, "config export unavailable")
+	}
+	return connect.NewResponse(&adminv1.ExportConfigResponse{Yaml: string(data)}), nil
+}
+
+// GetSettings returns the admin-editable runtime settings.
+func (s *connectService) GetSettings(ctx context.Context, _ *connect.Request[emptypb.Empty]) (*connect.Response[adminv1.Settings], error) {
+	return connect.NewResponse(&adminv1.Settings{StorePrompts: s.store.PromptsEnabled()}), nil
+}
+
+// UpdateSettings persists the runtime settings; an absent field is left
+// unchanged (today's *bool, as an optional proto field).
+func (s *connectService) UpdateSettings(ctx context.Context, req *connect.Request[adminv1.UpdateSettingsRequest]) (*connect.Response[adminv1.Settings], error) {
+	if req.Msg.StorePrompts != nil {
+		if err := s.store.SetSetting(ctx, store.SettingStorePrompts,
+			strconv.FormatBool(*req.Msg.StorePrompts)); err != nil {
+			return nil, s.connectError(err, "could not save settings")
+		}
+	}
+	return connect.NewResponse(&adminv1.Settings{StorePrompts: s.store.PromptsEnabled()}), nil
 }

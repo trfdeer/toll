@@ -7,10 +7,10 @@
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { AdminService } from "../gen/toll/admin/v1/admin_pb";
-import { mockKeyRoutes } from "./mockKeys";
+import { mockAdminRoutes } from "./mockAdmin";
 
 const transport = import.meta.env.DEV
-  ? createRouterTransport(mockKeyRoutes)
+  ? createRouterTransport(mockAdminRoutes)
   : createConnectTransport({
       baseUrl: "/admin/api",
       useBinaryFormat: true,

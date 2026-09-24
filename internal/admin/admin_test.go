@@ -431,17 +431,7 @@ func TestConfigExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/config", nil))
-	if rec.Code != 200 {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-	}
-	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "yaml") {
-		t.Errorf("content-type = %q, want yaml", ct)
-	}
-	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, "toll.yaml") {
-		t.Errorf("content-disposition = %q", cd)
-	}
+	body := getConfigYAML(t, h)
 
 	var got struct {
 		Profiles []struct {
@@ -468,21 +458,21 @@ func TestConfigExport(t *testing.T) {
 			} `yaml:"models"`
 		} `yaml:"upstreams"`
 	}
-	if err := yaml.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("export is not valid YAML: %v\n%s", err, rec.Body.String())
+	if err := yaml.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("export is not valid YAML: %v\n%s", err, body)
 	}
 	if len(got.Upstreams) != 1 {
-		t.Fatalf("upstreams = %d, want 1\n%s", len(got.Upstreams), rec.Body.String())
+		t.Fatalf("upstreams = %d, want 1\n%s", len(got.Upstreams), body)
 	}
 	u := got.Upstreams[0]
 	if u.Name != "hyper" || u.URL != "https://hyper.charm.land/v1" || u.APIKeyEnv != "HYPER_API_KEY" {
 		t.Errorf("unexpected upstream: %+v", u)
 	}
-	if strings.Contains(rec.Body.String(), "secret") {
-		t.Errorf("export leaked the api key: %s", rec.Body.String())
+	if strings.Contains(body, "secret") {
+		t.Errorf("export leaked the api key: %s", body)
 	}
 	if len(u.Models) != 2 {
-		t.Fatalf("models = %d, want 2\n%s", len(u.Models), rec.Body.String())
+		t.Fatalf("models = %d, want 2\n%s", len(u.Models), body)
 	}
 	// Ordered by gateway id: hyper/glm then qwen.
 	first := u.Models[0]
@@ -500,7 +490,7 @@ func TestConfigExport(t *testing.T) {
 	}
 
 	if len(got.Profiles) != 1 {
-		t.Fatalf("profiles = %d, want 1\n%s", len(got.Profiles), rec.Body.String())
+		t.Fatalf("profiles = %d, want 1\n%s", len(got.Profiles), body)
 	}
 	p := got.Profiles[0]
 	if p.Name != "glm-only" ||
@@ -508,8 +498,8 @@ func TestConfigExport(t *testing.T) {
 		p.ModelFilter.Mode != "exclude" || len(p.ModelFilter.Values) != 1 || p.ModelFilter.Values[0] != "hyper/hidden" {
 		t.Errorf("unexpected exported profile: %+v", p)
 	}
-	if strings.Contains(rec.Body.String(), "name: All") {
-		t.Errorf("the default profile should not be exported:\n%s", rec.Body.String())
+	if strings.Contains(body, "name: All") {
+		t.Errorf("the default profile should not be exported:\n%s", body)
 	}
 }
 
@@ -527,14 +517,9 @@ func TestConfigExportProfilesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/config", nil))
-	if rec.Code != 200 {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-	}
-
+	body := getConfigYAML(t, h)
 	path := filepath.Join(t.TempDir(), "toll.yaml")
-	if err := os.WriteFile(path, rec.Body.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("TOLL_CONFIG", path)
@@ -542,7 +527,7 @@ func TestConfigExportProfilesRoundTrip(t *testing.T) {
 	t.Setenv("TOLL_UPSTREAM_API_KEY", "")
 	cfg, err := config.Load(t.Context(), config.Flags{})
 	if err != nil {
-		t.Fatalf("export did not parse as config: %v\n%s", err, rec.Body.String())
+		t.Fatalf("export did not parse as config: %v\n%s", err, body)
 	}
 	if len(cfg.Profiles) != 2 {
 		t.Fatalf("parsed profiles = %+v", cfg.Profiles)
@@ -636,8 +621,7 @@ func TestModelDisableEnable(t *testing.T) {
 	}
 
 	// Disabled models are still exported, flagged disabled.
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/config", nil))
+	body := getConfigYAML(t, h)
 	var got struct {
 		Upstreams []struct {
 			Models []struct {
@@ -645,11 +629,11 @@ func TestModelDisableEnable(t *testing.T) {
 			} `yaml:"models"`
 		} `yaml:"upstreams"`
 	}
-	if err := yaml.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	if err := yaml.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatal(err)
 	}
 	if len(got.Upstreams) != 1 || len(got.Upstreams[0].Models) != 1 || !got.Upstreams[0].Models[0].Disabled {
-		t.Fatalf("export did not flag disabled model: %s", rec.Body.String())
+		t.Fatalf("export did not flag disabled model: %s", body)
 	}
 
 	if code := post("/enable"); code != http.StatusNoContent {
@@ -660,14 +644,13 @@ func TestModelDisableEnable(t *testing.T) {
 	}
 
 	// Only disabled models carry the flag; enabled ones omit it.
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/config", nil))
-	if strings.Contains(rec.Body.String(), "disabled:") {
-		t.Errorf("enabled model should omit disabled:\n%s", rec.Body.String())
+	body = getConfigYAML(t, h)
+	if strings.Contains(body, "disabled:") {
+		t.Errorf("enabled model should omit disabled:\n%s", body)
 	}
 
 	// Unknown id → 404.
-	rec = httptest.NewRecorder()
+	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/models/9999/disable", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown id status = %d, want 404", rec.Code)

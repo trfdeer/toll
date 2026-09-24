@@ -139,14 +139,6 @@ export interface ModelsResponse {
   total: number;
 }
 
-// ---- settings ----
-
-/** Admin-editable runtime settings. */
-export interface Settings {
-  /** Whether prompt/response bodies are persisted to the content database. */
-  storePrompts: boolean;
-}
-
 // ---- usage ----
 
 export interface UsageRow {

@@ -57,9 +57,6 @@ func Handler(st *store.Store, logger *log.Logger) http.Handler {
 	mux.HandleFunc("POST /api/models/{id}/disable", h.modelsDisable)
 	mux.HandleFunc("POST /api/models/{id}/enable", h.modelsEnable)
 	mux.HandleFunc("PUT /api/models/{id}/alias", h.modelsSetAlias)
-	mux.HandleFunc("GET /api/config", h.configExport)
-	mux.HandleFunc("GET /api/settings", h.settingsGet)
-	mux.HandleFunc("PUT /api/settings", h.settingsPut)
 	mux.HandleFunc("GET /api/profiles", h.profilesList)
 	mux.HandleFunc("POST /api/profiles", h.profilesCreate)
 	mux.HandleFunc("PUT /api/profiles/{name}", h.profilesUpdate)
@@ -520,8 +517,6 @@ func (h *handlers) modelsDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNoContent, nil)
 }
 
-// ---- settings ----
-
 // modelsSetAlias sets or clears a model's custom gateway ID (alias). An empty
 // alias restores the model's computed ID. The change applies immediately and
 // survives later discovery syncs.
@@ -550,36 +545,6 @@ func (h *handlers) modelsSetAlias(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusNoContent, nil)
-}
-
-// settingsView is the admin-editable runtime settings surface.
-type settingsView struct {
-	StorePrompts bool `json:"storePrompts"`
-}
-
-func (h *handlers) settingsGet(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, settingsView{StorePrompts: h.store.PromptsEnabled()})
-}
-
-type updateSettingsRequest struct {
-	StorePrompts *bool `json:"storePrompts"`
-}
-
-// settingsPut updates the runtime settings. Only prompt storage is settable
-// today; omitted fields are left unchanged.
-func (h *handlers) settingsPut(w http.ResponseWriter, r *http.Request) {
-	req, ok := readJSON[updateSettingsRequest](w, r)
-	if !ok {
-		return
-	}
-	if req.StorePrompts != nil {
-		if err := h.store.SetSetting(r.Context(), store.SettingStorePrompts,
-			strconv.FormatBool(*req.StorePrompts)); err != nil {
-			h.fail(w, err, "could not save settings")
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, settingsView{StorePrompts: h.store.PromptsEnabled()})
 }
 
 // ---- profiles ----

@@ -216,7 +216,6 @@ function mockApi(): Plugin {
       disabled: false, reachable: true, lastError: '', lastSyncedAt: '2026-09-15T00:00:00.000Z',
     },
   ];
-  let storePrompts = true;
   const models: Model[] = [
     { id: 1, upstream: 'hyper', upstreamModelId: 'glm-4.6', gatewayId: 'hyper/glm-4.6', displayName: 'GLM 4.6', alias: '', metadata: { max_model_len: 262144, max_output_tokens: 8192 }, disabled: false, providerDisabled: false, providerReachable: true },
     { id: 2, upstream: 'hyper', upstreamModelId: 'glm-4.5-air', gatewayId: 'hyper/glm-4.5-air', displayName: 'GLM 4.5 Air', alias: '', metadata: { context_window: 128000 }, disabled: false, providerDisabled: false, providerReachable: true },
@@ -397,25 +396,6 @@ function mockApi(): Plugin {
           m.alias = alias;
           m.gatewayId = alias || `${m.upstream}/${m.upstreamModelId}`;
           return json(res, 204, null);
-        }
-        if (method === 'GET' && path === '/settings') {
-          return json(res, 200, { storePrompts });
-        }
-        if (method === 'PUT' && path === '/settings') {
-          const body = (await readBody(req)) as { storePrompts?: boolean };
-          if (typeof body.storePrompts === 'boolean') storePrompts = body.storePrompts;
-          return json(res, 200, { storePrompts });
-        }
-        if (method === 'GET' && path === '/config') {
-          res.statusCode = 200;
-          res.setHeader('Content-Type', 'application/yaml');
-          return res.end(
-            'upstreams:\n' +
-              '  - name: default\n' +
-              '    url: http://zeph:9931/v1\n' +
-              '    api_key_env: DEFAULT_API_KEY\n' +
-              '    refresh_interval: 5m0s\n'
-          );
         }
         if (method === 'GET' && path === '/usage') {
           const rows: Array<UsageRow & { createdAt: string }> = [

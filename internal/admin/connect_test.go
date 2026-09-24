@@ -242,16 +242,30 @@ func TestConnectListKeysParams(t *testing.T) {
 func TestConnectUnmigratedRPCs(t *testing.T) {
 	_, h := setup(t)
 
-	rec := rpc(t, h, "GetSettings", `{}`)
+	rec := rpc(t, h, "ListProviders", `{}`)
 	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("GetSettings = %d, want 501: %s", rec.Code, rec.Body.String())
+		t.Fatalf("ListProviders = %d, want 501: %s", rec.Code, rec.Body.String())
 	}
 	wantConnectCode(t, rec, "unimplemented")
 
 	// The legacy REST route still serves the same resource.
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/settings", nil))
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/providers", nil))
 	if rec.Code != http.StatusOK {
-		t.Errorf("legacy GET /api/settings = %d: %s", rec.Code, rec.Body.String())
+		t.Errorf("legacy GET /api/providers = %d: %s", rec.Code, rec.Body.String())
 	}
+}
+
+// getConfigYAML calls the ExportConfig RPC and returns the YAML document.
+func getConfigYAML(t *testing.T, h http.Handler) string {
+	t.Helper()
+	rec := rpc(t, h, "ExportConfig", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ExportConfig = %d: %s", rec.Code, rec.Body.String())
+	}
+	var res adminv1.ExportConfigResponse
+	if err := protojson.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode ExportConfigResponse: %v", err)
+	}
+	return res.GetYaml()
 }

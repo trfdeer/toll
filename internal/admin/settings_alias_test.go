@@ -8,37 +8,40 @@ import (
 	"strings"
 	"testing"
 
+	adminv1 "github.com/trfdeer/toll/gen/toll/admin/v1"
 	"github.com/trfdeer/toll/internal/store"
 )
 
 func TestSettingsRoundTrip(t *testing.T) {
 	_, h := setup(t)
 
-	get := func() settingsView {
+	get := func() *adminv1.Settings {
 		t.Helper()
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/settings", nil))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET /api/settings = %d: %s", rec.Code, rec.Body.String())
-		}
-		var v settingsView
-		if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
-			t.Fatal(err)
-		}
-		return v
+		var v adminv1.Settings
+		rpcOK(t, h, "GetSettings", `{}`, &v)
+		return &v
 	}
 
-	if !get().StorePrompts {
+	if !get().GetStorePrompts() {
 		t.Error("default storePrompts = false, want true")
 	}
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{"storePrompts":false}`)))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("PUT /api/settings = %d: %s", rec.Code, rec.Body.String())
+	// An absent field is left unchanged; false persists.
+	var v adminv1.Settings
+	rpcOK(t, h, "UpdateSettings", `{}`, &v)
+	if !v.GetStorePrompts() {
+		t.Error("absent update changed storePrompts")
 	}
-	if get().StorePrompts {
-		t.Error("storePrompts still true after PUT false")
+	rpcOK(t, h, "UpdateSettings", `{"storePrompts":false}`, &v)
+	if v.GetStorePrompts() {
+		t.Error("storePrompts still true after update false")
+	}
+	if get().GetStorePrompts() {
+		t.Error("storePrompts still true after update false")
+	}
+	rpcOK(t, h, "UpdateSettings", `{"storePrompts":true}`, &v)
+	if !get().GetStorePrompts() {
+		t.Error("storePrompts still false after update true")
 	}
 }
 

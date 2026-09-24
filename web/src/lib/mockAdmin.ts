@@ -1,9 +1,8 @@
-// In-memory implementation of the virtual-key RPCs of toll.admin.v1
-// .AdminService for the Vite dev server (MIGRATION.md phase 2). The routes
-// are registered per method on the dev router, so an unimplemented RPC fails
-// exactly like the real server's strangled surface does, and each
-// implementation is type-checked against the generated method descriptor —
-// the mock cannot drift from the schema.
+// In-memory implementation of the migrated toll.admin.v1 AdminService RPCs
+// for the Vite dev server. The routes are registered per method on the dev
+// router, so an unimplemented RPC fails exactly like the real server's
+// strangled surface does, and each implementation is type-checked against the
+// generated method descriptor — the mock cannot drift from the schema.
 import { create } from "@bufbuild/protobuf";
 import { EmptySchema } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, type ConnectRouter } from "@connectrpc/connect";
@@ -26,6 +25,11 @@ import {
   type UpdateKeyRequest,
   type VirtualKey,
 } from "../gen/toll/admin/v1/keys_pb";
+import {
+  ExportConfigResponseSchema,
+  SettingsSchema,
+  type UpdateSettingsRequest,
+} from "../gen/toll/admin/v1/settings_pb";
 
 // The same seed data the dev SPA showed before the REST mock was removed.
 const keys: VirtualKey[] = [
@@ -194,12 +198,43 @@ function deleteKey(req: DeleteKeyRequest) {
   return create(EmptySchema);
 }
 
-// mockKeyRoutes registers the migrated key RPCs on a dev ConnectRouter.
-export function mockKeyRoutes(router: ConnectRouter) {
+// mockAdminRoutes registers the migrated RPCs on a dev ConnectRouter.
+export function mockAdminRoutes(router: ConnectRouter) {
   router.rpc(AdminService.method.listKeys, listKeys);
   router.rpc(AdminService.method.createKey, createKey);
   router.rpc(AdminService.method.updateKey, updateKey);
   router.rpc(AdminService.method.rotateKey, rotateKey);
   router.rpc(AdminService.method.revokeKey, revokeKey);
   router.rpc(AdminService.method.deleteKey, deleteKey);
+  router.rpc(AdminService.method.getSettings, getSettings);
+  router.rpc(AdminService.method.updateSettings, updateSettings);
+  router.rpc(AdminService.method.exportConfig, exportConfig);
+}
+
+// ---- settings ----
+
+// The same seed value the dev REST mock used.
+let storePrompts = true;
+
+function getSettings() {
+  return create(SettingsSchema, { storePrompts });
+}
+
+function updateSettings(req: UpdateSettingsRequest) {
+  if (req.storePrompts !== undefined) storePrompts = req.storePrompts;
+  return create(SettingsSchema, { storePrompts });
+}
+
+// ---- config export ----
+
+// A small static document; the dev export is a shape preview, not live state.
+function exportConfig() {
+  return create(ExportConfigResponseSchema, {
+    yaml:
+      "upstreams:\n" +
+      "  - name: default\n" +
+      "    url: http://zeph:9931/v1\n" +
+      "    api_key_env: DEFAULT_API_KEY\n" +
+      "    refresh_interval: 5m0s\n",
+  });
 }

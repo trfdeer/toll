@@ -16,6 +16,10 @@ import {
   UpdateKeyRequestSchema,
   type VirtualKey,
 } from "../gen/toll/admin/v1/keys_pb";
+import {
+  UpdateSettingsRequestSchema,
+  type Settings,
+} from "../gen/toll/admin/v1/settings_pb";
 import type {
   CreateProviderRequest,
   CreateProviderResponse,
@@ -31,7 +35,6 @@ import type {
   RequestQuery,
   RequestsResponse,
   RefreshModelsResponse,
-  Settings,
   UsageListQuery,
   UsageSummary,
 } from "./types";
@@ -161,17 +164,20 @@ export const setModelAlias = (id: number, alias: string): Promise<void> =>
     body: JSON.stringify({ alias }),
   });
 
-// ---- settings ----
+// ---- settings (ConnectRPC) ----
 
-export const getSettings = (): Promise<Settings> => request("/settings");
+export const getSettings = (): Promise<Settings> => admin.getSettings({});
 
 // updateSettings persists the runtime settings and returns the saved state.
-export const updateSettings = (settings: Settings): Promise<Settings> =>
-  request("/settings", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(settings),
-  });
+export const updateSettings = (settings: { storePrompts: boolean }): Promise<Settings> =>
+  admin.updateSettings(create(UpdateSettingsRequestSchema, settings));
+
+// exportConfig fetches the gateway config (toll.yaml) for the current
+// registry state; secrets are redacted to api_key_env references.
+export const exportConfig = async (): Promise<string> => {
+  const res = await admin.exportConfig({});
+  return res.yaml;
+};
 
 // ---- profiles ----
 
@@ -310,14 +316,3 @@ export const revokeKey = (name: string) =>
 
 export const deleteKey = (name: string) =>
   admin.deleteKey(create(DeleteKeyRequestSchema, { name }));
-
-// exportConfig fetches the gateway config (toll.yaml) for the current
-// registry state. The endpoint returns YAML, not JSON, so this bypasses the
-// shared request helper.
-export async function exportConfig(): Promise<string> {
-  const res = await fetch("/admin/api/config");
-  if (!res.ok) {
-    throw new Error(await errorFromResponse(res));
-  }
-  return res.text();
-}

@@ -3,7 +3,6 @@ package admin
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -60,21 +59,6 @@ type exportModel struct {
 	Name     string         `yaml:"name,omitempty"`
 	Metadata map[string]any `yaml:"metadata,omitempty"`
 	Disabled bool           `yaml:"disabled,omitempty"`
-}
-
-// configExport writes the current registry state as a toll.yaml. Secrets are
-// never emitted: each upstream's key is redacted to an api_key_env reference
-// derived from its name.
-func (h *handlers) configExport(w http.ResponseWriter, r *http.Request) {
-	data, err := exportConfig(r.Context(), h.store)
-	if err != nil {
-		h.fail(w, err, "config export unavailable")
-		return
-	}
-	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="toll.yaml"`)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
 }
 
 // exportConfig builds the YAML config from the store's upstream and model rows.

@@ -20,7 +20,7 @@ import { exportConfig, getSettings, updateSettings } from "./lib/api";
 import { errorMessage } from "./lib/errors";
 import TollMark from "./components/TollMark";
 import { THEME_ICONS, THEME_LABELS, THEME_ORDER, useTheme } from "./lib/theme";
-import type { Settings } from "./lib/types";
+import type { Settings } from "./gen/toll/admin/v1/settings_pb";
 import Keys from "./views/Keys";
 import Models from "./views/Models";
 import Profiles from "./views/Profiles";
