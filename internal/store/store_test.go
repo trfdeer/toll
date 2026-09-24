@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+// ptrTo returns a pointer to v, for patch payloads with optional fields.
+func ptrTo[T any](v T) *T { return &v }
+
 func TestMigrationsRunAndAreIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "toll.db")
 
@@ -111,7 +114,10 @@ func TestUpdateVirtualKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateVirtualKey(t.Context(), "before", "after", profileID); err != nil {
+	if err := s.UpdateVirtualKey(t.Context(), "before", VirtualKeyUpdate{
+		Name:      ptrTo("after"),
+		ProfileID: ptrTo(profileID),
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -130,8 +136,29 @@ func TestUpdateVirtualKey(t *testing.T) {
 	}
 
 	// Unknown key.
-	if err := s.UpdateVirtualKey(t.Context(), "missing", "x", 1); err != ErrKeyNotFound {
+	if err := s.UpdateVirtualKey(t.Context(), "missing", VirtualKeyUpdate{
+		Name:      ptrTo("x"),
+		ProfileID: ptrTo(int64(1)),
+	}); err != ErrKeyNotFound {
 		t.Errorf("update missing = %v, want ErrKeyNotFound", err)
+	}
+}
+
+// TestVirtualKeyNameConflict pins the duplicate-name sentinel the connect
+// layer maps to already_exists.
+func TestVirtualKeyNameConflict(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "toll.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := t.Context()
+	if _, err := s.CreateVirtualKey(ctx, "app", "hash", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVirtualKey(ctx, "app", "hash2", 1); !errors.Is(err, ErrKeyNameExists) {
+		t.Errorf("duplicate name err = %v, want ErrKeyNameExists", err)
 	}
 }
 

@@ -7,10 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/trfdeer/toll/internal/keys"
 )
 
 // ErrKeyNotFound is returned when no active virtual key matches a hash.
 var ErrKeyNotFound = errors.New("virtual key not found")
+
+// ErrKeyNameExists is returned when a new key's name is already taken (keys
+// keep their row after revocation, so a revoked key's name still conflicts).
+var ErrKeyNameExists = errors.New("virtual key name already exists")
 
 // KeyFilter constrains a key to (or away from) a set of providers or models.
 // Mode is "none" (no constraint), "include" (only Values) or "exclude"
@@ -39,7 +45,17 @@ func (f KeyFilter) normalize() KeyFilter {
 // CreateVirtualKey stores a new key (hash only) and returns its id. The key's
 // provider and model filters come from the referenced profile, resolved on
 // every lookup, so edits to a profile apply immediately to all keys using it.
+// Returns ErrKeyNameExists when the name is taken.
 func (s *Store) CreateVirtualKey(ctx context.Context, name, keyHash string, profileID int64) (int64, error) {
+	var exists int64
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM virtual_keys WHERE name = ?`, name).Scan(&exists)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return 0, fmt.Errorf("create virtual key %q: %w", name, err)
+	default:
+		return 0, fmt.Errorf("create virtual key: %w", ErrKeyNameExists)
+	}
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO virtual_keys (name, key_hash, profile_id) VALUES (?, ?, ?)`,
 		name, keyHash, profileID)
@@ -89,19 +105,27 @@ func (s *Store) KeyByHash(ctx context.Context, keyHash string) (*VirtualKey, err
 }
 
 // virtualKeyFilterCols and virtualKeySortCols map the admin column ids to SQL
-// expressions for the keys table. Status is derived from the timestamps.
+// expressions for the keys table. Status is derived from the timestamps;
+// revoked/paused render as 'true'/'false' so the text ops compare naturally.
 var (
 	virtualKeyStatusExpr = "(CASE WHEN vk.revoked_at IS NOT NULL THEN 'revoked' WHEN vk.paused_at IS NOT NULL THEN 'paused' ELSE 'active' END)"
+	virtualKeyBool       = func(expr string) string {
+		return "(CASE WHEN " + expr + " THEN 'true' ELSE 'false' END)"
+	}
 	virtualKeyFilterCols = map[string]string{
 		"name":    "vk.name",
 		"profile": "p.name",
 		"status":  virtualKeyStatusExpr,
+		"revoked": virtualKeyBool("vk.revoked_at IS NOT NULL"),
+		"paused":  virtualKeyBool("vk.paused_at IS NOT NULL"),
 	}
 	virtualKeySortCols = map[string]string{
 		"id":      "vk.id",
 		"name":    "vk.name",
 		"profile": "p.name",
 		"status":  virtualKeyStatusExpr,
+		"revoked": virtualKeyBool("vk.revoked_at IS NOT NULL"),
+		"paused":  virtualKeyBool("vk.paused_at IS NOT NULL"),
 	}
 )
 
@@ -174,47 +198,169 @@ func (s *Store) ListVirtualKeys(ctx context.Context) ([]VirtualKey, error) {
 	return keys, err
 }
 
-// UpdateVirtualKey edits a key's name and/or profile in place. The key
-// material (its hash) is unchanged, so existing clients keep working. Returns
-// ErrKeyNotFound when currentName does not exist; a rename onto an existing
-// name fails on the UNIQUE constraint.
-func (s *Store) UpdateVirtualKey(ctx context.Context, currentName, newName string, profileID int64) error {
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE virtual_keys SET name = ?, profile_id = ?
-		WHERE name = ?`,
-		newName, profileID, currentName)
+// VirtualKeyUpdate is the patch payload for UpdateVirtualKey: nil fields are
+// left unchanged.
+type VirtualKeyUpdate struct {
+	Name      *string
+	ProfileID *int64
+	// Paused pauses (true) or resumes (false) the key. Pausing a revoked key
+	// is a no-op (it is already inactive).
+	Paused *bool
+}
+
+// UpdateVirtualKey edits a key in place, applying only the fields the update
+// sets. The key material (its hash) is unchanged, so existing clients keep
+// working. Returns ErrKeyNotFound when currentName does not exist and
+// ErrKeyNameExists when a rename targets an existing name.
+func (s *Store) UpdateVirtualKey(ctx context.Context, currentName string, u VirtualKeyUpdate) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("update virtual key %q: %w", currentName, err)
+		return fmt.Errorf("update virtual key %q: begin: %w", currentName, err)
+	}
+	defer tx.Rollback()
+
+	var id int64
+	err = tx.QueryRowContext(ctx, `SELECT id FROM virtual_keys WHERE name = ?`, currentName).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrKeyNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("update virtual key %q: lookup: %w", currentName, err)
+	}
+
+	if u.Name != nil && *u.Name != currentName {
+		var exists int64
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM virtual_keys WHERE name = ?`, *u.Name).Scan(&exists)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("update virtual key %q: rename check: %w", currentName, err)
+		default:
+			return fmt.Errorf("update virtual key: %w", ErrKeyNameExists)
+		}
+	}
+
+	var sets []string
+	var args []any
+	if u.Name != nil {
+		sets = append(sets, "name = ?")
+		args = append(args, *u.Name)
+	}
+	if u.ProfileID != nil {
+		sets = append(sets, "profile_id = ?")
+		args = append(args, *u.ProfileID)
+	}
+	if len(sets) > 0 {
+		args = append(args, id)
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE virtual_keys SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+			return fmt.Errorf("update virtual key %q: %w", currentName, err)
+		}
+	}
+	if u.Paused != nil {
+		if *u.Paused {
+			// Pausing a revoked key is a no-op (it is already inactive).
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE virtual_keys SET paused_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+				WHERE id = ? AND revoked_at IS NULL AND paused_at IS NULL`, id); err != nil {
+				return fmt.Errorf("update virtual key %q: pause: %w", currentName, err)
+			}
+		} else if _, err := tx.ExecContext(ctx,
+			`UPDATE virtual_keys SET paused_at = NULL WHERE id = ? AND paused_at IS NOT NULL`, id); err != nil {
+			return fmt.Errorf("update virtual key %q: resume: %w", currentName, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// VirtualKeyByName resolves one key by name, revoked and paused included.
+func (s *Store) VirtualKeyByName(ctx context.Context, name string) (*VirtualKey, error) {
+	var vk VirtualKey
+	var revoked, paused sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT vk.id, vk.name, vk.profile_id, p.name, vk.revoked_at, vk.paused_at
+		FROM virtual_keys vk JOIN profiles p ON p.id = vk.profile_id
+		WHERE vk.name = ?`, name).
+		Scan(&vk.ID, &vk.Name, &vk.ProfileID, &vk.ProfileName, &revoked, &paused)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrKeyNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup virtual key %q: %w", name, err)
+	}
+	vk.Revoked = revoked.Valid
+	vk.Paused = paused.Valid
+	return &vk, nil
+}
+
+// RotateVirtualKey replaces a key's secret: a fresh key is generated and
+// hashed in place of the old material, and the plaintext is returned once.
+// Name, profile and pause state are untouched; the old secret stops working
+// immediately. Returns ErrKeyNotFound when the key does not exist.
+func (s *Store) RotateVirtualKey(ctx context.Context, name string) (string, error) {
+	plaintext, hash, err := keys.Generate()
+	if err != nil {
+		return "", fmt.Errorf("rotate virtual key %q: %w", name, err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE virtual_keys SET key_hash = ? WHERE name = ?`, hash, name)
+	if err != nil {
+		return "", fmt.Errorf("rotate virtual key %q: %w", name, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("update virtual key %q: %w", currentName, err)
+		return "", fmt.Errorf("rotate virtual key %q: %w", name, err)
 	}
 	if n == 0 {
-		return ErrKeyNotFound
+		return "", ErrKeyNotFound
 	}
-	return nil
+	return plaintext, nil
 }
 
-// RevokeVirtualKey marks a key revoked (no-op if already revoked).
+// RevokeVirtualKey marks a key revoked. Revoking an already-revoked key is a
+// no-op. Returns ErrKeyNotFound when the key does not exist.
 func (s *Store) RevokeVirtualKey(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE virtual_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		WHERE name = ? AND revoked_at IS NULL`, name)
 	if err != nil {
 		return fmt.Errorf("revoke virtual key %q: %w", name, err)
 	}
-	return nil
+	return s.rowsAffectedForKey(ctx, name, res)
 }
 
 // PauseVirtualKey temporarily disables a key without revoking it. Pausing a
-// revoked key is a no-op (it is already inactive).
+// revoked key is a no-op (it is already inactive). Returns ErrKeyNotFound
+// when the key does not exist.
 func (s *Store) PauseVirtualKey(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE virtual_keys SET paused_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		WHERE name = ? AND revoked_at IS NULL AND paused_at IS NULL`, name)
 	if err != nil {
 		return fmt.Errorf("pause virtual key %q: %w", name, err)
+	}
+	return s.rowsAffectedForKey(ctx, name, res)
+}
+
+// rowsAffectedForKey turns a zero-row conditional update on a named key into
+// ErrKeyNotFound only when the key is really gone: revoke/pause no-ops on
+// keys that already carry the target state stay silent successes.
+func (s *Store) rowsAffectedForKey(ctx context.Context, name string, res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update virtual key %q: %w", name, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	var exists int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM virtual_keys WHERE name = ?`, name).Scan(&exists)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return ErrKeyNotFound
+	case err != nil:
+		return fmt.Errorf("lookup virtual key %q: %w", name, err)
 	}
 	return nil
 }

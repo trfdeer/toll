@@ -1,8 +1,10 @@
 # Admin API → ConnectRPC migration plan
 
 Branch: `feat/admin-connect-migration`.
-Phase 0 (schema + committed codegen) is done: `proto/toll/admin/v1`,
-`gen/`, `web/src/gen/`, `buf.*.yaml`. See `proto/README.md` for the
+Phase 0 (schema + committed codegen) and phase 1 (connect server skeleton +
+`keys` pilot) are done: `proto/toll/admin/v1`, `gen/`, `web/src/gen/`,
+`buf.*.yaml`, the mounted handler in `internal/admin/connect.go` and the
+store changes it needed. See `proto/README.md` for the
 deliberate behavior changes this plan implements — they are product
 decisions, not transcription choices.
 

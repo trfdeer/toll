@@ -25,6 +25,7 @@ import (
 
 	"github.com/charmbracelet/log"
 
+	adminv1connect "github.com/trfdeer/toll/gen/toll/admin/v1/adminv1connect"
 	"github.com/trfdeer/toll/internal/keys"
 	"github.com/trfdeer/toll/internal/store"
 )
@@ -37,6 +38,13 @@ func Handler(st *store.Store, logger *log.Logger) http.Handler {
 	h := &handlers{store: st, logger: logger}
 
 	mux := http.NewServeMux()
+	// The ConnectRPC surface (MIGRATION.md): mounted alongside the legacy
+	// REST routes; resources migrate one by one and unmigrated RPCs answer
+	// CodeUnimplemented. POST-only: unary Connect requests, and the methodless
+	// prefix would conflict with the SPA's GET catchall below. The handler
+	// matches canonical procedure paths, so the /api mount prefix is stripped.
+	_, connectHandler := adminv1connect.NewAdminServiceHandler(&connectService{handlers: h})
+	mux.Handle("POST /api/"+adminv1connect.AdminServiceName+"/", http.StripPrefix("/api", connectHandler))
 	mux.HandleFunc("GET /api/usage", h.usage)
 	mux.HandleFunc("GET /api/requests", h.requests)
 	mux.HandleFunc("GET /api/requests/{id}", h.requestDetail)
@@ -763,17 +771,13 @@ type createKeyRequest struct {
 	Profile string `json:"profile"`
 }
 
-// resolveProfileName maps an optional profile name to its id, defaulting to
-// the seeded "All" profile when the request omits one.
-func (h *handlers) resolveProfileName(ctx context.Context, name string) (int64, error) {
+// resolveProfile maps an optional profile name to the seeded "All" profile
+// when the request omits one.
+func (h *handlers) resolveProfile(ctx context.Context, name string) (store.Profile, error) {
 	if strings.TrimSpace(name) == "" {
-		name = "All"
+		name = store.DefaultProfileName
 	}
-	p, err := h.store.ProfileByName(ctx, name)
-	if err != nil {
-		return 0, err
-	}
-	return p.ID, nil
+	return h.store.ProfileByName(ctx, name)
 }
 
 func (h *handlers) keysCreate(w http.ResponseWriter, r *http.Request) {
@@ -786,7 +790,7 @@ func (h *handlers) keysCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "name is required"})
 		return
 	}
-	profileID, err := h.resolveProfileName(r.Context(), req.Profile)
+	prof, err := h.resolveProfile(r.Context(), req.Profile)
 	if err != nil {
 		if errors.Is(err, store.ErrProfileNotFound) {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "profile not found"})
@@ -801,7 +805,7 @@ func (h *handlers) keysCreate(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err, "key generation failed")
 		return
 	}
-	if _, err := h.store.CreateVirtualKey(r.Context(), name, hash, profileID); err != nil {
+	if _, err := h.store.CreateVirtualKey(r.Context(), name, hash, prof.ID); err != nil {
 		// Likely a duplicate name.
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "could not create key: " + err.Error()})
 		return
@@ -822,7 +826,7 @@ func (h *handlers) keysUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "name is required"})
 		return
 	}
-	profileID, err := h.resolveProfileName(r.Context(), req.Profile)
+	prof, err := h.resolveProfile(r.Context(), req.Profile)
 	if err != nil {
 		if errors.Is(err, store.ErrProfileNotFound) {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "profile not found"})
@@ -831,7 +835,10 @@ func (h *handlers) keysUpdate(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err, "could not update key")
 		return
 	}
-	if err := h.store.UpdateVirtualKey(r.Context(), current, name, profileID); err != nil {
+	if err := h.store.UpdateVirtualKey(r.Context(), current, store.VirtualKeyUpdate{
+		Name:      &name,
+		ProfileID: &prof.ID,
+	}); err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found"})
 			return
@@ -862,7 +869,10 @@ func validateFilter(f store.KeyFilter) error {
 
 func (h *handlers) keysRevoke(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if err := h.store.RevokeVirtualKey(r.Context(), name); err != nil {
+	// The store now reports unknown keys (the connect surface maps them to
+	// not_found); the legacy route keeps its old silent no-op until it is
+	// deleted in phase 2.
+	if err := h.store.RevokeVirtualKey(r.Context(), name); err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		h.fail(w, err, "revoke failed")
 		return
 	}
@@ -871,7 +881,7 @@ func (h *handlers) keysRevoke(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) keysPause(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if err := h.store.PauseVirtualKey(r.Context(), name); err != nil {
+	if err := h.store.PauseVirtualKey(r.Context(), name); err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		h.fail(w, err, "pause failed")
 		return
 	}
