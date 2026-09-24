@@ -128,18 +128,6 @@ export interface RequestDetailView {
   messages: ChatMessage[];
 }
 
-// ---- query parameters ----
-
-export type QueryValue =
-  | string
-  | number
-  | boolean
-  | readonly string[]
-  | null
-  | undefined;
-
-export type QueryParams = Record<string, QueryValue>;
-
 // UsageQuery is the shared from/to/key narrowing accepted by the usage and
 // requests calls. The UI's "(deleted keys)" pseudo-entry maps onto
 // includeDeletedKeys; real key names ride keys.

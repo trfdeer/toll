@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"encoding/json"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -149,90 +148,57 @@ func TestRequestDetailBuildsConversation(t *testing.T) {
 func TestProfilesCRUD(t *testing.T) {
 	st, h := setup(t)
 
-	type profileList struct {
-		Profiles []profileView `json:"profiles"`
-	}
-	list := func() profileList {
+	var list adminv1.ListProfilesResponse
+	listProfiles := func() {
 		t.Helper()
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/profiles", nil))
-		var out profileList
-		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-			t.Fatal(err)
-		}
-		return out
-	}
-	do := func(method, path, body string) int {
-		t.Helper()
-		var req *http.Request
-		if body == "" {
-			req = httptest.NewRequest(method, path, nil)
-		} else {
-			req = httptest.NewRequest(method, path, strings.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-		}
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		return rec.Code
+		rpcOK(t, h, "ListProfiles", `{}`, &list)
 	}
 
 	// The seeded All profile is present, default and read-only.
-	got := list()
-	if len(got.Profiles) != 1 || got.Profiles[0].Name != "All" || !got.Profiles[0].IsDefault {
-		t.Fatalf("seeded profiles = %+v", got.Profiles)
+	listProfiles()
+	if list.GetTotal() != 1 || list.GetProfiles()[0].GetName() != "All" ||
+		!list.GetProfiles()[0].GetIsDefault() || list.GetProfiles()[0].GetKeyCount() != 0 {
+		t.Fatalf("seeded profiles = %s", protojson.Format(&list))
 	}
 
-	// Create.
-	if code := do("POST", "/api/profiles",
-		`{"name":"zeph","providerFilter":{"mode":"include","values":["zeph"]},"modelFilter":{"mode":"none","values":[]}}`); code != http.StatusNoContent {
-		t.Fatalf("create status = %d, want 204", code)
+	// Create; the response carries the stored profile with computed counts.
+	var created adminv1.Profile
+	rpcOK(t, h, "CreateProfile",
+		`{"name":"zeph","providerFilter":{"mode":"MODE_INCLUDE","values":["zeph"]}}`, &created)
+	if created.GetName() != "zeph" || created.GetProviderFilter().GetMode() != adminv1.KeyFilter_MODE_INCLUDE {
+		t.Errorf("created profile = %s", protojson.Format(&created))
 	}
 
-	// Duplicate name → 422.
-	if code := do("POST", "/api/profiles",
-		`{"name":"zeph","providerFilter":{"mode":"none","values":[]},"modelFilter":{"mode":"none","values":[]}}`); code != http.StatusUnprocessableEntity {
-		t.Fatalf("duplicate status = %d, want 422", code)
-	}
+	// Duplicate name → already_exists.
+	rpcFail(t, h, "CreateProfile", `{"name":"zeph"}`, http.StatusConflict, "already_exists")
 
-	// Empty include values → 422.
-	if code := do("POST", "/api/profiles",
-		`{"name":"bad","providerFilter":{"mode":"include","values":[]}}`); code != http.StatusUnprocessableEntity {
-		t.Fatalf("empty include status = %d, want 422", code)
-	}
+	// Empty include values → failed_precondition (the old 422).
+	rpcFail(t, h, "CreateProfile",
+		`{"name":"bad","providerFilter":{"mode":"MODE_INCLUDE"}}`, http.StatusBadRequest, "failed_precondition")
 
 	// The All profile cannot be edited or deleted.
-	if code := do("PUT", "/api/profiles/All",
-		`{"name":"All","providerFilter":{"mode":"none","values":[]},"modelFilter":{"mode":"none","values":[]}}`); code != http.StatusUnprocessableEntity {
-		t.Fatalf("update All status = %d, want 422", code)
-	}
-	if code := do("DELETE", "/api/profiles/All", ""); code != http.StatusUnprocessableEntity {
-		t.Fatalf("delete All status = %d, want 422", code)
-	}
+	rpcFail(t, h, "UpdateProfile", `{"name":"All"}`, http.StatusBadRequest, "failed_precondition")
+	rpcFail(t, h, "DeleteProfile", `{"name":"All"}`, http.StatusBadRequest, "failed_precondition")
 
-	// Rename.
-	if code := do("PUT", "/api/profiles/zeph",
-		`{"name":"zeph-renamed","providerFilter":{"mode":"include","values":["zeph"]},"modelFilter":{"mode":"none","values":[]}}`); code != http.StatusNoContent {
-		t.Fatalf("rename status = %d, want 204", code)
+	// Rename; keys referencing the profile follow it.
+	rpcOK(t, h, "UpdateProfile",
+		`{"name":"zeph","newName":"zeph-renamed","providerFilter":{"mode":"MODE_INCLUDE","values":["zeph"]}}`, &created)
+	if created.GetName() != "zeph-renamed" {
+		t.Errorf("renamed profile = %s", protojson.Format(&created))
 	}
 
 	// A profile in use cannot be deleted.
 	if _, err := st.CreateVirtualKey(t.Context(), "app", "hash", 2); err != nil {
 		t.Fatal(err)
 	}
-	if code := do("DELETE", "/api/profiles/zeph-renamed", ""); code != http.StatusUnprocessableEntity {
-		t.Fatalf("in-use delete status = %d, want 422", code)
-	}
+	rpcFail(t, h, "DeleteProfile", `{"name":"zeph-renamed"}`, http.StatusBadRequest, "failed_precondition")
 
-	// Delete once unused.
+	// Delete once unused; the second delete is not_found.
 	if err := st.DeleteVirtualKey(t.Context(), "app"); err != nil {
 		t.Fatal(err)
 	}
-	if code := do("DELETE", "/api/profiles/zeph-renamed", ""); code != http.StatusNoContent {
-		t.Fatalf("delete status = %d, want 204", code)
-	}
-	if code := do("DELETE", "/api/profiles/zeph-renamed", ""); code != http.StatusNotFound {
-		t.Fatalf("re-delete status = %d, want 404", code)
-	}
+	rpcOK(t, h, "DeleteProfile", `{"name":"zeph-renamed"}`, &emptypb.Empty{})
+	rpcFail(t, h, "DeleteProfile", `{"name":"zeph-renamed"}`, http.StatusNotFound, "not_found")
 }
 
 func TestProfilesDerived(t *testing.T) {
@@ -244,95 +210,60 @@ func TestProfilesDerived(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	do := func(method, path, body string) int {
-		t.Helper()
-		var req *http.Request
-		if body == "" {
-			req = httptest.NewRequest(method, path, nil)
-		} else {
-			req = httptest.NewRequest(method, path, strings.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-		}
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		return rec.Code
-	}
-
 	// A derived profile names its parents and carries no filters.
-	if code := do("POST", "/api/profiles", `{"name":"child","parents":["base"]}`); code != http.StatusNoContent {
-		t.Fatalf("create derived status = %d, want 204", code)
-	}
+	var created adminv1.Profile
+	rpcOK(t, h, "CreateProfile", `{"name":"child","parents":["base"]}`, &created)
 
-	listProfiles := func() map[string]profileView {
+	byName := func() map[string]*adminv1.Profile {
 		t.Helper()
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/profiles", nil))
-		var listed struct {
-			Profiles []profileView `json:"profiles"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
-			t.Fatal(err)
-		}
-		byName := map[string]profileView{}
-		for _, p := range listed.Profiles {
-			byName[p.Name] = p
+		var listed adminv1.ListProfilesResponse
+		rpcOK(t, h, "ListProfiles", `{}`, &listed)
+		byName := map[string]*adminv1.Profile{}
+		for _, p := range listed.GetProfiles() {
+			byName[p.GetName()] = p
 		}
 		return byName
 	}
 
-	byName := listProfiles()
-	if got := byName["child"]; len(got.Parents) != 1 || got.Parents[0] != "base" {
-		t.Errorf("derived profile = %+v", got)
+	if got := byName()["child"]; len(got.GetParents()) != 1 || got.GetParents()[0] != "base" {
+		t.Errorf("derived profile = %s", protojson.Format(got))
 	}
-	if got := byName["base"]; got.ChildCount != 1 {
-		t.Errorf("base childCount = %d, want 1", got.ChildCount)
+	if got := byName()["base"]; got.GetChildCount() != 1 {
+		t.Errorf("base childCount = %d, want 1", got.GetChildCount())
 	}
 
 	// Parent names are trimmed before the store resolves them.
-	if code := do("POST", "/api/profiles", `{"name":"padded","parents":[" base "]}`); code != http.StatusNoContent {
-		t.Fatalf("padded parent status = %d, want 204", code)
-	}
-	if got := listProfiles()["padded"]; len(got.Parents) != 1 || got.Parents[0] != "base" {
-		t.Errorf("padded parents = %v, want [base]", got.Parents)
+	rpcOK(t, h, "CreateProfile", `{"name":"padded","parents":[" base "]}`, &created)
+	if got := byName()["padded"]; len(got.GetParents()) != 1 || got.GetParents()[0] != "base" {
+		t.Errorf("padded parents = %s, want [base]", protojson.Format(got))
 	}
 
 	// Renaming onto an existing name is a rejection, not a store 500.
-	if code := do("POST", "/api/profiles",
-		`{"name":"other","providerFilter":{"mode":"include","values":["z"]}}`); code != http.StatusNoContent {
-		t.Fatalf("create other status = %d, want 204", code)
-	}
-	if code := do("PUT", "/api/profiles/child", `{"name":"other","parents":["base"]}`); code != http.StatusUnprocessableEntity {
-		t.Errorf("rename collision status = %d, want 422", code)
-	}
+	rpcOK(t, h, "CreateProfile",
+		`{"name":"other","providerFilter":{"mode":"MODE_INCLUDE","values":["z"]}}`, &created)
+	rpcFail(t, h, "UpdateProfile", `{"name":"child","newName":"other","parents":["base"]}`,
+		http.StatusConflict, "already_exists")
 
-	// Filters mixed with parents, unknown parents and self-parenting are 422.
-	if code := do("POST", "/api/profiles",
-		`{"name":"mix","providerFilter":{"mode":"include","values":["x"]},"parents":["base"]}`); code != http.StatusUnprocessableEntity {
-		t.Errorf("mixed status = %d, want 422", code)
-	}
-	if code := do("POST", "/api/profiles", `{"name":"orphan","parents":["nope"]}`); code != http.StatusUnprocessableEntity {
-		t.Errorf("unknown parent status = %d, want 422", code)
-	}
-	if code := do("PUT", "/api/profiles/base", `{"name":"base","parents":["base"]}`); code != http.StatusUnprocessableEntity {
-		t.Errorf("self parent status = %d, want 422", code)
-	}
+	// Filters mixed with parents, unknown parents and self-parenting are
+	// failed_precondition (the old 422).
+	rpcFail(t, h, "CreateProfile",
+		`{"name":"mix","providerFilter":{"mode":"MODE_INCLUDE","values":["x"]},"parents":["base"]}`,
+		http.StatusBadRequest, "failed_precondition")
+	rpcFail(t, h, "CreateProfile", `{"name":"orphan","parents":["nope"]}`,
+		http.StatusBadRequest, "failed_precondition")
+	rpcFail(t, h, "UpdateProfile", `{"name":"base","parents":["base"]}`,
+		http.StatusBadRequest, "failed_precondition")
 	// Cycle: base inherits child, which already inherits base.
-	if code := do("PUT", "/api/profiles/base", `{"name":"base","parents":["child"]}`); code != http.StatusUnprocessableEntity {
-		t.Errorf("cycle status = %d, want 422", code)
-	}
+	rpcFail(t, h, "UpdateProfile", `{"name":"base","parents":["child"]}`,
+		http.StatusBadRequest, "failed_precondition")
 
 	// base is used as a parent, so it cannot be deleted yet.
-	if code := do("DELETE", "/api/profiles/base", ""); code != http.StatusUnprocessableEntity {
-		t.Errorf("delete parent status = %d, want 422", code)
-	}
+	rpcFail(t, h, "DeleteProfile", `{"name":"base"}`,
+		http.StatusBadRequest, "failed_precondition")
 	for _, name := range []string{"child", "padded", "other"} {
-		if code := do("DELETE", "/api/profiles/"+name, ""); code != http.StatusNoContent {
-			t.Fatalf("delete %s status = %d, want 204", name, code)
-		}
+		rpcOK(t, h, "DeleteProfile", `{"name":"`+name+`"}`, &emptypb.Empty{})
 	}
-	if code := do("DELETE", "/api/profiles/base", ""); code != http.StatusNoContent {
-		t.Errorf("delete base after children status = %d, want 204", code)
-	}
+	rpcOK(t, h, "DeleteProfile", `{"name":"base"}`, &emptypb.Empty{})
 }
 
 func TestConfigExport(t *testing.T) {

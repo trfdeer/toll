@@ -125,6 +125,54 @@ func usageFilterFromProto(f *adminv1.UsageFilter) store.UsageFilter {
 	return out
 }
 
+// ---- profiles ----
+
+// keyFilterFromProto maps a proto KeyFilter onto the store's string-mode
+// form. UNSPECIFIED reads as none (proto3 JSON omits zero-valued enums).
+func keyFilterFromProto(f *adminv1.KeyFilter) store.KeyFilter {
+	if f == nil {
+		return store.KeyFilter{}
+	}
+	mode := "none"
+	switch f.GetMode() {
+	case adminv1.KeyFilter_MODE_INCLUDE:
+		mode = "include"
+	case adminv1.KeyFilter_MODE_EXCLUDE:
+		mode = "exclude"
+	}
+	return store.KeyFilter{Mode: mode, Values: f.GetValues()}
+}
+
+// keyFilterToProto maps the store's string-mode filter back onto the proto.
+func keyFilterToProto(f store.KeyFilter) *adminv1.KeyFilter {
+	mode := adminv1.KeyFilter_MODE_NONE
+	switch f.Mode {
+	case "include":
+		mode = adminv1.KeyFilter_MODE_INCLUDE
+	case "exclude":
+		mode = adminv1.KeyFilter_MODE_EXCLUDE
+	}
+	return &adminv1.KeyFilter{Mode: mode, Values: f.Values}
+}
+
+// profileProto maps a store profile. Parents render as an empty list rather
+// than null in the JSON mapping.
+func profileProto(p store.Profile) *adminv1.Profile {
+	parents := p.Parents
+	if parents == nil {
+		parents = []string{}
+	}
+	return &adminv1.Profile{
+		Name:           p.Name,
+		ProviderFilter: keyFilterToProto(p.ProviderFilter),
+		ModelFilter:    keyFilterToProto(p.ModelFilter),
+		Parents:        parents,
+		IsDefault:      p.IsDefault,
+		KeyCount:       int32(p.KeyCount),
+		ChildCount:     int32(p.ChildCount),
+	}
+}
+
 // badListParam marks client-caused list parameter failures so connectError
 // maps them to invalid_argument.
 func badListParam(msg string) error {

@@ -732,11 +732,11 @@ func TestProfileRename(t *testing.T) {
 	}
 
 	// Renaming onto an existing name is a client error, not a raw UNIQUE.
-	if err := s.UpdateProfile(ctx, "child", "base2", KeyFilter{}, KeyFilter{}, nil); !errors.Is(err, ErrProfileInvalid) {
-		t.Errorf("rename collision = %v, want ErrProfileInvalid", err)
+	if err := s.UpdateProfile(ctx, "child", "base2", KeyFilter{}, KeyFilter{}, nil); !errors.Is(err, ErrProfileExists) {
+		t.Errorf("rename collision = %v, want ErrProfileExists", err)
 	}
 	// The reserved default name is likewise refused.
-	if err := s.UpdateProfile(ctx, "child", DefaultProfileName, KeyFilter{}, KeyFilter{}, nil); !errors.Is(err, ErrProfileInvalid) {
-		t.Errorf("rename onto All = %v, want ErrProfileInvalid", err)
+	if err := s.UpdateProfile(ctx, "child", DefaultProfileName, KeyFilter{}, KeyFilter{}, nil); !errors.Is(err, ErrProfileExists) {
+		t.Errorf("rename onto All = %v, want ErrProfileExists", err)
 	}
 }

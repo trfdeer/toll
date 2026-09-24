@@ -59,7 +59,8 @@ func (h *handlers) connectError(err error, fallback string) error {
 		errors.Is(err, store.ErrTranscriptNotFound):
 		return connect.NewError(connect.CodeNotFound, errors.New(err.Error()))
 	case errors.Is(err, store.ErrAliasConflict),
-		errors.Is(err, store.ErrKeyNameExists):
+		errors.Is(err, store.ErrKeyNameExists),
+		errors.Is(err, store.ErrProfileExists):
 		return connect.NewError(connect.CodeAlreadyExists, errors.New(err.Error()))
 	case errors.Is(err, store.ErrProfileImmutable),
 		errors.Is(err, store.ErrProfileInUse),
@@ -331,6 +332,146 @@ func timestampFromStore(s string) *timestamppb.Timestamp {
 		return nil
 	}
 	return timestamppb.New(t)
+}
+
+// ---- profiles ----
+
+// ListProfiles returns a page of the profile table. Default order is the
+// read-only "All" profile first, then by name.
+func (s *connectService) ListProfiles(ctx context.Context, req *connect.Request[adminv1.ListProfilesRequest]) (*connect.Response[adminv1.ListProfilesResponse], error) {
+	p, err := listParamsFromProto(req.Msg.GetParams())
+	if err != nil {
+		return nil, s.connectError(err, "profiles unavailable")
+	}
+	ps, total, err := s.store.ListProfilesPaged(ctx, p)
+	if err != nil {
+		return nil, s.connectError(err, "profiles unavailable")
+	}
+	out := make([]*adminv1.Profile, 0, len(ps))
+	for _, pr := range ps {
+		out = append(out, profileProto(pr))
+	}
+	return connect.NewResponse(&adminv1.ListProfilesResponse{Profiles: out, Total: int32(total)}), nil
+}
+
+// profileValidationFailed renders a pre-store profile validation failure.
+// REST answered these 422; the plan maps profile-shape rejections onto
+// failed_precondition, matching the store's ErrProfile* codes.
+func profileValidationFailed(err error) error {
+	return connect.NewError(connect.CodeFailedPrecondition, err)
+}
+
+// trimParents trims the parent names so validation and storage agree.
+func trimParents(parents []string) []string {
+	out := make([]string, 0, len(parents))
+	for _, p := range parents {
+		out = append(out, strings.TrimSpace(p))
+	}
+	return out
+}
+
+// CreateProfile stores a new profile and returns it (with computed counts).
+func (s *connectService) CreateProfile(ctx context.Context, req *connect.Request[adminv1.CreateProfileRequest]) (*connect.Response[adminv1.Profile], error) {
+	name := strings.TrimSpace(req.Msg.GetName())
+	provider := keyFilterFromProto(req.Msg.GetProviderFilter())
+	model := keyFilterFromProto(req.Msg.GetModelFilter())
+	parents := trimParents(req.Msg.GetParents())
+	if err := validateProfile(name, provider, model, parents); err != nil {
+		return nil, profileValidationFailed(err)
+	}
+	if _, err := s.store.CreateProfile(ctx, name, provider, model, parents); err != nil {
+		return nil, s.connectError(err, "could not create profile")
+	}
+	created, err := s.store.ProfileByName(ctx, name)
+	if err != nil {
+		return nil, s.connectError(err, "could not create profile")
+	}
+	return connect.NewResponse(profileProto(created)), nil
+}
+
+// UpdateProfile edits a profile in place; keys referencing it follow it
+// across renames. Filters and parents are replaced wholesale.
+func (s *connectService) UpdateProfile(ctx context.Context, req *connect.Request[adminv1.UpdateProfileRequest]) (*connect.Response[adminv1.Profile], error) {
+	current := req.Msg.GetName()
+	newName := current
+	if req.Msg.NewName != nil {
+		newName = strings.TrimSpace(req.Msg.GetNewName())
+	}
+	provider := keyFilterFromProto(req.Msg.GetProviderFilter())
+	model := keyFilterFromProto(req.Msg.GetModelFilter())
+	parents := trimParents(req.Msg.GetParents())
+	if err := validateProfile(newName, provider, model, parents); err != nil {
+		return nil, profileValidationFailed(err)
+	}
+	if err := s.store.UpdateProfile(ctx, current, newName, provider, model, parents); err != nil {
+		return nil, s.connectError(err, "could not update profile")
+	}
+	updated, err := s.store.ProfileByName(ctx, newName)
+	if err != nil {
+		return nil, s.connectError(err, "could not update profile")
+	}
+	return connect.NewResponse(profileProto(updated)), nil
+}
+
+// DeleteProfile removes an unused profile.
+func (s *connectService) DeleteProfile(ctx context.Context, req *connect.Request[adminv1.DeleteProfileRequest]) (*connect.Response[emptypb.Empty], error) {
+	if err := s.store.DeleteProfile(ctx, req.Msg.GetName()); err != nil {
+		return nil, s.connectError(err, "could not delete profile")
+	}
+	return connect.NewResponse(&emptypb.Empty{}), nil
+}
+
+// validateFilter rejects an unknown mode or an include/exclude filter with no
+// values (which would allow nothing and is almost certainly a mistake).
+func validateFilter(f store.KeyFilter) error {
+	switch f.Mode {
+	case "", "none":
+		return nil
+	case "include", "exclude":
+		if len(f.Values) == 0 {
+			return errors.New("mode " + f.Mode + " requires at least one value")
+		}
+		return nil
+	default:
+		return errors.New("mode must be none, include or exclude")
+	}
+}
+
+// validateProfile checks the name, both filters and the leaf/derived XOR: a
+// profile either carries filters or references parents, never both. It
+// trims nothing in place — callers pass a trimmed name and the store
+// normalizes the filters.
+func validateProfile(name string, provider, model store.KeyFilter, parents []string) error {
+	if name == "" {
+		return errors.New("name is required")
+	}
+	for _, f := range []struct {
+		label  string
+		filter store.KeyFilter
+	}{{"provider", provider}, {"model", model}} {
+		if err := validateFilter(f.filter); err != nil {
+			return errors.New(f.label + " filter: " + err.Error())
+		}
+	}
+	seen := make(map[string]bool, len(parents))
+	for _, parent := range parents {
+		parent = strings.TrimSpace(parent)
+		switch {
+		case parent == "":
+			return errors.New("parent name is required")
+		case parent == name:
+			return errors.New("a profile cannot be its own parent")
+		case seen[parent]:
+			return errors.New("duplicate parent " + parent)
+		}
+		seen[parent] = true
+	}
+	if len(parents) > 0 &&
+		(provider.Mode == "include" || provider.Mode == "exclude" ||
+			model.Mode == "include" || model.Mode == "exclude") {
+		return errors.New("a derived profile has no filters of its own")
+	}
+	return nil
 }
 
 // ---- providers & models ----

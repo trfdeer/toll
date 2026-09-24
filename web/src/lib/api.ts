@@ -27,85 +27,27 @@ import {
   UpdateSettingsRequestSchema,
   type Settings,
 } from "../gen/toll/admin/v1/settings_pb";
+import {
+  CreateProfileRequestSchema,
+  UpdateProfileRequestSchema,
+} from "../gen/toll/admin/v1/profiles_pb";
+import {
+  KeyFilterSchema,
+  KeyFilter_Mode,
+  type KeyFilter as KeyFilterProto,
+} from "../gen/toll/admin/v1/common_pb";
 import type {
   ColumnFilters,
   FilterOp as UiFilterOp,
+  KeyFilter,
   ListQuery,
   ProfileRequest,
   ProfilesResponse,
-  QueryParams,
   RequestsResponse,
   RequestDetailView,
   UsageSummary,
 } from "./types";
 import { admin } from "./connect";
-
-// request performs a JSON call against the admin API. Bodies come from the
-// same-origin Go server, so the generic cast is applied at this single
-// boundary rather than sprinkled through the views. Endpoints that return 204
-// have no body and are typed as void by their callers.
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`/admin/api${path}`, options);
-  if (!res.ok) {
-    throw new Error(await errorFromResponse(res));
-  }
-  if (res.status === 204) {
-    return undefined as T;
-  }
-  return (await res.json()) as T;
-}
-
-// errorFromResponse extracts the API's {"error": "..."} message, falling back
-// to the HTTP status text when the body is missing or not JSON.
-async function errorFromResponse(res: Response): Promise<string> {
-  let msg = res.statusText;
-  try {
-    const body: unknown = await res.json();
-    if (
-      body !== null &&
-      typeof body === "object" &&
-      "error" in body &&
-      typeof body.error === "string"
-    ) {
-      msg = body.error;
-    }
-  } catch {
-    // not JSON — keep statusText
-  }
-  return msg;
-}
-
-// qs builds a query string from params, dropping empty values. Array values
-// (e.g. multiple key filters) are repeated as separate params.
-function qs(params: QueryParams | undefined): string {
-  const search = new URLSearchParams();
-  for (const [k, v] of Object.entries(params ?? {})) {
-    if (v === undefined || v === null || v === "") continue;
-    if (typeof v === "object") {
-      for (const item of v) {
-        if (item !== "") search.append(k, item);
-      }
-    } else {
-      search.set(k, String(v));
-    }
-  }
-  const s = search.toString();
-  return s ? `?${s}` : "";
-}
-
-// listParams flattens a ListQuery into query params, encoding the column
-// filters as the API's single JSON `filter` parameter.
-function listParams(q: ListQuery | undefined): QueryParams {
-  if (!q) return {};
-  const { filters, ...rest } = q;
-  return {
-    ...rest,
-    filter:
-      filters && Object.keys(filters).length > 0
-        ? JSON.stringify(filters)
-        : undefined,
-  };
-}
 
 // ---- usage & requests (ConnectRPC) ----
 
@@ -307,30 +249,82 @@ export const exportConfig = async (): Promise<string> => {
   return res.yaml;
 };
 
-// ---- profiles ----
+// ---- profiles (ConnectRPC) ----
 
-export const getProfiles = (params?: ListQuery): Promise<ProfilesResponse> =>
-  request(`/profiles${qs(listParams(params))}`);
+// KEY_MODES maps the UI's filter-mode vocabulary onto the proto enum; the
+// inverse lives in keyFilterFromProto.
+const KEY_MODES: Record<KeyFilter["mode"], KeyFilter_Mode> = {
+  none: KeyFilter_Mode.NONE,
+  include: KeyFilter_Mode.INCLUDE,
+  exclude: KeyFilter_Mode.EXCLUDE,
+};
 
-export const createProfile = (profile: ProfileRequest): Promise<void> =>
-  request("/profiles", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(profile),
+function keyFilterToProto(f: KeyFilter): KeyFilterProto {
+  return create(KeyFilterSchema, {
+    mode: KEY_MODES[f.mode] ?? KeyFilter_Mode.UNSPECIFIED,
+    values: f.values,
   });
+}
 
-export const updateProfile = (
+function keyFilterFromProto(f: KeyFilterProto | undefined): KeyFilter {
+  const mode =
+    f?.mode === KeyFilter_Mode.INCLUDE
+      ? "include"
+      : f?.mode === KeyFilter_Mode.EXCLUDE
+        ? "exclude"
+        : "none";
+  return { mode, values: f?.values ?? [] };
+}
+
+export const getProfiles = async (
+  params?: ListQuery,
+): Promise<ProfilesResponse> => {
+  const res = await admin.listProfiles({ params: listParamsProto(params) });
+  return {
+    profiles: res.profiles.map((p) => ({
+      name: p.name,
+      providerFilter: keyFilterFromProto(p.providerFilter),
+      modelFilter: keyFilterFromProto(p.modelFilter),
+      parents: p.parents,
+      isDefault: p.isDefault,
+      keyCount: p.keyCount,
+      childCount: p.childCount,
+    })),
+    total: res.total,
+  };
+};
+
+export const createProfile = async (profile: ProfileRequest): Promise<void> => {
+  await admin.createProfile(
+    create(CreateProfileRequestSchema, {
+      name: profile.name,
+      providerFilter: keyFilterToProto(profile.providerFilter),
+      modelFilter: keyFilterToProto(profile.modelFilter),
+      parents: profile.parents,
+    }),
+  );
+};
+
+export const updateProfile = async (
   currentName: string,
   profile: ProfileRequest,
-): Promise<void> =>
-  request(`/profiles/${encodeURIComponent(currentName)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(profile),
-  });
+): Promise<void> => {
+  await admin.updateProfile(
+    create(UpdateProfileRequestSchema, {
+      name: currentName,
+      // Absent keeps the name (same rename convention as UpdateKey).
+      newName:
+        profile.name === currentName ? undefined : profile.name,
+      providerFilter: keyFilterToProto(profile.providerFilter),
+      modelFilter: keyFilterToProto(profile.modelFilter),
+      parents: profile.parents,
+    }),
+  );
+};
 
-export const deleteProfile = (name: string): Promise<void> =>
-  request(`/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
+export const deleteProfile = async (name: string): Promise<void> => {
+  await admin.deleteProfile({ name });
+};
 
 // ---- ConnectRPC list params ----
 

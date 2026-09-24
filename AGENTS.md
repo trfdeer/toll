@@ -47,7 +47,7 @@ Nix (dendritic flake-parts layout — outputs are auto-imported from `nix/`; add
 
 - **`/admin` is served without authentication** (`internal/admin/admin.go`). Bind it to a trusted interface or front it with auth; `/v1/*` is the authenticated surface.
 - **Migrations**: append a new SQL string to the `migrations` slice in `internal/store/store.go`; never edit an applied migration. `store.Open` applies pending ones at startup.
-- **Admin API shapes live in three places**: `internal/admin/admin.go`, the Vite mock in `web/vite.config.ts`, and `web/src/lib/types.ts`. Changing an endpoint means updating all three.
+- **Admin API shapes live in the proto** (`proto/toll/admin/v1`): the Go handlers in `internal/admin/connect.go` and the SPA client in `web/src/lib/api.ts` both work off the committed generated code. Changing an endpoint means editing the `.proto` and running `bunx @bufbuild/buf generate` (then committing the regenerated `gen/` and `web/src/gen/`).
 - **Alias/registry resolution** (`internal/registry`): gateway ID = explicit config entry alias > first matching `alias_rules` > `{upstream name}/{upstream model id}`. Overlays match the *gateway* ID; explicit entry metadata always wins. Cross-upstream gateway-ID collisions: the earlier config position wins.
 - **Key filters gate on the discovery upstream name**, not a prefix parsed from the model ID (`keys.Allows`).
 - **Cost** (`internal/cost`): metadata `pricing` is per-Mtok USD with keys `input`, `output`, `cache_create`, `cache_hit`. Missing rates yield a `nil` cost, never a guess; `TOLL_LOG_LEVEL=debug` also logs when the computed cost diverges from an upstream-reported one.

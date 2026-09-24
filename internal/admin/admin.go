@@ -12,8 +12,6 @@ package admin
 
 import (
 	"embed"
-	"encoding/json"
-	"errors"
 	"io/fs"
 	"net/http"
 	"path"
@@ -41,10 +39,6 @@ func Handler(st *store.Store, logger *log.Logger) http.Handler {
 	// matches canonical procedure paths, so the /api mount prefix is stripped.
 	_, connectHandler := adminv1connect.NewAdminServiceHandler(&connectService{handlers: h})
 	mux.Handle("POST /api/"+adminv1connect.AdminServiceName+"/", http.StripPrefix("/api", connectHandler))
-	mux.HandleFunc("GET /api/profiles", h.profilesList)
-	mux.HandleFunc("POST /api/profiles", h.profilesCreate)
-	mux.HandleFunc("PUT /api/profiles/{name}", h.profilesUpdate)
-	mux.HandleFunc("DELETE /api/profiles/{name}", h.profilesDelete)
 	mux.HandleFunc("GET /{$}", h.spa)
 	mux.HandleFunc("GET /{rest...}", h.spa)
 
@@ -56,253 +50,13 @@ type handlers struct {
 	logger *log.Logger
 }
 
-// ---- JSON helpers ----
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if v != nil {
-		_ = json.NewEncoder(w).Encode(v)
-	}
-}
-
-func readJSON[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
-	var v T
-	if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
-		return v, false
-	}
-	return v, true
-}
-
+// fail logs the cause and answers 500 with a generic message, so store
+// internals never reach the client.
 func (h *handlers) fail(w http.ResponseWriter, err error, msg string) {
 	h.logger.Error("admin api failed", "err", err)
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})
-}
-
-// ---- list params (profiles is the last REST list endpoint) ----
-
-// parseListParams reads the shared limit/offset/sort/dir/filter query
-// parameters used by the listing endpoints. limit=0 means "all rows" (stored
-// as -1); an absent limit leaves the endpoint's default. It writes a 400 and
-// returns false on malformed input.
-func parseListParams(w http.ResponseWriter, r *http.Request) (store.ListParams, bool) {
-	q := r.URL.Query()
-	p := store.ListParams{}
-	if v := q.Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 || n > 1000 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be 0..1000"})
-			return p, false
-		}
-		if n == 0 {
-			p.Limit = -1
-		} else {
-			p.Limit = n
-		}
-	}
-	if v := q.Get("offset"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offset must be >= 0"})
-			return p, false
-		}
-		p.Offset = n
-	}
-	p.Sort = q.Get("sort")
-	p.Dir = q.Get("dir")
-	if v := q.Get("filter"); v != "" {
-		var f map[string]restFilterSpec
-		if err := json.Unmarshal([]byte(v), &f); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "filter must be a JSON object"})
-			return p, false
-		}
-		p.Filter = make(map[string]store.ColumnFilter, len(f))
-		for col, spec := range f {
-			p.Filter[col] = store.ColumnFilter{Conditions: []store.ColumnCondition{{
-				Op:     store.FilterOp(spec.Op),
-				Values: spec.Values,
-			}}}
-		}
-	}
-	return p, true
-}
-
-// restFilterSpec is the flat per-column filter the not-yet-migrated REST
-// endpoints accept (profiles today): one op with ORed values.
-type restFilterSpec struct {
-	Op     string   `json:"op"`
-	Values []string `json:"values"`
-}
-
-// listError reports a list query failure: an unknown sort/filter column is the
-// client's fault (400), anything else is a server failure (500).
-func (h *handlers) listError(w http.ResponseWriter, err error, msg string) {
-	if errors.Is(err, store.ErrBadListParam) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	h.fail(w, err, msg)
-}
-
-// ---- profiles ----
-
-type profileView struct {
-	Name           string          `json:"name"`
-	ProviderFilter store.KeyFilter `json:"providerFilter"`
-	ModelFilter    store.KeyFilter `json:"modelFilter"`
-	Parents        []string        `json:"parents"`
-	IsDefault      bool            `json:"isDefault"`
-	KeyCount       int             `json:"keyCount"`
-	ChildCount     int             `json:"childCount"`
-}
-
-func (h *handlers) profilesList(w http.ResponseWriter, r *http.Request) {
-	p, ok := parseListParams(w, r)
-	if !ok {
-		return
-	}
-	ps, total, err := h.store.ListProfilesPaged(r.Context(), p)
-	if err != nil {
-		h.listError(w, err, "profiles unavailable")
-		return
-	}
-	out := make([]profileView, 0, len(ps))
-	for _, p := range ps {
-		parents := p.Parents
-		if parents == nil {
-			parents = []string{}
-		}
-		out = append(out, profileView{
-			Name: p.Name, ProviderFilter: p.ProviderFilter, ModelFilter: p.ModelFilter,
-			Parents: parents, IsDefault: p.IsDefault,
-			KeyCount: p.KeyCount, ChildCount: p.ChildCount,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"profiles": out, "total": total})
-}
-
-type profileRequest struct {
-	Name           string          `json:"name"`
-	ProviderFilter store.KeyFilter `json:"providerFilter"`
-	ModelFilter    store.KeyFilter `json:"modelFilter"`
-	Parents        []string        `json:"parents"`
-}
-
-// validateFilter rejects an unknown mode or an include/exclude filter with no
-// values (which would allow nothing and is almost certainly a mistake).
-func validateFilter(f store.KeyFilter) error {
-	switch f.Mode {
-	case "", "none":
-		return nil
-	case "include", "exclude":
-		if len(f.Values) == 0 {
-			return errors.New("mode " + f.Mode + " requires at least one value")
-		}
-		return nil
-	default:
-		return errors.New("mode must be none, include or exclude")
-	}
-}
-
-// validateProfileRequest checks the name, both filters and the leaf/derived
-// XOR: a profile either carries filters or references parents, never both. It
-// trims parent names in place so the store sees the same values that were
-// validated.
-func validateProfileRequest(req *profileRequest) error {
-	if strings.TrimSpace(req.Name) == "" {
-		return errors.New("name is required")
-	}
-	for _, f := range []struct {
-		label  string
-		filter store.KeyFilter
-	}{{"provider", req.ProviderFilter}, {"model", req.ModelFilter}} {
-		if err := validateFilter(f.filter); err != nil {
-			return errors.New(f.label + " filter: " + err.Error())
-		}
-	}
-	seen := make(map[string]bool, len(req.Parents))
-	cleaned := make([]string, 0, len(req.Parents))
-	for _, parent := range req.Parents {
-		parent = strings.TrimSpace(parent)
-		switch {
-		case parent == "":
-			return errors.New("parent name is required")
-		case parent == strings.TrimSpace(req.Name):
-			return errors.New("a profile cannot be its own parent")
-		case seen[parent]:
-			return errors.New("duplicate parent " + parent)
-		}
-		seen[parent] = true
-		cleaned = append(cleaned, parent)
-	}
-	req.Parents = cleaned
-	if len(req.Parents) > 0 &&
-		(req.ProviderFilter.Mode == "include" || req.ProviderFilter.Mode == "exclude" ||
-			req.ModelFilter.Mode == "include" || req.ModelFilter.Mode == "exclude") {
-		return errors.New("a derived profile has no filters of its own")
-	}
-	return nil
-}
-
-func (h *handlers) profilesCreate(w http.ResponseWriter, r *http.Request) {
-	req, ok := readJSON[profileRequest](w, r)
-	if !ok {
-		return
-	}
-	req.Name = strings.TrimSpace(req.Name)
-	if err := validateProfileRequest(&req); err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
-		return
-	}
-	if _, err := h.store.CreateProfile(r.Context(), req.Name, req.ProviderFilter, req.ModelFilter, req.Parents); err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "could not create profile: " + err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusNoContent, nil)
-}
-
-func (h *handlers) profilesUpdate(w http.ResponseWriter, r *http.Request) {
-	current := r.PathValue("name")
-	req, ok := readJSON[profileRequest](w, r)
-	if !ok {
-		return
-	}
-	req.Name = strings.TrimSpace(req.Name)
-	if err := validateProfileRequest(&req); err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := h.store.UpdateProfile(r.Context(), current, req.Name, req.ProviderFilter, req.ModelFilter, req.Parents); err != nil {
-		h.writeProfileError(w, err, "could not update profile")
-		return
-	}
-	writeJSON(w, http.StatusNoContent, nil)
-}
-
-func (h *handlers) profilesDelete(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if err := h.store.DeleteProfile(r.Context(), name); err != nil {
-		h.writeProfileError(w, err, "could not delete profile")
-		return
-	}
-	writeJSON(w, http.StatusNoContent, nil)
-}
-
-// writeProfileError maps the store's profile sentinels to HTTP responses.
-func (h *handlers) writeProfileError(w http.ResponseWriter, err error, fallback string) {
-	switch {
-	case errors.Is(err, store.ErrProfileNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "profile not found"})
-	case errors.Is(err, store.ErrProfileImmutable):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "the All profile is read-only"})
-	case errors.Is(err, store.ErrProfileInUse):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
-	case errors.Is(err, store.ErrProfileInvalid):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
-	default:
-		h.fail(w, err, fallback)
-	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = w.Write([]byte(`{"error":` + strconv.Quote(msg) + `}`))
 }
 
 // ---- SPA ----

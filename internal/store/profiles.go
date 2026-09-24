@@ -24,6 +24,9 @@ var (
 	// ErrProfileInvalid is returned for a malformed definition: filters mixed
 	// with parents, an unknown parent, or a parent cycle.
 	ErrProfileInvalid = errors.New("invalid profile")
+	// ErrProfileExists is returned when a create or rename collides with an
+	// existing profile name.
+	ErrProfileExists = errors.New("profile name already exists")
 )
 
 // DefaultProfileName is the seeded, read-only profile every key falls back to.
@@ -79,6 +82,16 @@ func (s *Store) CreateProfile(ctx context.Context, name string, provider, model 
 	}
 	defer tx.Rollback()
 
+	// A taken name is a client error (already_exists), not a server-side
+	// UNIQUE failure. Check inside the tx to keep it atomic.
+	var taken int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM profiles WHERE name = ?`, name).Scan(&taken); err != nil {
+		return 0, fmt.Errorf("create profile %q: check name: %w", name, err)
+	}
+	if taken > 0 {
+		return 0, fmt.Errorf("create profile: %w: %q", ErrProfileExists, name)
+	}
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO profiles (name, provider_filter, model_filter) VALUES (?, ?, ?)`,
 		name, marshalJSON(provider.normalize()), marshalJSON(model.normalize()))
@@ -315,7 +328,7 @@ func (s *Store) UpdateProfile(ctx context.Context, currentName, newName string, 
 			return fmt.Errorf("update profile %q: check name: %w", currentName, err)
 		}
 		if taken > 0 {
-			return fmt.Errorf("%w: profile %q already exists", ErrProfileInvalid, newName)
+			return fmt.Errorf("update profile: %w: %q", ErrProfileExists, newName)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `

@@ -15,8 +15,11 @@ import { Code, ConnectError, type ConnectRouter } from "@connectrpc/connect";
 import { AdminService } from "../gen/toll/admin/v1/admin_pb";
 import {
   FilterOp,
+  KeyFilter_Mode,
+  KeyFilterSchema,
   SortDirection,
   type ColumnFilter,
+  type KeyFilter as KeyFilterProto,
   type ListParams,
   type UsageFilter,
 } from "../gen/toll/admin/v1/common_pb";
@@ -32,6 +35,15 @@ import {
   type ListRequestsRequest,
   type RequestDetail,
 } from "../gen/toll/admin/v1/requests_pb";
+import {
+  ListProfilesResponseSchema,
+  ProfileSchema,
+  type CreateProfileRequest,
+  type DeleteProfileRequest,
+  type ListProfilesRequest,
+  type Profile,
+  type UpdateProfileRequest,
+} from "../gen/toll/admin/v1/profiles_pb";
 import {
   CreateKeyResponseSchema,
   ListKeysResponseSchema,
@@ -311,6 +323,10 @@ export function mockAdminRoutes(router: ConnectRouter) {
   router.rpc(AdminService.method.getUsage, getUsage);
   router.rpc(AdminService.method.listRequests, listRequests);
   router.rpc(AdminService.method.getRequest, getRequest);
+  router.rpc(AdminService.method.listProfiles, listProfiles);
+  router.rpc(AdminService.method.createProfile, createProfileMock);
+  router.rpc(AdminService.method.updateProfile, updateProfileMock);
+  router.rpc(AdminService.method.deleteProfile, deleteProfileMock);
 }
 
 // ---- providers & models ----
@@ -773,6 +789,204 @@ function getRequest(req: GetRequestRequest) {
     throw new ConnectError(`request ${req.id} not found`, Code.NotFound);
   }
   return detail;
+}
+
+// ---- profiles ----
+
+// kf builds a proto KeyFilter for the mock seeds.
+function kf(
+  mode: "none" | "include" | "exclude",
+  values: string[] = [],
+): KeyFilterProto {
+  return create(KeyFilterSchema, {
+    mode:
+      mode === "include"
+        ? KeyFilter_Mode.INCLUDE
+        : mode === "exclude"
+          ? KeyFilter_Mode.EXCLUDE
+          : KeyFilter_Mode.NONE,
+    values,
+  });
+}
+
+interface ProfileSeed {
+  name: string;
+  providerFilter: KeyFilterProto;
+  modelFilter: KeyFilterProto;
+  parents: string[];
+  isDefault: boolean;
+}
+
+// The same seed data the dev REST mock showed before it was removed. Counts
+// are computed live from the mock's virtual keys (and child profiles).
+const profileSeeds: ProfileSeed[] = [
+  {
+    name: "All",
+    providerFilter: kf("none"),
+    modelFilter: kf("none"),
+    parents: [],
+    isDefault: true,
+  },
+  {
+    name: "hyper-chat",
+    providerFilter: kf("include", ["hyper"]),
+    modelFilter: kf("exclude", ["hyper/deepseek-v3"]),
+    parents: [],
+    isDefault: false,
+  },
+  {
+    name: "hyper-strict",
+    providerFilter: kf("none"),
+    modelFilter: kf("none"),
+    parents: ["hyper-chat"],
+    isDefault: false,
+  },
+];
+
+function profileOut(p: ProfileSeed): Profile {
+  return create(ProfileSchema, {
+    name: p.name,
+    providerFilter: p.providerFilter,
+    modelFilter: p.modelFilter,
+    parents: p.parents,
+    isDefault: p.isDefault,
+    keyCount: keys.filter((k) => k.profile === p.name).length,
+    childCount: profileSeeds.filter((x) => x.parents.includes(p.name)).length,
+  });
+}
+
+// findProfileSeed resolves a seed or throws not_found, like the server.
+function findProfileSeed(name: string): ProfileSeed {
+  const p = profileSeeds.find((x) => x.name === name);
+  if (!p) {
+    throw new ConnectError(`profile "${name}" not found`, Code.NotFound);
+  }
+  return p;
+}
+
+function listProfiles(req: ListProfilesRequest) {
+  let rows = profileSeeds.slice();
+  for (const [col, f] of Object.entries(req.params?.filter ?? {})) {
+    if (col !== "name") {
+      throw new ConnectError(`unknown filter column "${col}"`, Code.InvalidArgument);
+    }
+    rows = rows.filter((r) => matchesCell(r.name, f));
+  }
+  // The default order is the read-only "All" profile first, then by name.
+  rows = listWindow(rows, req.params, req.params?.sort ?? "", {
+    id: (_r) => 0,
+    name: (r) => (r.isDefault ? "" : r.name),
+    keys: (r) => keys.filter((k) => k.profile === r.name).length,
+  }, "name");
+  return create(ListProfilesResponseSchema, {
+    profiles: page(rows, req.params).map(profileOut),
+    total: rows.length,
+  });
+}
+
+// validateProfileMock mirrors the server's shape checks that the dev UI can
+// hit (the XOR, empty include values); the store-side extras (unknown
+// parents, cycles) are not simulated.
+function validateProfileMock(
+  name: string,
+  providerFilter: KeyFilterProto | undefined,
+  modelFilter: KeyFilterProto | undefined,
+  parents: string[],
+) {
+  const provider = providerFilter ?? kf("none");
+  const model = modelFilter ?? kf("none");
+  if (name.trim() === "") {
+    throw new ConnectError("name is required", Code.FailedPrecondition);
+  }
+  for (const [label, f] of [
+    ["provider", provider],
+    ["model", model],
+  ] as const) {
+    if (
+      (f.mode === KeyFilter_Mode.INCLUDE || f.mode === KeyFilter_Mode.EXCLUDE) &&
+      f.values.length === 0
+    ) {
+      throw new ConnectError(
+        `${label} filter mode requires at least one value`,
+        Code.FailedPrecondition,
+      );
+    }
+  }
+  if (
+    parents.length > 0 &&
+    (provider.mode === KeyFilter_Mode.INCLUDE ||
+      provider.mode === KeyFilter_Mode.EXCLUDE ||
+      model.mode === KeyFilter_Mode.INCLUDE ||
+      model.mode === KeyFilter_Mode.EXCLUDE)
+  ) {
+    throw new ConnectError(
+      "a derived profile has no filters of its own",
+      Code.FailedPrecondition,
+    );
+  }
+}
+
+function createProfileMock(req: CreateProfileRequest): Profile {
+  const name = req.name.trim();
+  validateProfileMock(name, req.providerFilter, req.modelFilter, req.parents);
+  if (profileSeeds.some((p) => p.name === name)) {
+    throw new ConnectError(`profile "${name}" already exists`, Code.AlreadyExists);
+  }
+  const seed: ProfileSeed = {
+    name,
+    providerFilter: create(KeyFilterSchema, req.providerFilter),
+    modelFilter: create(KeyFilterSchema, req.modelFilter),
+    parents: [...req.parents],
+    isDefault: false,
+  };
+  profileSeeds.push(seed);
+  return profileOut(seed);
+}
+
+function updateProfileMock(req: UpdateProfileRequest): Profile {
+  const current = findProfileSeed(req.name);
+  if (current.isDefault) {
+    throw new ConnectError("the All profile is read-only", Code.FailedPrecondition);
+  }
+  const newName = (req.newName ?? req.name).trim();
+  validateProfileMock(newName, req.providerFilter, req.modelFilter, req.parents);
+  if (newName !== current.name && profileSeeds.some((p) => p.name === newName)) {
+    throw new ConnectError(`profile "${newName}" already exists`, Code.AlreadyExists);
+  }
+  const oldName = current.name;
+  current.name = newName;
+  current.providerFilter = create(KeyFilterSchema, req.providerFilter);
+  current.modelFilter = create(KeyFilterSchema, req.modelFilter);
+  current.parents = [...req.parents];
+  // Derived profiles reference parents by name, so keep them pointing at the
+  // renamed profile.
+  for (const x of profileSeeds) {
+    x.parents = x.parents.map((parent) => (parent === oldName ? newName : parent));
+  }
+  return profileOut(current);
+}
+
+function deleteProfileMock(req: DeleteProfileRequest) {
+  const p = findProfileSeed(req.name);
+  if (p.isDefault) {
+    throw new ConnectError("the All profile is read-only", Code.FailedPrecondition);
+  }
+  const children = profileSeeds.filter((x) => x.parents.includes(req.name));
+  if (children.length > 0) {
+    throw new ConnectError(
+      `profile is in use as a parent by ${children.length} profile(s)`,
+      Code.FailedPrecondition,
+    );
+  }
+  const usedByKeys = keys.filter((k) => k.profile === req.name).length;
+  if (usedByKeys > 0) {
+    throw new ConnectError(
+      `profile is in use by ${usedByKeys} key(s)`,
+      Code.FailedPrecondition,
+    );
+  }
+  profileSeeds.splice(profileSeeds.indexOf(p), 1);
+  return create(EmptySchema, {});
 }
 
 // ---- settings ----

@@ -262,23 +262,18 @@ func TestConnectListKeysParams(t *testing.T) {
 	}
 }
 
-// TestConnectUnmigratedRPCs pins the strangle behavior: resources that have
-// not cut over yet answer CodeUnimplemented while their REST routes keep
-// working.
+// TestConnectUnmigratedRPCs pins the strangle behavior: RPCs that have not
+// cut over yet answer CodeUnimplemented. After the profiles flip the only
+// unimplemented surface left is phase 5's usage-series work.
 func TestConnectUnmigratedRPCs(t *testing.T) {
 	_, h := setup(t)
 
-	rec := rpc(t, h, "ListProfiles", `{}`)
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("ListProfiles = %d, want 501: %s", rec.Code, rec.Body.String())
-	}
-	wantConnectCode(t, rec, "unimplemented")
-
-	// The legacy REST route still serves the same resource.
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/providers", nil))
-	if rec.Code != http.StatusOK {
-		t.Errorf("legacy GET /api/providers = %d: %s", rec.Code, rec.Body.String())
+	for _, method := range []string{"GetUsageSeries", "ListFilterValues"} {
+		rec := rpc(t, h, method, `{}`)
+		if rec.Code != http.StatusNotImplemented {
+			t.Fatalf("%s = %d, want 501: %s", method, rec.Code, rec.Body.String())
+		}
+		wantConnectCode(t, rec, "unimplemented")
 	}
 }
 
